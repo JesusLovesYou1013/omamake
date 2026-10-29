@@ -1,0 +1,135 @@
+// Lite engine: Manifold3D (watertight triangle meshes). Fast and robust booleans;
+// curves are approximated by triangles.
+
+#include "engine/engine.h"
+
+#include <manifold/cross_section.h>
+#include <manifold/manifold.h>
+
+#include <cmath>
+#include <map>
+#include <unordered_map>
+#include <utility>
+
+namespace omamake {
+namespace {
+
+// Two triangles meeting at more than this angle draw an outline edge between them.
+constexpr double kOutlineAngleDeg = 20.0;
+
+class LiteEngine final : public GeometryEngine {
+public:
+    std::string name() const override { return "Lite (Manifold3D)"; }
+
+    BodyId box(double x, double y, double z) override {
+        return keep(manifold::Manifold::Cube({x, y, z}, false));
+    }
+
+    BodyId extrude(const Profile &profile, double height) override {
+        manifold::Polygons polygons;
+        for (const auto &loop : profile.loops) {
+            manifold::SimplePolygon polygon;
+            for (const auto &p : loop)
+                polygon.push_back({p.x, p.y});
+            polygons.push_back(std::move(polygon));
+        }
+        const manifold::CrossSection section(polygons, manifold::CrossSection::FillRule::EvenOdd);
+        return keep(manifold::Manifold::Extrude(section.ToPolygons(), height));
+    }
+
+    BodyId combine(BodyId a, BodyId b, Combine op) override {
+        const auto &first = m_bodies.at(a);
+        const auto &second = m_bodies.at(b);
+        switch (op) {
+        case Combine::Join: return keep(first + second);
+        case Combine::Cut: return keep(first - second);
+        case Combine::Intersect: return keep(first ^ second);
+        }
+        return 0;
+    }
+
+    BodyId translate(BodyId body, double x, double y, double z) override {
+        return keep(m_bodies.at(body).Translate({x, y, z}));
+    }
+
+    Mesh mesh(BodyId body) const override;
+
+    void release(BodyId body) override { m_bodies.erase(body); }
+
+private:
+    BodyId keep(manifold::Manifold m) {
+        const BodyId id = ++m_lastId;
+        m_bodies.emplace(id, std::move(m));
+        return id;
+    }
+
+    std::unordered_map<BodyId, manifold::Manifold> m_bodies;
+    BodyId m_lastId = 0;
+};
+
+using Vec3 = manifold::vec3;
+
+Vec3 faceNormal(const Vec3 &a, const Vec3 &b, const Vec3 &c) {
+    return manifold::la::normalize(manifold::la::cross(b - a, c - a));
+}
+
+// Flat shading: every triangle gets its own three vertices and its face normal.
+// Outline edges: where the two triangles sharing an edge bend more than kOutlineAngleDeg.
+Mesh LiteEngine::mesh(BodyId body) const {
+    Mesh out;
+    const manifold::MeshGL64 gl = m_bodies.at(body).GetMeshGL64();
+    const std::size_t stride = gl.numProp;
+    const std::size_t triCount = gl.triVerts.size() / 3;
+
+    auto vertex = [&](std::size_t i) {
+        return Vec3(gl.vertProperties[i * stride], gl.vertProperties[i * stride + 1],
+                    gl.vertProperties[i * stride + 2]);
+    };
+
+    std::vector<Vec3> normals(triCount);
+    std::map<std::pair<std::uint64_t, std::uint64_t>, std::vector<std::size_t>> edgeTris;
+
+    for (int k = 0; k < 3; ++k) {
+        out.min[k] = triCount ? INFINITY : 0;
+        out.max[k] = triCount ? -INFINITY : 0;
+    }
+
+    for (std::size_t t = 0; t < triCount; ++t) {
+        const std::uint64_t idx[3] = {gl.triVerts[t * 3], gl.triVerts[t * 3 + 1], gl.triVerts[t * 3 + 2]};
+        const Vec3 v[3] = {vertex(idx[0]), vertex(idx[1]), vertex(idx[2])};
+        normals[t] = faceNormal(v[0], v[1], v[2]);
+        for (int k = 0; k < 3; ++k) {
+            for (int c = 0; c < 3; ++c) {
+                out.positions.push_back(float(v[k][c]));
+                out.normals.push_back(float(normals[t][c]));
+                out.min[c] = std::min(out.min[c], float(v[k][c]));
+                out.max[c] = std::max(out.max[c], float(v[k][c]));
+            }
+            out.indices.push_back(std::uint32_t(t * 3 + k));
+            const std::uint64_t a = idx[k], b = idx[(k + 1) % 3];
+            edgeTris[{std::min(a, b), std::max(a, b)}].push_back(t);
+        }
+    }
+
+    const double cosLimit = std::cos(kOutlineAngleDeg * M_PI / 180.0);
+    for (const auto &[edge, tris] : edgeTris) {
+        const bool outline = tris.size() != 2
+            || manifold::la::dot(normals[tris[0]], normals[tris[1]]) < cosLimit;
+        if (!outline)
+            continue;
+        for (const std::uint64_t end : {edge.first, edge.second}) {
+            const Vec3 p = vertex(end);
+            for (int c = 0; c < 3; ++c)
+                out.edgeLines.push_back(float(p[c]));
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+std::unique_ptr<GeometryEngine> makeLiteEngine() {
+    return std::make_unique<LiteEngine>();
+}
+
+} // namespace omamake

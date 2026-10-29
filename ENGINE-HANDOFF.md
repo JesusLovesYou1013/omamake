@@ -30,13 +30,78 @@ This file documents engines, features and functions only.
 - **Lite** (triangle meshes): Manifold3D. Planned hard-fork name: **Open-Make-Lite**.
 - Long-term goal: both forked, optimized for speed, and gradually brought to the same features, so that the only difference is smooth surfaces vs triangles. Gradual, not all at once.
 
-## Engine interface (planned)
+## Engine interface
 
-Not written yet. The UI and every plugin call only this, never an engine directly.
+`omamake::GeometryEngine` in `src/engine/engine.h`. The UI and every plugin call only this, never an engine directly.
+Units are millimetres, Z up. A body is a `BodyId` (0 = none); operations return new bodies and leave their inputs alone.
+
+| Hook | What it does |
+|------|--------------|
+| `name()` | The engine's display name |
+| `box(x, y, z)` | A box with one corner at the origin |
+| `extrude(profile, height)` | A flat profile on the XY plane pushed up along +Z (first loop outside, others holes) |
+| `combine(a, b, Join \| Cut \| Intersect)` | Boolean of two bodies |
+| `translate(body, x, y, z)` | A moved copy |
+| `mesh(body)` | Triangles, normals and outline edges, ready to draw |
+| `release(body)` | Frees a body the document no longer needs |
+
+Engines are created by a factory: `makeLiteEngine()` (Heavy will get `makeHeavyEngine()`).
 
 ## Built-in features
 
-Not catalogued yet. Dune 3D 1.4 has one class per feature in `src/document/group/`:
+### Solids
+
+#### Box                                    [BUILT-IN]   [OURS]
+- What it does: makes a box from three sizes. For now it builds the 12 in placeholder cube at startup.
+- UI: none yet (startup only). Will be search: "box", "cube".
+- Popup: none yet.
+- Interface hook: `box(x, y, z)`, then `translate` to sit it centred on the floor.
+- Heavy (exact surfaces): MISSING
+- Lite (triangles): `LiteEngine::box` in `src/engine/lite/liteengine.cpp` (Manifold `Manifold::Cube`)
+- Engine differences: none expected (flat faces are exact in both).
+- Changes: 2026-10-29: added.
+
+#### Extrude                                [BUILT-IN]   [OURS]
+- What it does: pushes a flat profile up into a solid.
+- UI: not wired yet. Planned: search "extrude", floating panel "Extrude": Distance, Direction (One side / Symmetric / Two sides), Result (Join / Cut / Intersect / New).
+- Interface hook: `extrude(profile, height)`
+- Heavy (exact surfaces): MISSING
+- Lite (triangles): `LiteEngine::extrude` in `src/engine/lite/liteengine.cpp` (Manifold `Manifold::Extrude`, even-odd holes)
+- Engine differences: Lite turns curved profile edges into straight segments.
+- Changes: 2026-10-29: added.
+
+#### Combine                                [BUILT-IN]   [OURS]
+- What it does: joins, cuts or intersects two bodies.
+- UI: not wired yet. Planned: the Result choice in other panels, and search "join", "cut", "intersect".
+- Interface hook: `combine(a, b, op)`
+- Heavy (exact surfaces): MISSING
+- Lite (triangles): `LiteEngine::combine` in `src/engine/lite/liteengine.cpp` (Manifold `+`, `-`, `^`)
+- Engine differences: none known yet.
+- Changes: 2026-10-29: added.
+
+#### Move                                   [BUILT-IN]   [OURS]
+- What it does: a moved copy of a body.
+- UI: none yet.
+- Interface hook: `translate(body, x, y, z)`
+- Heavy (exact surfaces): MISSING
+- Lite (triangles): `LiteEngine::translate` in `src/engine/lite/liteengine.cpp`
+- Engine differences: none.
+- Changes: 2026-10-29: added.
+
+### Display
+
+#### Mesh for drawing                       [BUILT-IN]   [OURS]
+- What it does: turns a body into triangles with flat face normals, plus outline edges wherever neighbouring triangles bend more than 20°.
+- UI: every model on screen.
+- Interface hook: `mesh(body)`
+- Heavy (exact surfaces): MISSING
+- Lite (triangles): `LiteEngine::mesh` in `src/engine/lite/liteengine.cpp`
+- Engine differences: Heavy will tessellate exact surfaces to a chosen accuracy; Lite already is triangles.
+- Changes: 2026-10-29: added. Flat shading only for now (curved faces will need smooth normals).
+
+### Stock Dune 3D features (Heavy, not checked out yet)
+
+Dune 3D 1.4 has one class per feature in `src/document/group/`: Dune 3D 1.4 has one class per feature in `src/document/group/`:
 extrude, revolve, lathe, fillet, chamfer, loft, sweep, pipe, circular sweep, mirror, mirror H/V,
 linear array, polar array, clone, replicate, reference, sketch, solid-model operation,
 local operation, exploded cluster. These get full entries once the source is checked out.
