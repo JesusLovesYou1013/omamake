@@ -6,6 +6,8 @@
 
 #include <QJsonArray>
 #include <QObject>
+#include <QVariantList>
+#include <QVariantMap>
 #include <QVector3D>
 
 #include <memory>
@@ -29,6 +31,16 @@ public:
     // Fill a view's shaded geometry and its outline geometry with the model.
     Q_INVOKABLE void fill(MeshGeometry *faces, MeshGeometry *edges) const;
 
+    // What's under a ray (engine coordinates): {kind: "point" | "edge" | "face" | "", index}.
+    // Points win over edges, edges over faces, like Fusion. A point or edge counts when the
+    // ray passes within (distance along the ray × pointReach / edgeReach) of it and nothing
+    // solid is in front of it.
+    Q_INVOKABLE QVariantMap pick(QVector3D origin, QVector3D direction, float pointReach, float edgeReach) const;
+
+    // Shapes that show parts of the model (hover or selection): faces as copies of their
+    // triangles, edges as thin tubes, points as small balls. parts: [{kind, index}, ...].
+    Q_INVOKABLE void fillParts(MeshGeometry *target, const QVariantList &parts, float edgeRadius) const;
+
     // Placeholder until sketch + extrude exist: a cube sitting centred on the floor.
     void addCube(double sizeMm);
 
@@ -37,10 +49,11 @@ signals:
 
 private:
     void record(const QJsonObject &action);
-    void updateBounds();
+    void refreshMesh();
 
     std::unique_ptr<omamake::GeometryEngine> m_engine;
     omamake::BodyId m_body = 0;
     QJsonArray m_actions;   // every change, in order (saved with the file later)
+    omamake::Mesh m_mesh;   // the model as last built, with its faces, edges and points
     QVector3D m_boundsMin, m_boundsMax;
 };

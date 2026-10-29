@@ -5,6 +5,10 @@
 #include <QDateTime>
 #include <QJsonObject>
 
+#include <cmath>
+#include <limits>
+#include <set>
+
 Document::Document(std::unique_ptr<omamake::GeometryEngine> engine, QObject *parent)
     : QObject(parent), m_engine(std::move(engine)) {}
 
@@ -13,11 +17,10 @@ QString Document::engineName() const {
 }
 
 void Document::fill(MeshGeometry *faces, MeshGeometry *edges) const {
-    const omamake::Mesh mesh = m_body ? m_engine->mesh(m_body) : omamake::Mesh{};
     if (faces)
-        faces->setMesh(mesh);
+        faces->setMesh(m_mesh);
     if (edges)
-        edges->setMesh(mesh);
+        edges->setMesh(m_mesh);
 }
 
 void Document::addCube(double sizeMm) {
@@ -33,7 +36,7 @@ void Document::addCube(double sizeMm) {
         m_body = placed;
     }
     record({{QStringLiteral("type"), QStringLiteral("cube")}, {QStringLiteral("size_mm"), sizeMm}});
-    updateBounds();
+    refreshMesh();
     emit changed();
 }
 
@@ -43,8 +46,199 @@ void Document::record(const QJsonObject &action) {
     m_actions.append(entry);
 }
 
-void Document::updateBounds() {
-    const omamake::Mesh mesh = m_engine->mesh(m_body);
-    m_boundsMin = QVector3D(mesh.min[0], mesh.min[1], mesh.min[2]);
-    m_boundsMax = QVector3D(mesh.max[0], mesh.max[1], mesh.max[2]);
+void Document::refreshMesh() {
+    m_mesh = m_body ? m_engine->mesh(m_body) : omamake::Mesh{};
+    m_boundsMin = QVector3D(m_mesh.min[0], m_mesh.min[1], m_mesh.min[2]);
+    m_boundsMax = QVector3D(m_mesh.max[0], m_mesh.max[1], m_mesh.max[2]);
+}
+
+namespace {
+
+QVector3D at(const std::vector<float> &xyz, std::size_t i) {
+    return QVector3D(xyz[i * 3], xyz[i * 3 + 1], xyz[i * 3 + 2]);
+}
+
+// Distance along the ray to a triangle, or infinity (Möller–Trumbore, both sides).
+float rayTriangle(const QVector3D &o, const QVector3D &d, const QVector3D &a, const QVector3D &b, const QVector3D &c) {
+    const QVector3D e1 = b - a, e2 = c - a;
+    const QVector3D p = QVector3D::crossProduct(d, e2);
+    const float det = QVector3D::dotProduct(e1, p);
+    if (std::abs(det) < 1e-9f)
+        return INFINITY;
+    const QVector3D s = o - a;
+    const float u = QVector3D::dotProduct(s, p) / det;
+    if (u < 0 || u > 1)
+        return INFINITY;
+    const QVector3D q = QVector3D::crossProduct(s, e1);
+    const float v = QVector3D::dotProduct(d, q) / det;
+    if (v < 0 || u + v > 1)
+        return INFINITY;
+    const float t = QVector3D::dotProduct(e2, q) / det;
+    return t > 0 ? t : INFINITY;
+}
+
+// Closest approach between the ray (o + t·d, d unit length) and the segment a→b:
+// {distance along the ray, gap between them}.
+std::pair<float, float> raySegment(const QVector3D &o, const QVector3D &d, const QVector3D &a, const QVector3D &b) {
+    const QVector3D u = b - a, w = o - a;
+    const float uu = QVector3D::dotProduct(u, u), ud = QVector3D::dotProduct(u, d);
+    const float uw = QVector3D::dotProduct(u, w), dw = QVector3D::dotProduct(d, w);
+    const float denom = uu - ud * ud;
+    float s = denom > 1e-9f ? (uw - ud * dw) / denom : 0.0f;   // 0 = at a, 1 = at b
+    s = std::clamp(s, 0.0f, 1.0f);
+    const QVector3D onSeg = a + u * s;
+    const float t = std::max(0.0f, QVector3D::dotProduct(onSeg - o, d));
+    return {t, (o + d * t - onSeg).length()};
+}
+
+void addTriangle(omamake::Mesh &m, const QVector3D &a, const QVector3D &b, const QVector3D &c,
+                 const QVector3D &na, const QVector3D &nb, const QVector3D &nc) {
+    const QVector3D v[3] = {a, b, c}, n[3] = {na, nb, nc};
+    for (int k = 0; k < 3; ++k) {
+        m.indices.push_back(std::uint32_t(m.positions.size() / 3));
+        for (int i = 0; i < 3; ++i) {
+            m.positions.push_back(v[k][i]);
+            m.normals.push_back(n[k][i]);
+            m.min[i] = std::min(m.min[i], v[k][i]);
+            m.max[i] = std::max(m.max[i], v[k][i]);
+        }
+    }
+}
+
+// Two unit vectors at right angles to d.
+std::pair<QVector3D, QVector3D> sideways(const QVector3D &d) {
+    const QVector3D helper = std::abs(d.z()) < 0.9f ? QVector3D(0, 0, 1) : QVector3D(1, 0, 0);
+    const QVector3D x = QVector3D::crossProduct(d, helper).normalized();
+    return {x, QVector3D::crossProduct(d, x).normalized()};
+}
+
+void addTube(omamake::Mesh &m, const QVector3D &a, const QVector3D &b, float r) {
+    constexpr int sides = 8;
+    const QVector3D d = (b - a).normalized();
+    if ((b - a).length() < 1e-6f)
+        return;
+    const auto [x, y] = sideways(d);
+    for (int i = 0; i < sides; ++i) {
+        const float a0 = float(2 * M_PI * i / sides), a1 = float(2 * M_PI * (i + 1) / sides);
+        const QVector3D n0 = x * std::cos(a0) + y * std::sin(a0), n1 = x * std::cos(a1) + y * std::sin(a1);
+        addTriangle(m, a + n0 * r, b + n0 * r, b + n1 * r, n0, n0, n1);
+        addTriangle(m, a + n0 * r, b + n1 * r, a + n1 * r, n0, n1, n1);
+    }
+}
+
+void addBall(omamake::Mesh &m, const QVector3D &c, float r) {
+    constexpr int rings = 6, segments = 10;
+    auto p = [&](int ring, int seg) {
+        const float th = float(M_PI * ring / rings), ph = float(2 * M_PI * seg / segments);
+        return QVector3D(std::sin(th) * std::cos(ph), std::sin(th) * std::sin(ph), std::cos(th));
+    };
+    for (int i = 0; i < rings; ++i)
+        for (int j = 0; j < segments; ++j) {
+            const QVector3D a = p(i, j), b = p(i + 1, j), cc = p(i + 1, j + 1), d = p(i, j + 1);
+            addTriangle(m, c + a * r, c + b * r, c + cc * r, a, b, cc);
+            addTriangle(m, c + a * r, c + cc * r, c + d * r, a, cc, d);
+        }
+}
+
+} // namespace
+
+QVariantMap Document::pick(QVector3D origin, QVector3D direction, float pointReach, float edgeReach) const {
+    const QVector3D d = direction.normalized();
+
+    // The nearest solid surface along the ray hides anything behind it.
+    float hitT = INFINITY;
+    std::uint32_t hitFace = 0;
+    const std::size_t triCount = m_mesh.indices.size() / 3;
+    for (std::size_t t = 0; t < triCount; ++t) {
+        const float h = rayTriangle(origin, d, at(m_mesh.positions, m_mesh.indices[t * 3]),
+                                    at(m_mesh.positions, m_mesh.indices[t * 3 + 1]),
+                                    at(m_mesh.positions, m_mesh.indices[t * 3 + 2]));
+        if (h < hitT) {
+            hitT = h;
+            hitFace = m_mesh.triangleFace[t];
+        }
+    }
+    auto visible = [&](float t, float reach) { return t <= hitT + reach * 2; };
+
+    auto result = [](const char *kind, int index) {
+        return QVariantMap{{QStringLiteral("kind"), QString::fromLatin1(kind)}, {QStringLiteral("index"), index}};
+    };
+
+    int best = -1;
+    float bestT = INFINITY;
+    for (std::size_t i = 0; i < m_mesh.points.size() / 3; ++i) {
+        const QVector3D p = at(m_mesh.points, i);
+        const float t = QVector3D::dotProduct(p - origin, d);
+        const float reach = std::max(t, 1.0f) * pointReach;
+        if (t > 0 && (origin + d * t - p).length() <= reach && visible(t, reach) && t < bestT) {
+            best = int(i);
+            bestT = t;
+        }
+    }
+    if (best >= 0)
+        return result("point", best);
+
+    float bestGap = INFINITY;
+    for (std::size_t e = 0; e < m_mesh.edges.size(); ++e) {
+        const auto &line = m_mesh.edges[e];
+        for (std::size_t i = 0; i + 1 < line.size() / 3; ++i) {
+            const auto [t, gap] = raySegment(origin, d, at(line, i), at(line, i + 1));
+            const float reach = std::max(t, 1.0f) * edgeReach;
+            if (gap <= reach && visible(t, reach) && gap / reach < bestGap) {
+                best = int(e);
+                bestGap = gap / reach;
+            }
+        }
+    }
+    if (best >= 0)
+        return result("edge", best);
+
+    if (std::isfinite(hitT))
+        return result("face", int(hitFace));
+    return result("", -1);
+}
+
+void Document::fillParts(MeshGeometry *target, const QVariantList &parts, float edgeRadius) const {
+    if (!target)
+        return;
+    omamake::Mesh out;
+    for (int i = 0; i < 3; ++i) {
+        out.min[i] = std::numeric_limits<float>::max();
+        out.max[i] = std::numeric_limits<float>::lowest();
+    }
+    std::set<std::uint32_t> faces;
+    for (const QVariant &v : parts) {
+        const QVariantMap part = v.toMap();
+        const QString kind = part.value(QStringLiteral("kind")).toString();
+        const int index = part.value(QStringLiteral("index")).toInt();
+        if (kind == QLatin1String("face") && index >= 0 && std::uint32_t(index) < m_mesh.faceCount) {
+            faces.insert(std::uint32_t(index));
+        } else if (kind == QLatin1String("edge") && index >= 0 && std::size_t(index) < m_mesh.edges.size()) {
+            const auto &line = m_mesh.edges[std::size_t(index)];
+            for (std::size_t k = 0; k + 1 < line.size() / 3; ++k) {
+                addTube(out, at(line, k), at(line, k + 1), edgeRadius);
+                addBall(out, at(line, k + 1), edgeRadius);   // smooth joints
+            }
+        } else if (kind == QLatin1String("point") && index >= 0 && std::size_t(index) < m_mesh.points.size() / 3) {
+            addBall(out, at(m_mesh.points, std::size_t(index)), edgeRadius * 2.4f);
+        }
+    }
+    const std::size_t triCount = m_mesh.indices.size() / 3;
+    for (std::size_t t = 0; t < triCount && !faces.empty(); ++t) {
+        if (!faces.count(m_mesh.triangleFace[t]))
+            continue;
+        // Lifted a hair off the surface: a copy in exactly the same place would lose the depth test.
+        const std::uint32_t *idx = &m_mesh.indices[t * 3];
+        const float lift = edgeRadius * 0.3f;
+        QVector3D v[3], n[3];
+        for (int k = 0; k < 3; ++k) {
+            n[k] = at(m_mesh.normals, idx[k]);
+            v[k] = at(m_mesh.positions, idx[k]) + n[k] * lift;
+        }
+        addTriangle(out, v[0], v[1], v[2], n[0], n[1], n[2]);
+    }
+    if (out.positions.empty())
+        for (int i = 0; i < 3; ++i)
+            out.min[i] = out.max[i] = 0;
+    target->setMesh(out);
 }

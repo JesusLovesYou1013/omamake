@@ -24,7 +24,7 @@ QtObject {
         controlHover: "#222D3D", border: "#293241", borderStrong: "#3A4658",
         textPrimary: "#E7EDF7", textSecondary: "#A7B1C1", textMuted: "#727E90",
         accent: "#27C2FF", warning: "#FBBF24", danger: "#EF4444", success: "#34D399",
-        model: "#7F95C2", modelEdge: "#0B0E13",
+        model: "#7F95C2", modelEdge: "#0B0E13", hover: "#A8E4FF", selection: "#1FA8F0",
         gridMinor: Qt.rgba(0.72, 0.78, 0.88, 0.16), gridMajor: Qt.rgba(0.72, 0.78, 0.88, 0.34),
         axisX: "#EF4444", axisY: "#34D399"
     })
@@ -33,7 +33,7 @@ QtObject {
         controlHover: "#D0D8E3", border: "#BCC6D3", borderStrong: "#9DA9B9",
         textPrimary: "#151C27", textSecondary: "#3B4759", textMuted: "#677386",
         accent: "#0A86C4", warning: "#B7791F", danger: "#C53030", success: "#1F8A5B",
-        model: "#6681B3", modelEdge: "#1A2333",
+        model: "#6681B3", modelEdge: "#1A2333", hover: "#86D3F7", selection: "#0A72C4",
         gridMinor: Qt.rgba(0.20, 0.26, 0.36, 0.13), gridMajor: Qt.rgba(0.20, 0.26, 0.36, 0.38),
         axisX: "#D13B3B", axisY: "#1F9A62"
     })
@@ -50,6 +50,15 @@ QtObject {
     // The same colour moved to a lightness, keeping its hue.
     function atLightness(c, l, satScale) {
         return hsl(hue(c), c.hslSaturation * (satScale === undefined ? 1 : satScale), l)
+    }
+
+    // Selection must never look like the model (which is made from the accent): use the
+    // theme's blue when its hue is clearly different, else the accent's opposite hue.
+    function pickColour(acc, lightness) {
+        const blue = sys("blue", "#4080e0")
+        const gap = Math.abs(hue(blue) - hue(acc))
+        const h = Math.min(gap, 1 - gap) > 0.12 ? hue(blue) : (hue(acc) + 0.5) % 1
+        return hsl(h, 0.78, lightness)
     }
 
     function fromOmarchy(isLight) {
@@ -71,6 +80,7 @@ QtObject {
                 textMuted: sys("muted", Qt.darker(fg, 1.5).toString()),
                 accent: accent, warning: sys("yellow", "#d0b040"), danger: red, success: green,
                 model: atLightness(acc, 0.6, 0.55), modelEdge: hsl(h, s, L * 0.6),
+                hover: hsl(hue(acc), 0.85, 0.78), selection: pickColour(acc, 0.56),
                 gridMinor: hsl(hue(fg), fg.hslSaturation * 0.6, 0.78, 0.15),
                 gridMajor: hsl(hue(fg), fg.hslSaturation * 0.6, 0.78, 0.32),
                 axisX: red, axisY: green
@@ -89,6 +99,7 @@ QtObject {
             warning: atLightness(sys("yellow", "#b08020"), 0.38), danger: atLightness(red, 0.42),
             success: atLightness(green, 0.33),
             model: atLightness(acc, 0.47, 0.6), modelEdge: ink(0.14, 0.4),
+            hover: hsl(hue(acc), 0.75, 0.62), selection: pickColour(acc, 0.4),
             gridMinor: ink(0.25, 0.3), gridMajor: ink(0.25, 0.3),
             axisX: atLightness(red, 0.45), axisY: atLightness(green, 0.36)
         }
@@ -117,6 +128,8 @@ QtObject {
     // The 3D space.
     readonly property color model: p.model
     readonly property color modelEdge: p.modelEdge
+    readonly property color hover: p.hover            // part under the mouse
+    readonly property color selection: p.selection    // selected parts
     readonly property color gridMinor: following && light ? Qt.rgba(p.gridMinor.r, p.gridMinor.g, p.gridMinor.b, lightGridMinorAlpha) : p.gridMinor
     readonly property color gridMajor: following && light ? Qt.rgba(p.gridMajor.r, p.gridMajor.g, p.gridMajor.b, lightGridMajorAlpha) : p.gridMajor
     readonly property color axisX: p.axisX

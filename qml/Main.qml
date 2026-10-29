@@ -101,6 +101,25 @@ Window {
                 castsShadows: true
                 receivesShadows: true
             }
+            // Selected parts, then the hovered part on top (Selection.qml fills these).
+            Model {
+                geometry: MeshGeometry { id: selectedParts }
+                depthBias: -60
+                materials: PrincipledMaterial {
+                    baseColor: theme.selection
+                    metalness: 0.05
+                    roughness: 0.45
+                }
+            }
+            Model {
+                geometry: MeshGeometry { id: hoverParts }
+                depthBias: -80
+                materials: PrincipledMaterial {
+                    baseColor: theme.hover
+                    metalness: 0.05
+                    roughness: 0.45
+                }
+            }
             Model {
                 geometry: MeshGeometry { id: edges; lines: true }
                 depthBias: -40
@@ -118,6 +137,18 @@ Window {
         view: view
         pivot: pivot
         camera: camera
+        onHoverAt: (x, y) => selection.hoverAt(x, y)
+        onClickAt: (x, y, modifiers) => selection.clickAt(x, y, modifiers)
+        onHoverLeft: selection.clearHover()
+    }
+
+    Selection {
+        id: selection
+        view: view
+        camera: camera
+        nav: navigation
+        hoverGeometry: hoverParts
+        selectedGeometry: selectedParts
     }
 
     ViewCube {
@@ -184,10 +215,17 @@ Window {
         anchorItem: modeButton
     }
 
+    // Esc: closes the search or menu first (they handle it), then stops panning,
+    // then clears the selection.
     Shortcut {
         sequence: "Esc"
-        enabled: navigation.panMode && !search.open && !modeMenu.open
-        onActivated: navigation.panMode = false
+        enabled: (navigation.panMode || selection.selected.length > 0) && !search.open && !modeMenu.open
+        onActivated: {
+            if (navigation.panMode)
+                navigation.panMode = false
+            else
+                selection.clear()
+        }
     }
     Shortcut {
         sequence: "Ctrl+Q"

@@ -6,8 +6,8 @@ import QtQuick
 //   wheel               zoom, toward the cursor
 //   double-click middle fit the model to the window
 //   hand button (by the view cube) left-drag pans too, until clicked again or Esc
-// The left button is left free for selecting. The view cube (top right) uses
-// orbit() and lookFrom() below.
+// The left button selects (signals hoverAt / clickAt / hoverLeft, handled by Selection.qml),
+// or pans while the hand is on. The view cube (top right) uses orbit() and lookFrom() below.
 MouseArea {
     id: nav
 
@@ -27,7 +27,15 @@ MouseArea {
 
     property bool panMode: false
 
-    acceptedButtons: panMode ? (Qt.LeftButton | Qt.MiddleButton) : Qt.MiddleButton
+    signal hoverAt(real x, real y)
+    signal clickAt(real x, real y, int modifiers)
+    signal hoverLeft()
+
+    acceptedButtons: Qt.LeftButton | Qt.MiddleButton
+    hoverEnabled: true
+    readonly property real clickSlop: 4    // pixels a click may move and still be a click
+    property point pressAt
+    property bool moved: false
     cursorShape: !panMode ? Qt.ArrowCursor : (pressedButtons & Qt.LeftButton) ? Qt.ClosedHandCursor : Qt.OpenHandCursor
     property point last
 
@@ -89,9 +97,29 @@ MouseArea {
         return 2 * distance * Math.tan(fov * Math.PI / 360) / Math.max(1, height)
     }
 
-    onPressed: mouse => last = Qt.point(mouse.x, mouse.y)
+    onPressed: mouse => {
+        last = Qt.point(mouse.x, mouse.y)
+        pressAt = last
+        moved = false
+        if (mouse.button === Qt.MiddleButton)
+            hoverLeft()
+    }
+    onReleased: mouse => {
+        if (mouse.button === Qt.LeftButton && !panMode && !moved)
+            clickAt(mouse.x, mouse.y, mouse.modifiers)
+    }
+    onExited: hoverLeft()
 
     onPositionChanged: mouse => {
+        if (!pressed) {
+            hoverAt(mouse.x, mouse.y)
+            return
+        }
+        if (Math.hypot(mouse.x - pressAt.x, mouse.y - pressAt.y) > clickSlop)
+            moved = true
+        // A plain left-drag (no hand) is kept for window selection later.
+        if ((mouse.buttons & Qt.MiddleButton) === 0 && !panMode)
+            return
         const dx = mouse.x - last.x
         const dy = mouse.y - last.y
         last = Qt.point(mouse.x, mouse.y)
@@ -120,5 +148,6 @@ MouseArea {
             .plus(camera.right.times(dx * u))
             .minus(camera.up.times(dy * u))
         distance = Math.max(5, distance * factor)
+        hoverAt(wheel.x, wheel.y)
     }
 }

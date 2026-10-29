@@ -8,6 +8,7 @@
 
 #include <cmath>
 #include <map>
+#include <numeric>
 #include <unordered_map>
 #include <utility>
 
@@ -75,6 +76,10 @@ Vec3 faceNormal(const Vec3 &a, const Vec3 &b, const Vec3 &c) {
 
 // Flat shading: every triangle gets its own three vertices and its face normal.
 // Outline edges: where the two triangles sharing an edge bend more than kOutlineAngleDeg.
+// Topology from the same rule (a mesh has no true faces, so we rebuild them):
+//   face  = triangles joined across non-outline edges (a cylinder's facets make one face)
+//   edge  = a chain of outline segments between corner points (or a closed loop, like a circle)
+//   point = a vertex where 1 or 3+ outline segments meet
 Mesh LiteEngine::mesh(BodyId body) const {
     Mesh out;
     const manifold::MeshGL64 gl = m_bodies.at(body).GetMeshGL64();
@@ -111,18 +116,82 @@ Mesh LiteEngine::mesh(BodyId body) const {
         }
     }
 
+    // Faces: union triangles across every edge that isn't an outline.
+    std::vector<std::size_t> parent(triCount);
+    std::iota(parent.begin(), parent.end(), 0);
+    auto root = [&](std::size_t t) {
+        while (parent[t] != t)
+            t = parent[t] = parent[parent[t]];
+        return t;
+    };
+
     const double cosLimit = std::cos(kOutlineAngleDeg * M_PI / 180.0);
+    std::unordered_map<std::uint64_t, std::vector<std::uint64_t>> outlineNext;   // vertex → outline neighbours
     for (const auto &[edge, tris] : edgeTris) {
         const bool outline = tris.size() != 2
             || manifold::la::dot(normals[tris[0]], normals[tris[1]]) < cosLimit;
-        if (!outline)
+        if (!outline) {
+            parent[root(tris[0])] = root(tris[1]);
             continue;
+        }
+        outlineNext[edge.first].push_back(edge.second);
+        outlineNext[edge.second].push_back(edge.first);
         for (const std::uint64_t end : {edge.first, edge.second}) {
             const Vec3 p = vertex(end);
             for (int c = 0; c < 3; ++c)
                 out.edgeLines.push_back(float(p[c]));
         }
     }
+
+    std::unordered_map<std::size_t, std::uint32_t> faceOfRoot;
+    out.triangleFace.resize(triCount);
+    for (std::size_t t = 0; t < triCount; ++t) {
+        const auto [it, added] = faceOfRoot.emplace(root(t), std::uint32_t(faceOfRoot.size()));
+        out.triangleFace[t] = it->second;
+    }
+    out.faceCount = std::uint32_t(faceOfRoot.size());
+
+    // Points, then edges: walk the outline graph from every point; what's left are closed loops.
+    auto isPoint = [&](std::uint64_t v) { return outlineNext.at(v).size() != 2; };
+    auto push = [&](std::vector<float> &list, std::uint64_t v) {
+        const Vec3 p = vertex(v);
+        for (int c = 0; c < 3; ++c)
+            list.push_back(float(p[c]));
+    };
+    for (const auto &[v, next] : outlineNext)
+        if (isPoint(v))
+            push(out.points, v);
+
+    std::map<std::pair<std::uint64_t, std::uint64_t>, bool> walked;
+    auto key = [](std::uint64_t a, std::uint64_t b) { return std::make_pair(std::min(a, b), std::max(a, b)); };
+    auto walk = [&](std::uint64_t from, std::uint64_t to) {
+        std::vector<float> line;
+        push(line, from);
+        std::uint64_t prev = from, cur = to;
+        walked[key(prev, cur)] = true;
+        while (true) {
+            push(line, cur);
+            if (isPoint(cur) || cur == from)
+                break;
+            const auto &n = outlineNext.at(cur);
+            const std::uint64_t nxt = n[0] == prev ? n[1] : n[0];
+            if (walked[key(cur, nxt)])
+                break;
+            walked[key(cur, nxt)] = true;
+            prev = cur;
+            cur = nxt;
+        }
+        out.edges.push_back(std::move(line));
+    };
+    for (const auto &[v, next] : outlineNext)
+        if (isPoint(v))
+            for (const std::uint64_t n : next)
+                if (!walked[key(v, n)])
+                    walk(v, n);
+    for (const auto &[v, next] : outlineNext)
+        for (const std::uint64_t n : next)
+            if (!walked[key(v, n)])
+                walk(v, n);
     return out;
 }
 

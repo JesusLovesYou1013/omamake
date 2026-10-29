@@ -42,7 +42,7 @@ Units are millimetres, Z up. A body is a `BodyId` (0 = none); operations return 
 | `extrude(profile, height)` | A flat profile on the XY plane pushed up along +Z (first loop outside, others holes) |
 | `combine(a, b, Join \| Cut \| Intersect)` | Boolean of two bodies |
 | `translate(body, x, y, z)` | A moved copy |
-| `mesh(body)` | Triangles, normals and outline edges, ready to draw |
+| `mesh(body)` | Triangles, normals and outline edges, ready to draw, plus the topology (faces, edges, points) used for hovering and selecting |
 | `release(body)` | Frees a body the document no longer needs |
 
 Engines are created by a factory: `makeLiteEngine()` (Heavy will get `makeHeavyEngine()`).
@@ -98,6 +98,16 @@ Engines are created by a factory: `makeLiteEngine()` (Heavy will get `makeHeavyE
 - Lite (triangles): `LiteEngine::mesh` in `src/engine/lite/liteengine.cpp`
 - Engine differences: Heavy will tessellate exact surfaces to a chosen accuracy; Lite already is triangles.
 - Changes: 2026-10-29: added. Flat shading only for now (curved faces will need smooth normals).
+
+#### Topology (faces, edges, points)       [BUILT-IN]   [OURS]
+- What it does: tells which triangles make up each face, which outline segments make up each edge, and where the corner points are, so a user can hover and select a whole face, edge or point the way CAD users expect (a cube: 6 faces, 12 edges, 8 points).
+- UI: hover anything on the model (pale highlight); click selects it (strong highlight); Ctrl- or Shift-click adds or removes; click empty space or Esc clears. Points win over edges, edges over faces.
+- Popup: none.
+- Interface hook: `mesh(body)`, fields `faceCount`, `triangleFace`, `edges` (polylines), `points` of `omamake::Mesh`.
+- Heavy (exact surfaces): MISSING (will come straight from the exact model's own faces, edges and vertices).
+- Lite (triangles): `LiteEngine::mesh` in `src/engine/lite/liteengine.cpp`. A mesh has no true faces, so they are rebuilt: triangles are joined across every edge that bends less than 20° (the same rule as outline edges), so a cylinder's facets become one face. Edges are chains of outline segments between points; closed chains (a circle) have no points. Points are vertices where 1 or 3+ outline segments meet.
+- Engine differences: Lite's faces depend on the 20° rule: a very gentle crease between two flat areas joins them into one face, and a very coarse curve could split into several. Heavy will not have this limit.
+- Changes: 2026-10-29: added.
 
 ### Stock Dune 3D features (Heavy, not checked out yet)
 

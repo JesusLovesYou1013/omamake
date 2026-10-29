@@ -30,7 +30,8 @@ struct Profile {
 
 enum class Combine { Join, Cut, Intersect };
 
-// Ready-to-draw triangles plus the outline edges a CAD view shows.
+// Ready-to-draw triangles plus the outline edges a CAD view shows, plus the
+// topology a user hovers and selects: faces, edges and corner points.
 struct Mesh {
     std::vector<float> positions;        // x,y,z per vertex
     std::vector<float> normals;          // x,y,z per vertex
@@ -38,6 +39,11 @@ struct Mesh {
     std::vector<float> edgeLines;        // x,y,z,x,y,z per outline edge
     float min[3] = {0, 0, 0};
     float max[3] = {0, 0, 0};
+
+    std::uint32_t faceCount = 0;
+    std::vector<std::uint32_t> triangleFace;   // which face each triangle belongs to
+    std::vector<std::vector<float>> edges;     // each edge as a polyline: x,y,z,x,y,z,...
+    std::vector<float> points;                 // x,y,z per corner point (where edges meet)
 };
 
 class GeometryEngine {
