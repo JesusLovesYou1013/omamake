@@ -41,6 +41,13 @@ public:
     // triangles, edges as thin tubes, points as small balls. parts: [{kind, index}, ...].
     Q_INVOKABLE void fillParts(MeshGeometry *target, const QVariantList &parts, float edgeRadius) const;
 
+    // The plane a sketch on this face sits on (engine coordinates):
+    // {flat, origin, normal, xAxis, yAxis, center}. flat is false for a curved face.
+    // The normal points out of the body. The sketch's own Y axis is "up" (world Z, or
+    // world Y on a face that lies flat), and the origin is the world origin dropped onto
+    // the plane, as in Fusion, so sketches on parallel faces line up.
+    Q_INVOKABLE QVariantMap facePlane(int face) const;
+
     // Placeholder until sketch + extrude exist: a cube sitting centred on the floor.
     void addCube(double sizeMm);
 

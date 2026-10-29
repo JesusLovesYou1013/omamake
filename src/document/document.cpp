@@ -198,6 +198,56 @@ QVariantMap Document::pick(QVector3D origin, QVector3D direction, float pointRea
     return result("", -1);
 }
 
+QVariantMap Document::facePlane(int face) const {
+    QVariantMap plane{{QStringLiteral("flat"), false}};
+    if (face < 0 || std::uint32_t(face) >= m_mesh.faceCount)
+        return plane;
+
+    // Every triangle of the face must point the same way; area-weighted, so slivers
+    // from the triangulation can't tip the normal.
+    QVector3D sum, first;
+    QVector3D center;
+    float area = 0;
+    bool flat = true;
+    const std::size_t triCount = m_mesh.indices.size() / 3;
+    for (std::size_t t = 0; t < triCount; ++t) {
+        if (m_mesh.triangleFace[t] != std::uint32_t(face))
+            continue;
+        const QVector3D a = at(m_mesh.positions, m_mesh.indices[t * 3]);
+        const QVector3D b = at(m_mesh.positions, m_mesh.indices[t * 3 + 1]);
+        const QVector3D c = at(m_mesh.positions, m_mesh.indices[t * 3 + 2]);
+        const QVector3D cross = QVector3D::crossProduct(b - a, c - a);
+        const float twice = cross.length();
+        if (twice < 1e-9f)
+            continue;
+        const QVector3D n = cross / twice;
+        if (first.isNull())
+            first = n;
+        else if (QVector3D::dotProduct(n, first) < 0.9999f)
+            flat = false;
+        sum += cross;
+        center += (a + b + c) / 3 * twice;
+        area += twice;
+    }
+    if (!flat || area <= 0)
+        return plane;
+
+    const QVector3D normal = sum.normalized();
+    center /= area;
+    // Up on the sketch: world Z, unless the face lies (nearly) flat; then world Y.
+    const QVector3D up = std::abs(normal.z()) < 0.9f ? QVector3D(0, 0, 1) : QVector3D(0, 1, 0);
+    const QVector3D yAxis = (up - normal * QVector3D::dotProduct(up, normal)).normalized();
+    const QVector3D xAxis = QVector3D::crossProduct(yAxis, normal).normalized();
+
+    plane.insert(QStringLiteral("flat"), true);
+    plane.insert(QStringLiteral("origin"), normal * QVector3D::dotProduct(center, normal));
+    plane.insert(QStringLiteral("normal"), normal);
+    plane.insert(QStringLiteral("xAxis"), xAxis);
+    plane.insert(QStringLiteral("yAxis"), yAxis);
+    plane.insert(QStringLiteral("center"), center);
+    return plane;
+}
+
 void Document::fillParts(MeshGeometry *target, const QVariantList &parts, float edgeRadius) const {
     if (!target)
         return;

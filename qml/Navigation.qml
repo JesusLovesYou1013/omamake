@@ -6,6 +6,7 @@ import QtQuick
 //   wheel               zoom, toward the cursor
 //   double-click middle fit the model to the window
 //   hand button (by the view cube) left-drag pans too, until clicked again or Esc
+//   triple-click left   tripleClickAt (Main.qml starts a sketch there)
 // The left button selects (signals hoverAt / clickAt / hoverLeft, handled by Selection.qml),
 // or pans while the hand is on. The view cube (top right) uses orbit() and lookFrom() below.
 MouseArea {
@@ -30,6 +31,12 @@ MouseArea {
     signal hoverAt(real x, real y)
     signal clickAt(real x, real y, int modifiers)
     signal hoverLeft()
+    signal tripleClickAt(real x, real y)
+
+    // Clicks in a row: each within the system's double-click time of the last, near the first.
+    property int clicksInRow: 0
+    property real lastClickTime: 0
+    property point rowAt
 
     acceptedButtons: Qt.LeftButton | Qt.MiddleButton
     hoverEnabled: true
@@ -105,8 +112,20 @@ MouseArea {
             hoverLeft()
     }
     onReleased: mouse => {
-        if (mouse.button === Qt.LeftButton && !panMode && !moved)
-            clickAt(mouse.x, mouse.y, mouse.modifiers)
+        if (mouse.button !== Qt.LeftButton || panMode || moved)
+            return
+        clickAt(mouse.x, mouse.y, mouse.modifiers)
+        const now = Date.now()
+        const inRow = now - lastClickTime <= Qt.styleHints.mouseDoubleClickInterval
+                      && Math.hypot(mouse.x - rowAt.x, mouse.y - rowAt.y) <= clickSlop * 2
+        clicksInRow = inRow ? clicksInRow + 1 : 1
+        lastClickTime = now
+        if (clicksInRow === 1)
+            rowAt = Qt.point(mouse.x, mouse.y)
+        if (clicksInRow === 3) {
+            clicksInRow = 0
+            tripleClickAt(mouse.x, mouse.y)
+        }
     }
     onExited: hoverLeft()
 

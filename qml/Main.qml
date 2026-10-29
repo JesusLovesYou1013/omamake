@@ -114,7 +114,7 @@ Window {
         }
 
         FloorGrid {
-            visible: navigation.gridVisible
+            visible: navigation.gridVisible && !sketch.active
             theme: theme
             fadeDistance: Math.max(3000, navigation.distance * 4)
         }
@@ -175,6 +175,11 @@ Window {
                     baseColor: theme.modelEdge
                 }
             }
+            SketchGrid {
+                theme: theme
+                plane: sketch.plane
+                fadeDistance: Math.max(3000, navigation.distance * 4)
+            }
         }
     }
 
@@ -185,7 +190,8 @@ Window {
         pivot: pivot
         camera: camera
         onHoverAt: (x, y) => selection.hoverAt(x, y)
-        onClickAt: (x, y, modifiers) => selection.clickAt(x, y, modifiers)
+        onClickAt: (x, y, modifiers) => sketch.picking ? sketch.startAt(x, y) : selection.clickAt(x, y, modifiers)
+        onTripleClickAt: (x, y) => { if (!sketch.active && !sketch.picking) sketch.startAt(x, y) }
         onHoverLeft: selection.clearHover()
     }
 
@@ -196,6 +202,20 @@ Window {
         nav: navigation
         hoverGeometry: hoverParts
         selectedGeometry: selectedParts
+    }
+
+    Sketch {
+        id: sketch
+        nav: navigation
+        selection: selection
+    }
+
+    SketchBar {
+        anchors.top: parent.top
+        anchors.topMargin: 14
+        anchors.horizontalCenter: parent.horizontalCenter
+        theme: theme
+        sketch: sketch
     }
 
     ViewCube {
@@ -240,15 +260,20 @@ Window {
         id: search
         theme: theme
         // Things you DO, not ways to look around: view moves stay on the mouse and the
-        // view cube (owner, 2026-10-29). onlyOmarchy commands are left out on other systems.
+        // view cube (owner, 2026-10-29). Each command says which modes it shows in (Model,
+        // Sketch); onlyOmarchy commands are left out on other systems. Names are Fusion's
+        // exact ones wherever Fusion has the function (history/DUNE-VS-FUSION.md).
         commands: [
-            { name: theme.light ? "Dark Mode" : "Light Mode", hint: "Switch the look", group: "Look", keys: "", run: () => theme.light = !theme.light },
-            { name: "Follow Omarchy Theme", onlyOmarchy: true, hint: theme.followSystem ? "Back to OmaMake's own colours" : "Take colours from the current Omarchy theme", group: "Look", keys: "", run: () => theme.followSystem = !theme.followSystem },
-            { name: "Light Follows View", hint: root.lightFollowsView ? "On: the lamp turns with you. Turn off to keep it fixed in the room" : "Off: the lamp stays put in the room. Turn on to have it turn with you", group: "Look", keys: "", run: () => root.lightFollowsView = !root.lightFollowsView },
-            { name: "Grid", hint: navigation.gridVisible ? "Hide the floor grid" : "Show the floor grid", group: "Look", keys: "", run: () => navigation.gridVisible = !navigation.gridVisible },
-            { name: "Simple Look", hint: navigation.simpleLook ? "Back to full shading and shadows" : "Fewer effects, for slower computers", group: "Look", keys: "", run: () => navigation.simpleLook = !navigation.simpleLook },
-            { name: "Quit OmaMake", hint: "Close the window", group: "App", keys: "Ctrl Q", run: () => Qt.quit() }
-        ].filter(c => !c.onlyOmarchy || omarchyTheme.onOmarchy)
+            { name: theme.light ? "Dark Mode" : "Light Mode", hint: "Switch the look", group: "Look", modes: both, keys: "", run: () => theme.light = !theme.light },
+            { name: "Follow Omarchy Theme", onlyOmarchy: true, hint: theme.followSystem ? "Back to OmaMake's own colours" : "Take colours from the current Omarchy theme", group: "Look", modes: both, keys: "", run: () => theme.followSystem = !theme.followSystem },
+            { name: "Light Follows View", hint: root.lightFollowsView ? "On: the lamp turns with you. Turn off to keep it fixed in the room" : "Off: the lamp stays put in the room. Turn on to have it turn with you", group: "Look", modes: both, keys: "", run: () => root.lightFollowsView = !root.lightFollowsView },
+            { name: "Grid", hint: navigation.gridVisible ? "Hide the floor grid" : "Show the floor grid", group: "Look", modes: ["model"], keys: "", run: () => navigation.gridVisible = !navigation.gridVisible },
+            { name: "Simple Look", hint: navigation.simpleLook ? "Back to full shading and shadows" : "Fewer effects, for slower computers", group: "Look", modes: both, keys: "", run: () => navigation.simpleLook = !navigation.simpleLook },
+            { name: "Create Sketch", hint: "Pick a flat face, or empty space for an origin plane (or triple-click one)", group: "Create", modes: ["model"], keys: "", run: () => sketch.picking = true },
+            { name: "Finish Sketch", hint: "Back to the model", group: "Sketch", modes: ["sketch"], keys: "", run: () => sketch.finish() },
+            { name: "Quit OmaMake", hint: "Close the window", group: "App", modes: both, keys: "Ctrl Q", run: () => Qt.quit() }
+        ].filter(c => (!c.onlyOmarchy || omarchyTheme.onOmarchy) && c.modes.includes(sketch.active ? "sketch" : "model"))
+        readonly property var both: ["model", "sketch"]
     }
 
     Shortcut {
@@ -261,13 +286,16 @@ Window {
         anchorItem: modeButton
     }
 
-    // Esc: closes the search or menu first (they handle it), then stops panning,
-    // then clears the selection.
+    // Esc: closes the search or menu first (they handle it), then cancels Create Sketch's
+    // pick, then stops panning, then clears the selection. It never leaves a sketch
+    // (Fusion: only Finish Sketch does).
     Shortcut {
         sequence: "Esc"
-        enabled: (navigation.panMode || selection.selected.length > 0) && !search.open && !modeMenu.open
+        enabled: (sketch.picking || navigation.panMode || selection.selected.length > 0) && !search.open && !modeMenu.open
         onActivated: {
-            if (navigation.panMode)
+            if (sketch.picking)
+                sketch.picking = false
+            else if (navigation.panMode)
                 navigation.panMode = false
             else
                 selection.clear()
