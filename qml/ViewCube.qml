@@ -77,6 +77,10 @@ Item {
         function onYawChanged() { canvas.requestPaint() }
         function onPitchChanged() { canvas.requestPaint() }
     }
+    Connections {
+        target: cube.theme
+        function onLightChanged() { canvas.requestPaint() }
+    }
     onHoveredChanged: canvas.requestPaint()
 
     Canvas {
@@ -104,9 +108,9 @@ Item {
         function drawAxes(ctx, onTop) {
             const corner = [-1, -1, 1]
             const axes = [
-                { d: [1, 0, 0],  color: "#ef4444", label: "X", faces: [[0, -1, 0], [0, 0, 1]] },
-                { d: [0, 0, -1], color: "#34d399", label: "Y", faces: [[0, -1, 0], [-1, 0, 0]] },
-                { d: [0, 1, 0],  color: "#27c2ff", label: "Z", faces: [[-1, 0, 0], [0, 0, 1]] }
+                { d: [1, 0, 0],  color: cube.theme.axisX, label: "X", faces: [[0, -1, 0], [0, 0, 1]] },
+                { d: [0, 0, -1], color: cube.theme.axisY, label: "Y", faces: [[0, -1, 0], [-1, 0, 0]] },
+                { d: [0, 1, 0],  color: cube.theme.accent, label: "Z", faces: [[-1, 0, 0], [0, 0, 1]] }
             ]
             const o = cube.project(corner)
             for (const a of axes) {
@@ -114,14 +118,14 @@ Item {
                 if (visible !== onTop)
                     continue
                 const tip = cube.project([0, 1, 2].map(i => corner[i] + a.d[i] * 2.45))
-                ctx.strokeStyle = a.color
+                ctx.strokeStyle = rgba(a.color, 1)
                 ctx.lineWidth = 2
                 ctx.beginPath()
                 ctx.moveTo(o.x, o.y)
                 ctx.lineTo(tip.x, tip.y)
                 ctx.stroke()
                 const lab = cube.project([0, 1, 2].map(i => corner[i] + a.d[i] * 2.8))
-                ctx.fillStyle = a.color
+                ctx.fillStyle = rgba(a.color, 1)
                 ctx.font = "bold 11px sans-serif"
                 ctx.textAlign = "center"
                 ctx.textBaseline = "middle"
@@ -143,8 +147,9 @@ Item {
                 .filter(e => e.s.c.z > 0.001)
             for (const e of visible) {
                 const f = e.f, s = e.s
-                // Faces turned toward us are a little lighter, for a 3D feel.
-                const lift = 0.06 * s.c.z
+                // Faces turned toward us are a little lighter (dark look), or the ones
+                // turned away a little darker (light look, so nothing goes white).
+                const lift = t.light ? -0.1 * (1 - s.c.z) - 0.03 : 0.06 * s.c.z
                 facePath(ctx, s, -1, 1, -1, 1)
                 ctx.fillStyle = rgba(Qt.rgba(t.panelRaised.r + lift, t.panelRaised.g + lift * 1.2,
                                              t.panelRaised.b + lift * 1.6, 1), 1)

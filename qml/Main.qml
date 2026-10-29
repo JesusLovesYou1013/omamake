@@ -1,7 +1,7 @@
 import QtQuick
 import QtQuick.Window
 import QtQuick3D
-import QtQuick3D.Helpers
+import QtCore
 import OmaMake
 
 // OmaMake's window: nothing but the 3D space, edge to edge. Every command lives
@@ -15,6 +15,13 @@ Window {
     color: "transparent"
 
     Theme { id: theme }
+
+    // Remembered between launches.
+    Settings {
+        location: StandardPaths.writableLocation(StandardPaths.ConfigLocation) + "/omamake/omamake.conf"
+        category: "look"
+        property alias light: theme.light
+    }
 
     // Only the space behind the model follows OmaSkins' transparency; models stay solid.
     readonly property real spaceOpacity: root.active ? transparency.focused : transparency.unfocused
@@ -34,11 +41,6 @@ Window {
             aoDistance: 40
             aoSoftness: 40
 
-            InfiniteGrid {
-                visible: navigation.gridVisible
-                gridInterval: 25.4     // one inch
-                gridAxes: true
-            }
         }
 
         // Camera rig: pivot (what we look at) → yaw → pitch → camera at a distance.
@@ -59,6 +61,12 @@ Window {
                     }
                 }
             }
+        }
+
+        FloorGrid {
+            visible: navigation.gridVisible
+            theme: theme
+            fadeDistance: Math.max(3000, navigation.distance * 4)
         }
 
         DirectionalLight {
@@ -85,7 +93,7 @@ Window {
             Model {
                 geometry: MeshGeometry { id: faces }
                 materials: PrincipledMaterial {
-                    baseColor: "#7f95c2"
+                    baseColor: theme.model
                     metalness: 0.08
                     roughness: 0.42
                 }
@@ -97,7 +105,7 @@ Window {
                 depthBias: -40
                 materials: PrincipledMaterial {
                     lighting: PrincipledMaterial.NoLighting
-                    baseColor: "#0b0e13"
+                    baseColor: theme.modelEdge
                 }
             }
         }
@@ -114,8 +122,9 @@ Window {
     ViewCube {
         id: viewCube
         anchors.top: parent.top
+        anchors.topMargin: 26
         anchors.right: parent.right
-        anchors.margins: 6
+        anchors.rightMargin: 16
         theme: theme
         nav: navigation
     }
@@ -127,6 +136,13 @@ Window {
         anchors.topMargin: 4
         theme: theme
         nav: navigation
+    }
+
+    ModeButton {
+        anchors.top: parent.top
+        anchors.right: parent.right
+        anchors.margins: 10
+        theme: theme
     }
 
     Connections {
@@ -146,6 +162,7 @@ Window {
             { name: "Fit to View", hint: "Show the whole model", group: "View", keys: "Double-click middle", run: () => navigation.fit() },
             { name: "Home View", hint: "Back to the starting angle", group: "View", keys: "", run: () => navigation.home() },
             { name: "Pan", hint: navigation.panMode ? "Stop left-drag panning" : "Left-drag moves the view (Esc stops)", group: "View", keys: "", run: () => navigation.panMode = !navigation.panMode },
+            { name: theme.light ? "Dark Mode" : "Light Mode", hint: "Switch the look", group: "View", keys: "", run: () => theme.light = !theme.light },
             { name: "Grid", hint: navigation.gridVisible ? "Hide the floor grid" : "Show the floor grid", group: "View", keys: "", run: () => navigation.gridVisible = !navigation.gridVisible },
             { name: "Simple Look", hint: navigation.simpleLook ? "Back to full shading and shadows" : "Fewer effects, for slower computers", group: "View", keys: "", run: () => navigation.simpleLook = !navigation.simpleLook },
             { name: "Quit OmaMake", hint: "Close the window", group: "App", keys: "Ctrl Q", run: () => Qt.quit() }
