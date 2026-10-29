@@ -19,6 +19,7 @@ class Document : public QObject {
     Q_PROPERTY(QString engineName READ engineName CONSTANT)
     Q_PROPERTY(QVector3D boundsMin READ boundsMin NOTIFY changed)
     Q_PROPERTY(QVector3D boundsMax READ boundsMax NOTIFY changed)
+    Q_PROPERTY(int historyLength READ historyLength NOTIFY historyChanged)
 
 public:
     explicit Document(std::unique_ptr<omamake::GeometryEngine> engine, QObject *parent = nullptr);
@@ -27,6 +28,8 @@ public:
     // Engine coordinates (mm, Z up).
     QVector3D boundsMin() const { return m_boundsMin; }
     QVector3D boundsMax() const { return m_boundsMax; }
+    // How many actions the history holds (the timeline, later).
+    int historyLength() const { return int(m_actions.size()); }
 
     // Fill a view's shaded geometry and its outline geometry with the model.
     Q_INVOKABLE void fill(MeshGeometry *faces, MeshGeometry *edges) const;
@@ -48,11 +51,19 @@ public:
     // the plane, as in Fusion, so sketches on parallel faces line up.
     Q_INVOKABLE QVariantMap facePlane(int face) const;
 
+    // Sketches. Starting one adds it to the action log; plane is Sketch.qml's
+    // {origin, normal, xAxis, yAxis}. Returns the new sketch's id.
+    Q_INVOKABLE int addSketch(const QVariantMap &plane);
+    // Take a sketch back out as if it was never made (Ctrl+Z in a sketch): its
+    // action leaves the log, so nothing of it is left in the history.
+    Q_INVOKABLE void removeSketch(int id);
+
     // Placeholder until sketch + extrude exist: a cube sitting centred on the floor.
     void addCube(double sizeMm);
 
 signals:
     void changed();
+    void historyChanged();
 
 private:
     void record(const QJsonObject &action);
@@ -60,6 +71,7 @@ private:
 
     std::unique_ptr<omamake::GeometryEngine> m_engine;
     omamake::BodyId m_body = 0;
+    int m_nextSketch = 1;
     QJsonArray m_actions;   // every change, in order (saved with the file later)
     omamake::Mesh m_mesh;   // the model as last built, with its faces, edges and points
     QVector3D m_boundsMin, m_boundsMax;

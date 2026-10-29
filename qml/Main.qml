@@ -287,19 +287,30 @@ Window {
     }
 
     // Esc: closes the search or menu first (they handle it), then cancels Create Sketch's
-    // pick, then stops panning, then clears the selection. It never leaves a sketch
-    // (Fusion: only Finish Sketch does).
+    // pick, then stops panning, then finishes the sketch (same as Finish Sketch, owner
+    // 2026-10-29), then clears the selection.
     Shortcut {
+        id: escKey
         sequence: "Esc"
-        enabled: (sketch.picking || navigation.panMode || selection.selected.length > 0) && !search.open && !modeMenu.open
+        enabled: (sketch.picking || sketch.active || navigation.panMode || selection.selected.length > 0)
+                 && !search.open && !modeMenu.open
         onActivated: {
             if (sketch.picking)
                 sketch.picking = false
             else if (navigation.panMode)
                 navigation.panMode = false
+            else if (sketch.active)
+                sketch.finish()
             else
                 selection.clear()
         }
+    }
+    // Ctrl+Z in a sketch: undo its creation, leaving no sketch in the history (owner, 2026-10-29).
+    Shortcut {
+        id: undoKey
+        sequence: "Ctrl+Z"
+        enabled: sketch.active && !search.open && !modeMenu.open
+        onActivated: sketch.undo()
     }
     Shortcut {
         sequence: "Ctrl+Q"

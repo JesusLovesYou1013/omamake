@@ -40,10 +40,43 @@ void Document::addCube(double sizeMm) {
     emit changed();
 }
 
+namespace {
+
+QJsonArray xyz(const QVariant &v) {
+    const QVector3D p = v.value<QVector3D>();
+    return {p.x(), p.y(), p.z()};
+}
+
+} // namespace
+
+int Document::addSketch(const QVariantMap &plane) {
+    const int id = m_nextSketch++;
+    record({{QStringLiteral("type"), QStringLiteral("sketch")},
+            {QStringLiteral("id"), id},
+            {QStringLiteral("origin"), xyz(plane.value(QStringLiteral("origin")))},
+            {QStringLiteral("normal"), xyz(plane.value(QStringLiteral("normal")))},
+            {QStringLiteral("x_axis"), xyz(plane.value(QStringLiteral("xAxis")))},
+            {QStringLiteral("y_axis"), xyz(plane.value(QStringLiteral("yAxis")))}});
+    return id;
+}
+
+void Document::removeSketch(int id) {
+    for (int i = m_actions.size() - 1; i >= 0; --i) {
+        const QJsonObject a = m_actions.at(i).toObject();
+        if (a.value(QStringLiteral("type")).toString() == QLatin1String("sketch")
+            && a.value(QStringLiteral("id")).toInt() == id) {
+            m_actions.removeAt(i);
+            emit historyChanged();
+            return;
+        }
+    }
+}
+
 void Document::record(const QJsonObject &action) {
     QJsonObject entry = action;
     entry.insert(QStringLiteral("at"), QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
     m_actions.append(entry);
+    emit historyChanged();
 }
 
 void Document::refreshMesh() {

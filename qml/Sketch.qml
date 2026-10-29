@@ -4,7 +4,8 @@ import QtQuick
 //   triple-click a flat face    sketch on that face
 //   triple-click empty space    sketch on the origin plane that faces you most (XY, XZ or YZ)
 //   Create Sketch (search)      the next click picks the face or empty space, Esc cancels
-//   Finish Sketch               back to the model
+//   Finish Sketch, Esc          back to the model, keeping the sketch
+//   Ctrl+Z                      back to the model, and the sketch is gone from the history
 // On entering, the view turns square onto the plane (Fusion's Look At). A plane is
 // {origin, normal, xAxis, yAxis} in engine coordinates (mm, Z up); the normal faces the viewer.
 QtObject {
@@ -16,6 +17,7 @@ QtObject {
     property bool active: false
     property bool picking: false     // Create Sketch is waiting for a click
     property var plane: null
+    property int sketchId: 0         // the open sketch's entry in the document's history
     property string message: ""      // a short note when a pick can't start a sketch
 
     // Fusion's origin planes, each with its own right and up as seen from the front side.
@@ -71,6 +73,7 @@ QtObject {
         picking = false
         message = ""
         plane = p
+        sketchId = doc.addSketch(p)
         active = true
         selection.clear()
         nav.lookAlong(Qt.vector3d(p.normal.x, p.normal.z, -p.normal.y))   // engine → scene
@@ -79,6 +82,14 @@ QtObject {
     function finish() {
         active = false
         plane = null
+        sketchId = 0
+    }
+
+    // Undo the sketch's creation: leave it and take it out of the history.
+    // (Once drawing exists, Ctrl+Z undoes the last drawn thing first.)
+    function undo() {
+        doc.removeSketch(sketchId)
+        finish()
     }
 
     function say(text) {
