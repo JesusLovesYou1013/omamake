@@ -239,16 +239,14 @@ Window {
     CommandSearch {
         id: search
         theme: theme
-        // onlyOmarchy commands are left out on other systems.
+        // Things you DO, not ways to look around: view moves stay on the mouse and the
+        // view cube (owner, 2026-10-29). onlyOmarchy commands are left out on other systems.
         commands: [
-            { name: "Fit to View", hint: "Show the whole model", group: "View", keys: "Double-click middle", run: () => navigation.fit() },
-            { name: "Home View", hint: "Back to the starting angle", group: "View", keys: "", run: () => navigation.home() },
-            { name: "Pan", hint: navigation.panMode ? "Stop left-drag panning" : "Left-drag moves the view (Esc stops)", group: "View", keys: "", run: () => navigation.panMode = !navigation.panMode },
-            { name: theme.light ? "Dark Mode" : "Light Mode", hint: "Switch the look", group: "View", keys: "", run: () => theme.light = !theme.light },
-            { name: "Follow Omarchy Theme", onlyOmarchy: true, hint: theme.followSystem ? "Back to OmaMake's own colours" : "Take colours from the current Omarchy theme", group: "View", keys: "", run: () => theme.followSystem = !theme.followSystem },
-            { name: "Light Follows View", hint: root.lightFollowsView ? "On: the lamp turns with you. Turn off to keep it fixed in the room" : "Off: the lamp stays put in the room. Turn on to have it turn with you", group: "View", keys: "", run: () => root.lightFollowsView = !root.lightFollowsView },
-            { name: "Grid", hint: navigation.gridVisible ? "Hide the floor grid" : "Show the floor grid", group: "View", keys: "", run: () => navigation.gridVisible = !navigation.gridVisible },
-            { name: "Simple Look", hint: navigation.simpleLook ? "Back to full shading and shadows" : "Fewer effects, for slower computers", group: "View", keys: "", run: () => navigation.simpleLook = !navigation.simpleLook },
+            { name: theme.light ? "Dark Mode" : "Light Mode", hint: "Switch the look", group: "Look", keys: "", run: () => theme.light = !theme.light },
+            { name: "Follow Omarchy Theme", onlyOmarchy: true, hint: theme.followSystem ? "Back to OmaMake's own colours" : "Take colours from the current Omarchy theme", group: "Look", keys: "", run: () => theme.followSystem = !theme.followSystem },
+            { name: "Light Follows View", hint: root.lightFollowsView ? "On: the lamp turns with you. Turn off to keep it fixed in the room" : "Off: the lamp stays put in the room. Turn on to have it turn with you", group: "Look", keys: "", run: () => root.lightFollowsView = !root.lightFollowsView },
+            { name: "Grid", hint: navigation.gridVisible ? "Hide the floor grid" : "Show the floor grid", group: "Look", keys: "", run: () => navigation.gridVisible = !navigation.gridVisible },
+            { name: "Simple Look", hint: navigation.simpleLook ? "Back to full shading and shadows" : "Fewer effects, for slower computers", group: "Look", keys: "", run: () => navigation.simpleLook = !navigation.simpleLook },
             { name: "Quit OmaMake", hint: "Close the window", group: "App", keys: "Ctrl Q", run: () => Qt.quit() }
         ].filter(c => !c.onlyOmarchy || omarchyTheme.onOmarchy)
     }
