@@ -23,9 +23,13 @@ Window {
         category: "look"
         property alias light: theme.light
         property alias followSystem: theme.followSystem
+        property alias lightFollowsView: root.lightFollowsView
     }
 
     // Only the space behind the model follows OmaSkins' transparency; models stay solid.
+    // The lamp turns with the view, or stays put in the room (search "Light Follows View").
+    property bool lightFollowsView: true
+
     readonly property real spaceOpacity: root.active ? transparency.focused : transparency.unfocused
 
     View3D {
@@ -45,7 +49,7 @@ Window {
             // Soft studio light from all around (sky above, ground below): gives every
             // face a gentle glow and sheen. Only light comes from it; the background stays ours.
             lightProbe: navigation.simpleLook ? null : studio
-            probeExposure: theme.light ? 0.5 : 0.6
+            probeExposure: theme.light ? 0.3 : 0.35   // low: flat all-round light would wash out the lamp's gradient
 
         }
 
@@ -56,36 +60,6 @@ Window {
                 id: yawNode
                 eulerRotation.y: navigation.yaw
 
-                // Key light: close to the model (a lamp, not the sun), up and to the viewer's
-                // left. Because it's near, its angle changes across each face, so every face
-                // runs from brighter to darker instead of one flat colour. Placed at a multiple
-                // of the camera distance so the look is the same at any zoom.
-                PointLight {
-                    id: keyLight
-                    // How far the lamp is from what we look at (it moves with the zoom).
-                    readonly property real reach: navigation.distance * 0.5 * 1.42
-                    position: Qt.vector3d(-0.7, 1.0, 0.75).times(navigation.distance * 0.5)
-                    brightness: theme.light ? 1.25 : 1.35
-                    // Light fades with distance: full strength at the pivot, brighter on the
-                    // near edge of a face, dimmer on the far edge. (Qt scales linearFade by 0.01.)
-                    constantFade: 0.2
-                    linearFade: 80 / reach
-                    quadraticFade: 0
-                    castsShadow: !navigation.simpleLook
-                    shadowFactor: 35
-                    shadowMapQuality: Light.ShadowMapQualityHigh
-                    shadowMapFar: navigation.distance * 6
-                }
-                // Rim light from behind on the right: lifts the dark side's edges off the background.
-                DirectionalLight {
-                    eulerRotation: Qt.vector3d(-25, 150, 0)
-                    brightness: 0.45
-                }
-                // Soft fill from the viewer's right, so the shadow side keeps its colour.
-                DirectionalLight {
-                    eulerRotation: Qt.vector3d(-10, 35, 0)
-                    brightness: 0.22
-                }
                 Node {
                     id: pitchNode
                     eulerRotation.x: navigation.pitch
@@ -97,6 +71,45 @@ Window {
                         clipFar: 200000
                     }
                 }
+            }
+        }
+
+        // Lights: a lamp near the model, set at a distance from the model's own size (not the
+        // camera's), so light falls off naturally across each face: strong on the edge nearest
+        // the lamp, fading toward the far edge (inverse-square, softened). The rig sits on the
+        // model's centre and turns with the view (lightFollowsView) or stays put in the room.
+        Node {
+            id: lightRig
+            readonly property var bounds: navigation.sceneBounds()
+            position: bounds.center
+            eulerRotation.y: root.lightFollowsView ? navigation.yaw : 35   // 35 = the home view's angle
+
+            PointLight {
+                id: keyLight
+                readonly property real reach: lightRig.bounds.radius * 2.2   // lamp ↔ model centre
+                // Up, and to the left of the viewer (at the home view when fixed).
+                position: Qt.vector3d(-0.62, 0.62, 0.48).normalized().times(reach)
+                brightness: theme.light ? 1.35 : 1.45
+                // Strength = 1 / (0.4 + 0.6·(d/reach)²): full at the model's centre, about
+                // 1.6× on the nearest corner, about 0.8× on the far side. (Qt scales
+                // quadraticFade by 0.0001.)
+                constantFade: 0.4
+                linearFade: 0
+                quadraticFade: 0.6 * 10000 / (reach * reach)
+                castsShadow: !navigation.simpleLook
+                shadowFactor: 35
+                shadowMapQuality: Light.ShadowMapQualityHigh
+                shadowMapFar: reach * 4
+            }
+            // Rim light from behind on the right: lifts the dark side's edges off the background.
+            DirectionalLight {
+                eulerRotation: Qt.vector3d(-25, 150, 0)
+                brightness: 0.35
+            }
+            // A little fill from the right, so the shadow side keeps its colour.
+            DirectionalLight {
+                eulerRotation: Qt.vector3d(-10, 35, 0)
+                brightness: 0.12
             }
         }
 
@@ -233,6 +246,7 @@ Window {
             { name: "Pan", hint: navigation.panMode ? "Stop left-drag panning" : "Left-drag moves the view (Esc stops)", group: "View", keys: "", run: () => navigation.panMode = !navigation.panMode },
             { name: theme.light ? "Dark Mode" : "Light Mode", hint: "Switch the look", group: "View", keys: "", run: () => theme.light = !theme.light },
             { name: "Follow Omarchy Theme", onlyOmarchy: true, hint: theme.followSystem ? "Back to OmaMake's own colours" : "Take colours from the current Omarchy theme", group: "View", keys: "", run: () => theme.followSystem = !theme.followSystem },
+            { name: "Light Follows View", hint: root.lightFollowsView ? "On: the lamp turns with you. Turn off to keep it fixed in the room" : "Off: the lamp stays put in the room. Turn on to have it turn with you", group: "View", keys: "", run: () => root.lightFollowsView = !root.lightFollowsView },
             { name: "Grid", hint: navigation.gridVisible ? "Hide the floor grid" : "Show the floor grid", group: "View", keys: "", run: () => navigation.gridVisible = !navigation.gridVisible },
             { name: "Simple Look", hint: navigation.simpleLook ? "Back to full shading and shadows" : "Fewer effects, for slower computers", group: "View", keys: "", run: () => navigation.simpleLook = !navigation.simpleLook },
             { name: "Quit OmaMake", hint: "Close the window", group: "App", keys: "Ctrl Q", run: () => Qt.quit() }
