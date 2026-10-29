@@ -10,7 +10,9 @@
 #include <QVariantMap>
 #include <QVector3D>
 
+#include <map>
 #include <memory>
+#include <vector>
 
 class MeshGeometry;
 
@@ -20,6 +22,8 @@ class Document : public QObject {
     Q_PROPERTY(QVector3D boundsMin READ boundsMin NOTIFY changed)
     Q_PROPERTY(QVector3D boundsMax READ boundsMax NOTIFY changed)
     Q_PROPERTY(int historyLength READ historyLength NOTIFY historyChanged)
+    Q_PROPERTY(QVariantMap browser READ browser NOTIFY structureChanged)
+    Q_PROPERTY(int activeComponent READ activeComponent WRITE setActiveComponent NOTIFY structureChanged)
 
 public:
     explicit Document(std::unique_ptr<omamake::GeometryEngine> engine, QObject *parent = nullptr);
@@ -51,7 +55,21 @@ public:
     // the plane, as in Fusion, so sketches on parallel faces line up.
     Q_INVOKABLE QVariantMap facePlane(int face) const;
 
-    // Sketches. Starting one adds it to the action log; plane is Sketch.qml's
+    // The Browser's tree (Fusion's names): the root component, then nested components.
+    // Every component can hold Origin, Bodies, Sketches and further components: Fusion's
+    // "hybrid design", always on here. Each node: {key, kind, name, id?, children: [...]};
+    // kind is "component", "folder", "origin", "plane", "axis", "point", "body" or "sketch".
+    QVariantMap browser() const;
+
+    // New sketches and components go into the active component (Fusion's radio button).
+    int activeComponent() const { return m_active; }
+    void setActiveComponent(int id);
+
+    // Fusion's New Component: an empty component inside the active one, which it then
+    // activates, so the next one nests inside it. Returns its id.
+    Q_INVOKABLE int newComponent();
+
+    // Sketches. Starting one adds it to the action log and to the active component; plane is Sketch.qml's
     // {origin, normal, xAxis, yAxis}. Returns the new sketch's id.
     Q_INVOKABLE int addSketch(const QVariantMap &plane);
     // Take a sketch back out as if it was never made (Ctrl+Z in a sketch): its
@@ -64,6 +82,7 @@ public:
 signals:
     void changed();
     void historyChanged();
+    void structureChanged();
 
 private:
     void record(const QJsonObject &action);
@@ -71,6 +90,29 @@ private:
 
     std::unique_ptr<omamake::GeometryEngine> m_engine;
     omamake::BodyId m_body = 0;
+    struct Component {
+        int id = 0;
+        int parent = -1;              // -1: the root component
+        QString name;
+        int nextSketch = 1;           // Sketch1, Sketch2… counted per component, as in Fusion
+        std::vector<int> components, bodies, sketches;
+    };
+    struct Named {
+        int component = 0;
+        QString name;
+    };
+    static Component rootComponent() {
+        Component root;
+        root.name = QStringLiteral("(Unsaved)");   // the document's name, until it's saved
+        return root;
+    }
+    Component *component(int id);
+    QVariantMap componentNode(const Component &c) const;
+
+    std::vector<Component> m_components = {rootComponent()};
+    std::map<int, Named> m_bodies, m_sketches;   // by id
+    int m_active = 0;
+    int m_nextComponent = 1;
     int m_nextSketch = 1;
     QJsonArray m_actions;   // every change, in order (saved with the file later)
     omamake::Mesh m_mesh;   // the model as last built, with its faces, edges and points

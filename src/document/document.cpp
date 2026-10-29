@@ -5,6 +5,7 @@
 #include <QDateTime>
 #include <QJsonObject>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <set>
@@ -34,6 +35,9 @@ void Document::addCube(double sizeMm) {
         m_body = joined;
     } else {
         m_body = placed;
+        m_bodies[int(m_body)] = {0, QStringLiteral("Body1")};
+        m_components[0].bodies.push_back(int(m_body));
+        emit structureChanged();
     }
     record({{QStringLiteral("type"), QStringLiteral("cube")}, {QStringLiteral("size_mm"), sizeMm}});
     refreshMesh();
@@ -51,16 +55,34 @@ QJsonArray xyz(const QVariant &v) {
 
 int Document::addSketch(const QVariantMap &plane) {
     const int id = m_nextSketch++;
+    Component *owner = component(m_active);
+    const QString name = QStringLiteral("Sketch%1").arg(owner->nextSketch++);
+    owner->sketches.push_back(id);
+    m_sketches[id] = {owner->id, name};
     record({{QStringLiteral("type"), QStringLiteral("sketch")},
             {QStringLiteral("id"), id},
+            {QStringLiteral("name"), name},
+            {QStringLiteral("component"), owner->id},
             {QStringLiteral("origin"), xyz(plane.value(QStringLiteral("origin")))},
             {QStringLiteral("normal"), xyz(plane.value(QStringLiteral("normal")))},
             {QStringLiteral("x_axis"), xyz(plane.value(QStringLiteral("xAxis")))},
             {QStringLiteral("y_axis"), xyz(plane.value(QStringLiteral("yAxis")))}});
+    emit structureChanged();
     return id;
 }
 
 void Document::removeSketch(int id) {
+    const auto found = m_sketches.find(id);
+    if (found != m_sketches.end()) {
+        // Undoing the newest sketch hands its number back, so the next is named the same.
+        Component *owner = component(found->second.component);
+        auto &list = owner->sketches;
+        if (!list.empty() && list.back() == id)
+            --owner->nextSketch;
+        list.erase(std::remove(list.begin(), list.end(), id), list.end());
+        m_sketches.erase(found);
+        emit structureChanged();
+    }
     for (int i = m_actions.size() - 1; i >= 0; --i) {
         const QJsonObject a = m_actions.at(i).toObject();
         if (a.value(QStringLiteral("type")).toString() == QLatin1String("sketch")
@@ -70,6 +92,77 @@ void Document::removeSketch(int id) {
             return;
         }
     }
+}
+
+Document::Component *Document::component(int id) {
+    for (Component &c : m_components)
+        if (c.id == id)
+            return &c;
+    return &m_components[0];
+}
+
+void Document::setActiveComponent(int id) {
+    if (id != m_active && component(id)->id == id) {
+        m_active = id;
+        emit structureChanged();
+    }
+}
+
+int Document::newComponent() {
+    const int id = m_nextComponent++;
+    Component c;
+    c.id = id;
+    c.parent = m_active;
+    c.name = QStringLiteral("Component%1:1").arg(id);   // name:occurrence, as Fusion shows it
+    component(m_active)->components.push_back(id);
+    m_components.push_back(c);
+    record({{QStringLiteral("type"), QStringLiteral("component")}, {QStringLiteral("id"), id},
+            {QStringLiteral("name"), c.name}, {QStringLiteral("parent"), c.parent}});
+    m_active = id;
+    emit structureChanged();
+    return id;
+}
+
+QVariantMap Document::browser() const {
+    return componentNode(m_components[0]);
+}
+
+QVariantMap Document::componentNode(const Component &c) const {
+    auto node = [](const QString &key, const char *kind, const QString &name, QVariantList children = {}) {
+        return QVariantMap{{QStringLiteral("key"), key}, {QStringLiteral("kind"), QString::fromLatin1(kind)},
+                           {QStringLiteral("name"), name}, {QStringLiteral("children"), children}};
+    };
+    const QString k = QStringLiteral("c%1").arg(c.id);
+    QVariantList children;
+
+    // Fusion's origin: the centre point, the three axes and the three planes.
+    QVariantList origin;
+    origin << node(k + QStringLiteral("/O"), "point", QStringLiteral("O"));
+    for (const char *axis : {"X", "Y", "Z"})
+        origin << node(k + QStringLiteral("/") + QLatin1String(axis), "axis", QString::fromLatin1(axis));
+    for (const char *plane : {"XY", "XZ", "YZ"})
+        origin << node(k + QStringLiteral("/") + QLatin1String(plane), "plane", QString::fromLatin1(plane));
+    children << node(k + QStringLiteral("/origin"), "origin", QStringLiteral("Origin"), origin);
+
+    // Folders show only once they hold something, as in Fusion.
+    QVariantList bodies, sketches;
+    for (int id : c.bodies)
+        bodies << node(QStringLiteral("b%1").arg(id), "body", m_bodies.at(id).name);
+    for (int id : c.sketches)
+        sketches << node(QStringLiteral("s%1").arg(id), "sketch", m_sketches.at(id).name);
+    if (!bodies.isEmpty())
+        children << node(k + QStringLiteral("/bodies"), "folder", QStringLiteral("Bodies"), bodies);
+    if (!sketches.isEmpty())
+        children << node(k + QStringLiteral("/sketches"), "folder", QStringLiteral("Sketches"), sketches);
+
+    for (int id : c.components)
+        for (const Component &sub : m_components)
+            if (sub.id == id)
+                children << componentNode(sub);
+
+    QVariantMap me = node(k, "component", c.name, children);
+    me.insert(QStringLiteral("id"), c.id);
+    return me;
 }
 
 void Document::record(const QJsonObject &action) {

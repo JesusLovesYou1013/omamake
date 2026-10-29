@@ -24,6 +24,7 @@ Window {
         property alias light: theme.light
         property alias followSystem: theme.followSystem
         property alias lightFollowsView: root.lightFollowsView
+        property alias browserShown: browserTree.shown
     }
 
     // Only the space behind the model follows OmaSkins' transparency; models stay solid.
@@ -204,6 +205,15 @@ Window {
         selectedGeometry: selectedParts
     }
 
+    Browser {
+        id: browserTree
+        anchors.left: parent.left
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        width: 300
+        theme: theme
+    }
+
     Sketch {
         id: sketch
         nav: navigation
@@ -269,6 +279,8 @@ Window {
             { name: "Light Follows View", hint: root.lightFollowsView ? "On: the lamp turns with you. Turn off to keep it fixed in the room" : "Off: the lamp stays put in the room. Turn on to have it turn with you", group: "Look", modes: both, keys: "", run: () => root.lightFollowsView = !root.lightFollowsView },
             { name: "Grid", hint: navigation.gridVisible ? "Hide the floor grid" : "Show the floor grid", group: "Look", modes: ["model"], keys: "", run: () => navigation.gridVisible = !navigation.gridVisible },
             { name: "Simple Look", hint: navigation.simpleLook ? "Back to full shading and shadows" : "Fewer effects, for slower computers", group: "Look", modes: both, keys: "", run: () => navigation.simpleLook = !navigation.simpleLook },
+            { name: "New Component", hint: "An empty component inside the active one, made active", group: "Assemble", modes: ["model"], keys: "", run: () => doc.newComponent() },
+            { name: "Browser", hint: browserTree.shown ? "Hide the design tree" : "Show the design tree", group: "Look", modes: both, keys: "", run: () => browserTree.shown = !browserTree.shown },
             { name: "Create Sketch", hint: "Pick a flat face, or empty space for an origin plane (or triple-click one)", group: "Create", modes: ["model"], keys: "", run: () => sketch.picking = true },
             { name: "Finish Sketch", hint: "Back to the model", group: "Sketch", modes: ["sketch"], keys: "", run: () => sketch.finish() },
             { name: "Quit OmaMake", hint: "Close the window", group: "App", modes: both, keys: "Ctrl Q", run: () => Qt.quit() }
