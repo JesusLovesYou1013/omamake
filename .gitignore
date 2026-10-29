@@ -1,0 +1,10 @@
+# Private notes (owner + Claude only, backed up to pCloud, never pushed)
+HANDOFF.md
+ENGINE-HANDOFF.md
+history/
+
+# Owner's design files used for testing
+samples/
+
+# Build output
+build/
