@@ -112,9 +112,19 @@ Window {
     }
 
     ViewCube {
+        id: viewCube
         anchors.top: parent.top
         anchors.right: parent.right
         anchors.margins: 6
+        theme: theme
+        nav: navigation
+    }
+
+    HandButton {
+        anchors.right: viewCube.left
+        anchors.rightMargin: -4
+        anchors.top: viewCube.top
+        anchors.topMargin: 4
         theme: theme
         nav: navigation
     }
@@ -135,6 +145,7 @@ Window {
         commands: [
             { name: "Fit to View", hint: "Show the whole model", group: "View", keys: "Double-click middle", run: () => navigation.fit() },
             { name: "Home View", hint: "Back to the starting angle", group: "View", keys: "", run: () => navigation.home() },
+            { name: "Pan", hint: navigation.panMode ? "Stop left-drag panning" : "Left-drag moves the view (Esc stops)", group: "View", keys: "", run: () => navigation.panMode = !navigation.panMode },
             { name: "Grid", hint: navigation.gridVisible ? "Hide the floor grid" : "Show the floor grid", group: "View", keys: "", run: () => navigation.gridVisible = !navigation.gridVisible },
             { name: "Simple Look", hint: navigation.simpleLook ? "Back to full shading and shadows" : "Fewer effects, for slower computers", group: "View", keys: "", run: () => navigation.simpleLook = !navigation.simpleLook },
             { name: "Quit OmaMake", hint: "Close the window", group: "App", keys: "Ctrl Q", run: () => Qt.quit() }
@@ -144,6 +155,11 @@ Window {
     Shortcut {
         sequence: "Alt+Space"
         onActivated: search.toggle()
+    }
+    Shortcut {
+        sequence: "Esc"
+        enabled: navigation.panMode && !search.open
+        onActivated: navigation.panMode = false
     }
     Shortcut {
         sequence: "Ctrl+Q"

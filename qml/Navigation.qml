@@ -5,6 +5,7 @@ import QtQuick
 //   Shift+middle-drag   orbit
 //   wheel               zoom, toward the cursor
 //   double-click middle fit the model to the window
+//   hand button (by the view cube) left-drag pans too, until clicked again or Esc
 // The left button is left free for selecting. The view cube (top right) uses
 // orbit() and lookFrom() below.
 MouseArea {
@@ -24,7 +25,10 @@ MouseArea {
     readonly property real orbitDegreesPerPixel: 0.3
     readonly property real zoomPerNotch: 0.88
 
-    acceptedButtons: Qt.MiddleButton
+    property bool panMode: false
+
+    acceptedButtons: panMode ? (Qt.LeftButton | Qt.MiddleButton) : Qt.MiddleButton
+    cursorShape: !panMode ? Qt.ArrowCursor : (pressedButtons & Qt.LeftButton) ? Qt.ClosedHandCursor : Qt.OpenHandCursor
     property point last
 
     // Model bounds come in engine coordinates (mm, Z up); the scene is Y up.
@@ -91,7 +95,7 @@ MouseArea {
         const dx = mouse.x - last.x
         const dy = mouse.y - last.y
         last = Qt.point(mouse.x, mouse.y)
-        if (mouse.modifiers & Qt.ShiftModifier) {
+        if ((mouse.modifiers & Qt.ShiftModifier) && (mouse.buttons & Qt.MiddleButton)) {
             orbit(dx, dy)
         } else {
             const u = unitsPerPixel()
