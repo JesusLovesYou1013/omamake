@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Window
 import QtQuick3D
 import QtCore
+import QtQuick3D.Helpers
 import OmaMake
 
 // OmaMake's window: nothing but the 3D space, edge to edge. Every command lives
@@ -41,6 +42,10 @@ Window {
             aoStrength: 60
             aoDistance: 40
             aoSoftness: 40
+            // Soft studio light from all around (sky above, ground below): gives every
+            // face a gentle glow and sheen. Only light comes from it; the background stays ours.
+            lightProbe: navigation.simpleLook ? null : studio
+            probeExposure: theme.light ? 0.5 : 0.6
 
         }
 
@@ -50,6 +55,37 @@ Window {
             Node {
                 id: yawNode
                 eulerRotation.y: navigation.yaw
+
+                // Key light: close to the model (a lamp, not the sun), up and to the viewer's
+                // left. Because it's near, its angle changes across each face, so every face
+                // runs from brighter to darker instead of one flat colour. Placed at a multiple
+                // of the camera distance so the look is the same at any zoom.
+                PointLight {
+                    id: keyLight
+                    // How far the lamp is from what we look at (it moves with the zoom).
+                    readonly property real reach: navigation.distance * 0.5 * 1.42
+                    position: Qt.vector3d(-0.7, 1.0, 0.75).times(navigation.distance * 0.5)
+                    brightness: theme.light ? 1.25 : 1.35
+                    // Light fades with distance: full strength at the pivot, brighter on the
+                    // near edge of a face, dimmer on the far edge. (Qt scales linearFade by 0.01.)
+                    constantFade: 0.2
+                    linearFade: 80 / reach
+                    quadraticFade: 0
+                    castsShadow: !navigation.simpleLook
+                    shadowFactor: 35
+                    shadowMapQuality: Light.ShadowMapQualityHigh
+                    shadowMapFar: navigation.distance * 6
+                }
+                // Rim light from behind on the right: lifts the dark side's edges off the background.
+                DirectionalLight {
+                    eulerRotation: Qt.vector3d(-25, 150, 0)
+                    brightness: 0.45
+                }
+                // Soft fill from the viewer's right, so the shadow side keeps its colour.
+                DirectionalLight {
+                    eulerRotation: Qt.vector3d(-10, 35, 0)
+                    brightness: 0.22
+                }
                 Node {
                     id: pitchNode
                     eulerRotation.x: navigation.pitch
@@ -70,20 +106,18 @@ Window {
             fadeDistance: Math.max(3000, navigation.distance * 4)
         }
 
-        DirectionalLight {
-            eulerRotation: Qt.vector3d(-50, -35, 0)
-            brightness: 1.1
-            castsShadow: !navigation.simpleLook
-            shadowFactor: 45
-            shadowMapQuality: Light.ShadowMapQualityHigh
-        }
-        DirectionalLight {
-            eulerRotation: Qt.vector3d(-20, 140, 0)
-            brightness: 0.45
-        }
-        DirectionalLight {
-            eulerRotation: Qt.vector3d(70, 0, 0)
-            brightness: 0.2
+        Texture {
+            id: studio
+            textureData: ProceduralSkyTextureData {
+                textureQuality: ProceduralSkyTextureData.SkyTextureQualityLow
+                skyTopColor: "#dfe7f2"
+                skyHorizonColor: "#9ca8ba"
+                skyEnergy: 1.0
+                groundHorizonColor: "#6b7380"
+                groundBottomColor: "#2a2f37"
+                groundEnergy: 1.0
+                sunEnergy: 0
+            }
         }
 
         // The model, in engine coordinates (mm, Z up) turned to Quick 3D's Y up.
