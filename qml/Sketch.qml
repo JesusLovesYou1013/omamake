@@ -5,7 +5,9 @@ import QtQuick
 //   triple-click empty space    sketch on the origin plane that faces you most (XY, XZ or YZ)
 //   Create Sketch (search)      the next click picks the face or empty space, Esc cancels
 //   Finish Sketch, Esc          back to the model, keeping the sketch
-//   Ctrl+Z                      back to the model, and the sketch is gone from the history
+//   Ctrl+Z                      undoes the sketch's own steps (lines, constraints…), newest
+//                               first; with nothing left in it, leaves it and the sketch is
+//                               gone from the history (owner, 2026-10-29)
 // On entering, the view turns square onto the plane (Fusion's Look At). A plane is
 // {origin, normal, xAxis, yAxis} in engine coordinates (mm, Z up); the normal faces the viewer.
 QtObject {
@@ -18,6 +20,9 @@ QtObject {
     property bool picking: false     // Create Sketch is waiting for a click
     property var plane: null
     property int sketchId: 0         // the open sketch's entry in the document's history
+    // What was done inside the open sketch, oldest first: each step is {name, undo}, where
+    // undo() takes it back. Drawing tools and constraints add theirs with did().
+    property var steps: []
     property string message: ""      // a short note when a pick can't start a sketch
 
     // Fusion's origin planes, each with its own right and up as seen from the front side.
@@ -74,6 +79,7 @@ QtObject {
         message = ""
         plane = p
         sketchId = doc.addSketch(p)
+        steps = []
         active = true
         selection.clear()
         nav.lookAlong(Qt.vector3d(p.normal.x, p.normal.z, -p.normal.y))   // engine → scene
@@ -83,11 +89,22 @@ QtObject {
         active = false
         plane = null
         sketchId = 0
+        steps = []
     }
 
-    // Undo the sketch's creation: leave it and take it out of the history.
-    // (Once drawing exists, Ctrl+Z undoes the last drawn thing first.)
+    function did(name, undo) {
+        steps = steps.concat([{ name: name, undo: undo }])
+    }
+
+    // Ctrl+Z: the newest step inside the sketch, or, when nothing is left in it,
+    // the sketch's creation (leave it and take it out of the history).
     function undo() {
+        if (steps.length > 0) {
+            const last = steps[steps.length - 1]
+            steps = steps.slice(0, -1)
+            last.undo()
+            return
+        }
         doc.removeSketch(sketchId)
         finish()
     }

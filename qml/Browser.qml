@@ -3,7 +3,7 @@ import QtQuick
 // The Browser (Fusion's name): the design's tree on the left, top down. The root
 // component holds Origin, Bodies, Sketches and further components, which can hold
 // the same again, nested as deep as wanted (Fusion's "hybrid design", always on).
-//   arrow tab on the left edge   shows or hides the tree; it never moves
+//   arrow tab, middle of the left edge   shows or hides the tree; it never moves
 //   click a row with children    open or close it
 //   round button on a component  make it the active one: new sketches and components go in it
 // No panel behind it: each row is its own floating button, so the 3D space shows
@@ -44,11 +44,11 @@ Item {
         return out
     }
 
-    // The tab on the edge: always in the same place, whatever the tree does.
+    // The tab on the edge, halfway down: always in the same place, whatever the tree does.
     Rectangle {
         id: tab
         x: -8
-        y: 14
+        anchors.verticalCenter: parent.verticalCenter
         width: 26
         height: 40
         radius: 8
@@ -78,7 +78,7 @@ Item {
 
     Flickable {
         id: list
-        x: browser.shown ? 26 : -browser.treeWidth - 10
+        x: browser.shown ? tab.x + tab.width + 16 : -browser.treeWidth - 10   // a clear gap after the tab
         y: 14
         width: browser.treeWidth
         height: Math.min(contentHeight, browser.height - y - 70)
