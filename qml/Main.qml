@@ -111,6 +111,14 @@ Window {
         camera: camera
     }
 
+    ViewCube {
+        anchors.top: parent.top
+        anchors.right: parent.right
+        anchors.margins: 6
+        theme: theme
+        nav: navigation
+    }
+
     Connections {
         target: doc
         function onChanged() { doc.fill(faces, edges) }
