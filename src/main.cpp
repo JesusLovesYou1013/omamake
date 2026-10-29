@@ -1,5 +1,6 @@
 #include "document/document.h"
 #include "engine/engine.h"
+#include "theme/omarchytheme.h"
 #include "theme/transparency.h"
 #include "view/meshgeometry.h"
 
@@ -39,12 +40,14 @@ int main(int argc, char *argv[]) {
     qmlRegisterType<MeshGeometry>("OmaMake", 1, 0, "MeshGeometry");
 
     Transparency transparency;
+    OmarchyTheme omarchyTheme;
     Document document(omamake::makeLiteEngine());
     document.addCube(12 * kInch);
 
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("doc"), &document);
     engine.rootContext()->setContextProperty(QStringLiteral("transparency"), &transparency);
+    engine.rootContext()->setContextProperty(QStringLiteral("omarchyTheme"), &omarchyTheme);
     engine.load(QUrl::fromLocalFile(QDir(qmlDir()).filePath(QStringLiteral("Main.qml"))));
     if (engine.rootObjects().isEmpty())
         return 1;

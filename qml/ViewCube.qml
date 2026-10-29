@@ -79,7 +79,7 @@ Item {
     }
     Connections {
         target: cube.theme
-        function onLightChanged() { canvas.requestPaint() }
+        function onPChanged() { canvas.requestPaint() }    // any colour changed
     }
     onHoveredChanged: canvas.requestPaint()
 

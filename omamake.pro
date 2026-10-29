@@ -19,6 +19,7 @@ DEFINES += OMAMAKE_SOURCE_QML_DIR=\\\"$$PWD/qml\\\"
 HEADERS += \
     src/document/document.h \
     src/engine/engine.h \
+    src/theme/omarchytheme.h \
     src/theme/transparency.h \
     src/view/meshgeometry.h
 
@@ -26,5 +27,6 @@ SOURCES += \
     src/main.cpp \
     src/document/document.cpp \
     src/engine/lite/liteengine.cpp \
+    src/theme/omarchytheme.cpp \
     src/theme/transparency.cpp \
     src/view/meshgeometry.cpp

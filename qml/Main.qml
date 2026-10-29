@@ -21,6 +21,7 @@ Window {
         location: StandardPaths.writableLocation(StandardPaths.ConfigLocation) + "/omamake/omamake.conf"
         category: "look"
         property alias light: theme.light
+        property alias followSystem: theme.followSystem
     }
 
     // Only the space behind the model follows OmaSkins' transparency; models stay solid.
@@ -139,10 +140,12 @@ Window {
     }
 
     ModeButton {
+        id: modeButton
         anchors.top: parent.top
         anchors.right: parent.right
         anchors.margins: 10
         theme: theme
+        onMenuRequested: modeMenu.show()
     }
 
     Connections {
@@ -163,6 +166,7 @@ Window {
             { name: "Home View", hint: "Back to the starting angle", group: "View", keys: "", run: () => navigation.home() },
             { name: "Pan", hint: navigation.panMode ? "Stop left-drag panning" : "Left-drag moves the view (Esc stops)", group: "View", keys: "", run: () => navigation.panMode = !navigation.panMode },
             { name: theme.light ? "Dark Mode" : "Light Mode", hint: "Switch the look", group: "View", keys: "", run: () => theme.light = !theme.light },
+            { name: "Follow Omarchy Theme", hint: theme.followSystem ? "Back to OmaMake's own colours" : "Take colours from the current Omarchy theme", group: "View", keys: "", run: () => theme.followSystem = !theme.followSystem },
             { name: "Grid", hint: navigation.gridVisible ? "Hide the floor grid" : "Show the floor grid", group: "View", keys: "", run: () => navigation.gridVisible = !navigation.gridVisible },
             { name: "Simple Look", hint: navigation.simpleLook ? "Back to full shading and shadows" : "Fewer effects, for slower computers", group: "View", keys: "", run: () => navigation.simpleLook = !navigation.simpleLook },
             { name: "Quit OmaMake", hint: "Close the window", group: "App", keys: "Ctrl Q", run: () => Qt.quit() }
@@ -173,9 +177,15 @@ Window {
         sequence: "Alt+Space"
         onActivated: search.toggle()
     }
+    ModeMenu {
+        id: modeMenu
+        theme: theme
+        anchorItem: modeButton
+    }
+
     Shortcut {
         sequence: "Esc"
-        enabled: navigation.panMode && !search.open
+        enabled: navigation.panMode && !search.open && !modeMenu.open
         onActivated: navigation.panMode = false
     }
     Shortcut {

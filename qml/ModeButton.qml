@@ -1,10 +1,12 @@
 import QtQuick
 
 // Light/dark switch, top right: a moon while dark, a sun while light.
+// Right-click asks for the look menu (Main.qml shows ModeMenu).
 Item {
     id: mode
 
     required property var theme
+    signal menuRequested()
 
     width: 30
     height: 30
@@ -64,6 +66,12 @@ Item {
         anchors.fill: parent
         hoverEnabled: true
         cursorShape: Qt.PointingHandCursor
-        onClicked: mode.theme.light = !mode.theme.light
+        acceptedButtons: Qt.LeftButton | Qt.RightButton
+        onClicked: m => {
+            if (m.button === Qt.RightButton)
+                mode.menuRequested()
+            else
+                mode.theme.light = !mode.theme.light
+        }
     }
 }
