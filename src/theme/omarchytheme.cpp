@@ -6,6 +6,13 @@
 #include <QRegularExpression>
 
 OmarchyTheme::OmarchyTheme(QObject *parent) : QObject(parent) {
+    // Omarchy installs itself here (with a version file); its theme state lives elsewhere.
+    QString data = qEnvironmentVariable("XDG_DATA_HOME");
+    if (data.isEmpty())
+        data = QDir::homePath() + QStringLiteral("/.local/share");
+    m_onOmarchy = QFileInfo::exists(data + QStringLiteral("/omarchy/version"))
+               || QFileInfo::exists(QDir::homePath() + QStringLiteral("/.local/share/omarchy/version"));
+
     connect(&m_watcher, &QFileSystemWatcher::fileChanged, this, &OmarchyTheme::reload);
     connect(&m_watcher, &QFileSystemWatcher::directoryChanged, this, &OmarchyTheme::reload);
     reload();

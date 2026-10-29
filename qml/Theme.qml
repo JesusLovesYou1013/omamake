@@ -16,7 +16,8 @@ QtObject {
 
     property bool light: false
     property bool followSystem: false
-    readonly property bool following: followSystem && omarchyTheme.available
+    // Only on Omarchy; elsewhere the option isn't offered and the saved switch is ignored.
+    readonly property bool following: followSystem && omarchyTheme.onOmarchy && omarchyTheme.available
 
     readonly property var builtInDark: ({
         windowBg: "#0B0E13", panelBg: "#111722", panelRaised: "#171E2A", controlBg: "#1B2431",

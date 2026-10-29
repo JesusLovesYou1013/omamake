@@ -6,6 +6,8 @@
 // lines like  accent = "#3CBF5C",  background = "#080C09",  mode = "dark".
 // Theme switches replace that folder, so the parent folders are watched too.
 // No file → available is false and the app keeps its own palette.
+// onOmarchy says whether this is an Omarchy system at all; elsewhere the
+// "Follow Omarchy theme" option isn't offered (other desktops aren't supported).
 
 #include <QFileSystemWatcher>
 #include <QObject>
@@ -13,6 +15,7 @@
 
 class OmarchyTheme : public QObject {
     Q_OBJECT
+    Q_PROPERTY(bool onOmarchy READ onOmarchy NOTIFY changed)
     Q_PROPERTY(bool available READ available NOTIFY changed)
     Q_PROPERTY(QString name READ name NOTIFY changed)
     Q_PROPERTY(QVariantMap colors READ colors NOTIFY changed)
@@ -20,6 +23,7 @@ class OmarchyTheme : public QObject {
 public:
     explicit OmarchyTheme(QObject *parent = nullptr);
 
+    bool onOmarchy() const { return m_onOmarchy || available(); }
     bool available() const { return !m_colors.isEmpty(); }
     QString name() const { return m_name; }
     QVariantMap colors() const { return m_colors; }
@@ -34,4 +38,5 @@ private:
     QFileSystemWatcher m_watcher;
     QString m_name;
     QVariantMap m_colors;
+    bool m_onOmarchy = false;
 };

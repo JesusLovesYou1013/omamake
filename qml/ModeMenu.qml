@@ -61,13 +61,16 @@ Item {
                 mark: menu.theme.light ? "●" : ""
                 onActivated: menu.theme.light = true
             }
+            // Only offered on Omarchy.
             Rectangle {
+                visible: omarchyTheme.onOmarchy
                 width: parent.width
                 height: 9
                 color: "transparent"
                 Rectangle { anchors.centerIn: parent; width: parent.width - 12; height: 1; color: menu.theme.border }
             }
             MenuRow {
+                visible: omarchyTheme.onOmarchy
                 theme: menu.theme
                 text: "Follow Omarchy theme"
                 detail: !omarchyTheme.available ? "No Omarchy theme found"
@@ -88,7 +91,7 @@ Item {
         signal activated()
 
         width: parent ? parent.width : 0
-        height: detail ? 44 : 32
+        height: !visible ? 0 : detail ? 44 : 32
         radius: 6
         color: rowArea.containsMouse && enabled ? theme.controlHover : "transparent"
         opacity: enabled ? 1 : 0.5
