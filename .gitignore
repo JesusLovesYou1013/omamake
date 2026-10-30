@@ -7,3 +7,6 @@ samples/
 
 # Build output
 build/
+
+# Compiled Qt Quick shaders (made by the build beside their source)
+qml/shaders/*.qsb

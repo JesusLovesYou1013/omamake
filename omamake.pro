@@ -30,3 +30,11 @@ SOURCES += \
     src/theme/omarchytheme.cpp \
     src/theme/transparency.cpp \
     src/view/meshgeometry.cpp
+
+# Qt Quick shaders (2D effects) are compiled to .qsb beside their source, where the QML reads them.
+QSB_SOURCES = $$PWD/qml/shaders/crossfade.frag
+qsb.input = QSB_SOURCES
+qsb.output = $$PWD/qml/shaders/${QMAKE_FILE_BASE}.frag.qsb
+qsb.commands = $$[QT_HOST_BINS]/qsb --glsl \"100 es,120,150\" --hlsl 50 --msl 12 -o ${QMAKE_FILE_OUT} ${QMAKE_FILE_IN}
+qsb.CONFIG += no_link target_predeps
+QMAKE_EXTRA_COMPILERS += qsb

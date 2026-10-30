@@ -51,7 +51,9 @@ MouseArea {
         const lo = doc.boundsMin, hi = doc.boundsMax
         return {
             center: Qt.vector3d((lo.x + hi.x) / 2, (lo.z + hi.z) / 2, -(lo.y + hi.y) / 2),
-            radius: Math.max(1, Qt.vector3d(hi.x - lo.x, hi.y - lo.y, hi.z - lo.z).length() / 2)
+            // An empty design: room for the origin's planes.
+            radius: Math.max(lo.x === hi.x && lo.y === hi.y && lo.z === hi.z ? 150 : 1,
+                             Qt.vector3d(hi.x - lo.x, hi.y - lo.y, hi.z - lo.z).length() / 2)
         }
     }
 
@@ -69,6 +71,7 @@ MouseArea {
     // and dragging the view cube, so both feel the same.
     function orbit(dx, dy) {
         flight.stop()
+        flightBack.stop()
         yaw -= dx * orbitDegreesPerPixel
         pitch = Math.max(-90, Math.min(90, pitch - dy * orbitDegreesPerPixel))
     }
@@ -76,6 +79,7 @@ MouseArea {
     // Fly to a view angle and fit the model, by the shortest way round.
     function lookFrom(toYaw, toPitch) {
         flight.stop()
+        flightBack.stop()
         yaw = ((yaw % 360) + 540) % 360 - 180
         let target = ((toYaw % 360) + 540) % 360 - 180
         if (target - yaw > 180) target -= 360
@@ -91,6 +95,35 @@ MouseArea {
         const flat = Math.hypot(dir.x, dir.z)
         const toYaw = flat > 1e-6 ? Math.atan2(dir.x, dir.z) * 180 / Math.PI : 0
         lookFrom(toYaw, -Math.atan2(dir.y, flat) * 180 / Math.PI)
+    }
+
+    // The whole view as it is now (angle, zoom, centre), to come back to later.
+    function viewState() {
+        const c = pivot.position   // copied: a vector read from a property follows later changes
+        return { yaw: yaw, pitch: pitch, distance: distance, center: Qt.vector3d(c.x, c.y, c.z) }
+    }
+
+    // Fly back to a saved view, turning the shortest way round.
+    function restoreView(s) {
+        flight.stop()
+        flightBack.stop()
+        yaw = ((yaw % 360) + 540) % 360 - 180
+        let target = ((s.yaw % 360) + 540) % 360 - 180
+        if (target - yaw > 180) target -= 360
+        if (target - yaw < -180) target += 360
+        backYaw.to = target
+        backPitch.to = s.pitch
+        backDistance.to = s.distance
+        backCenter.to = s.center
+        flightBack.start()
+    }
+
+    ParallelAnimation {
+        id: flightBack
+        NumberAnimation { id: backYaw; target: nav; property: "yaw"; duration: 380; easing.type: Easing.OutCubic }
+        NumberAnimation { id: backPitch; target: nav; property: "pitch"; duration: 380; easing.type: Easing.OutCubic }
+        NumberAnimation { id: backDistance; target: nav; property: "distance"; duration: 380; easing.type: Easing.OutCubic }
+        Vector3dAnimation { id: backCenter; target: nav.pivot; property: "position"; duration: 380; easing.type: Easing.OutCubic }
     }
 
     ParallelAnimation {

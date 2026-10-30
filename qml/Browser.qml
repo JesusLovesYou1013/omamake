@@ -6,6 +6,10 @@ import QtQuick
 //   arrow tab, middle of the left edge   shows or hides the tree; it never moves
 //   click a row with children    open or close it
 //   round button on a component  make it the active one: new sketches and components go in it
+//   eye on every row but the top  show or hide it (and all inside it); hidden things fade out
+//   while sketching, the planes' eyes show or hide them for this sketch only (they start
+//   hidden in every sketch, and nothing goes in the history)
+//   right-click Origin or a plane  the planes' style (PlaneStyleMenu, opened by Main.qml)
 // No panel behind it: each row is its own floating button, so the 3D space shows
 // around them. Longer than the window, the list scrolls.
 Item {
@@ -13,6 +17,12 @@ Item {
 
     required property var theme
     property bool shown: true
+    // Runs a show/hide so it fades cleanly (Main.qml's crossfade).
+    property var crossfade: change => change()
+    property var sketch: null           // Sketch.qml: its planes are its own while it's open
+
+    // Right-click on Origin or one of its planes; x, y in the Browser's own coordinates.
+    signal planeMenuRequested(real x, real y)
 
     readonly property int rowHeight: 28
     readonly property int treeWidth: 250
@@ -105,6 +115,10 @@ Item {
                     readonly property bool parentNode: node.children.length > 0
                     readonly property bool isComponent: node.kind === "component"
                     readonly property bool active: isComponent && node.id === doc.activeComponent
+                    readonly property bool isDesign: modelData.depth === 0   // the design itself: no eye
+                    readonly property bool sketchPlane: node.kind === "plane" && !!browser.sketch && browser.sketch.active
+                    readonly property bool shown: sketchPlane ? !!browser.sketch.shownPlanes[node.key] : node.shown
+                    readonly property bool seen: sketchPlane ? shown : node.visible
 
                     x: modelData.depth * browser.indent
                     width: browser.treeWidth - x
@@ -119,8 +133,18 @@ Item {
                         id: rowArea
                         anchors.fill: parent
                         hoverEnabled: true
+                        acceptedButtons: Qt.LeftButton | Qt.RightButton
                         cursorShape: row.parentNode ? Qt.PointingHandCursor : Qt.ArrowCursor
-                        onClicked: if (row.parentNode) browser.toggle(row.node)
+                        onClicked: mouse => {
+                            if (mouse.button === Qt.RightButton) {
+                                if (row.node.kind === "origin" || row.node.kind === "plane") {
+                                    const at = mapToItem(browser, mouse.x, mouse.y)
+                                    browser.planeMenuRequested(at.x, at.y)
+                                }
+                            } else if (row.parentNode) {
+                                browser.toggle(row.node)
+                            }
+                        }
                     }
 
                     // Open/closed arrow.
@@ -137,6 +161,7 @@ Item {
 
                     BrowserIcon {
                         id: icon
+                        opacity: row.seen ? 1 : 0.4
                         x: arrow.x + arrow.width + 2
                         anchors.verticalCenter: parent.verticalCenter
                         theme: browser.theme
@@ -147,16 +172,30 @@ Item {
                     Text {
                         anchors.left: icon.right
                         anchors.leftMargin: 7
-                        anchors.right: radio.left
+                        anchors.right: eye.left
                         anchors.rightMargin: 6
                         height: parent.height
                         verticalAlignment: Text.AlignVCenter
                         elide: Text.ElideRight
                         text: row.node.name
+                        opacity: row.seen ? 1 : 0.5
                         color: row.node.kind === "folder" || row.node.kind === "origin" ? browser.theme.textSecondary
                                                                                          : browser.theme.textPrimary
                         font.pixelSize: 13
                         font.bold: row.active
+                    }
+
+                    // Same column on every row, whether or not it has the activate button.
+                    EyeButton {
+                        id: eye
+                        anchors.right: parent.right
+                        anchors.rightMargin: 30
+                        anchors.verticalCenter: parent.verticalCenter
+                        theme: browser.theme
+                        visible: !row.isDesign
+                        open: row.shown
+                        onClicked: browser.crossfade(() => row.sketchPlane ? browser.sketch.showPlane(row.node.key, !row.shown)
+                                                                           : doc.setShown(row.node.key, !row.node.shown))
                     }
 
                     // Fusion's activate button, on components only.

@@ -42,7 +42,10 @@ int main(int argc, char *argv[]) {
     Transparency transparency;
     OmarchyTheme omarchyTheme;
     Document document(omamake::makeLiteEngine());
-    document.addCube(12 * kInch);
+    // A new design starts empty: sketches start on the origin planes (owner, 2026-10-29).
+    // OMAMAKE_TEST_CUBE=1 places the old 12 in cube, for testing faces until bodies can be made.
+    if (qEnvironmentVariableIntValue("OMAMAKE_TEST_CUBE"))
+        document.addCube(12 * kInch);
 
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("doc"), &document);

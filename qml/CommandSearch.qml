@@ -8,7 +8,7 @@ Item {
     required property var theme
     property var commands: []
     property bool open: false
-    property bool usedOnce: false
+    property int timesOpened: 0          // remembered (Main.qml Settings); the hint goes after 3
     property int current: 0
 
     readonly property var matches: {
@@ -22,7 +22,7 @@ Item {
     function toggle() {
         open = !open
         if (open) {
-            usedOnce = true
+            timesOpened++
             input.text = ""
             current = 0
             input.forceActiveFocus()

@@ -6,6 +6,9 @@ import QtQuick
 //   Ctrl- or Shift-click    add it to the selection, or take it out again
 //   click empty space, Esc  clear the selection
 // Points win over edges, edges over faces (Document::pick). A part is {kind, index}.
+// The origin's point, axes and planes (OriginShapes) can be picked too, as
+// {kind: "origin", name: "O"/"X"/…/"XY", part: "point"/"axis"/"plane"}: its point and
+// axes count like the model's points and edges, a plane like a face (nearest wins).
 QtObject {
     id: sel
 
@@ -14,6 +17,8 @@ QtObject {
     required property var nav
     required property var hoverGeometry
     required property var selectedGeometry
+    required property var origin             // OriginShapes
+    property bool pickable: true             // false while the body is hidden
 
     property var hovered: null
     property var selected: []
@@ -43,11 +48,28 @@ QtObject {
     function partAt(x, y) {
         const r = rayAt(x, y)
         const k = perPixel()
-        const hit = doc.pick(r.origin, r.direction, pointPixels * k, edgePixels * k)
-        return hit.kind ? { kind: hit.kind, index: hit.index } : null
+        const hit = pickable ? doc.pick(r.origin, r.direction, pointPixels * k, edgePixels * k)
+                             : { kind: "", depth: -1 }
+        const body = hit.kind ? { kind: hit.kind, index: hit.index } : null
+        const surface = hit.depth > 0 ? hit.depth : Infinity
+        const o = origin.hitAt(r.origin, r.direction, pointPixels * k, edgePixels * k)
+        const near = o && o.t <= surface + o.reach * 2      // not hidden behind the model
+        const asPart = o ? { kind: "origin", name: o.name, part: o.part, index: -1 } : null
+
+        if (near && o.part === "point")
+            return asPart
+        if (hit.kind === "point")
+            return body
+        if (near && o.part === "axis" && hit.kind !== "edge")
+            return asPart
+        if (hit.kind === "edge")
+            return body
+        if (o && o.part === "plane" && o.t < surface)
+            return asPart
+        return body
     }
 
-    function same(a, b) { return !!a && !!b && a.kind === b.kind && a.index === b.index }
+    function same(a, b) { return !!a && !!b && a.kind === b.kind && a.index === b.index && a.name === b.name }
 
     function hoverAt(x, y) {
         const part = partAt(x, y)
@@ -86,10 +108,30 @@ QtObject {
     }
 
     // Tubes and balls keep the same on-screen thickness at any zoom.
+    // The model's parts are drawn here; the origin lights its own (OriginShapes).
     function redraw() {
         const radius = nav.distance * perPixel() * tubePixels
-        doc.fillParts(selectedGeometry, selected, radius)
-        doc.fillParts(hoverGeometry, hovered ? [hovered] : [], radius * 1.15)
+        const ofModel = p => p.kind !== "origin"
+        doc.fillParts(selectedGeometry, selected.filter(ofModel), radius)
+        doc.fillParts(hoverGeometry, hovered && ofModel(hovered) ? [hovered] : [], radius * 1.15)
+        origin.hovered = hovered && !ofModel(hovered) ? hovered.name : ""
+        origin.selected = selected.filter(p => !ofModel(p)).map(p => p.name)
+    }
+
+    // Hidden parts can't stay lit or selected.
+    onPickableChanged: if (!pickable) clear()
+    property Connections originShown: Connections {
+        target: sel.origin
+        function onShownChanged() {
+            const shown = sel.origin.shown
+            const stays = p => p.kind !== "origin" || !!shown[p.name]
+            if (!sel.selected.every(stays) || (sel.hovered && !stays(sel.hovered))) {
+                sel.selected = sel.selected.filter(stays)
+                if (sel.hovered && !stays(sel.hovered))
+                    sel.hovered = null
+                sel.redraw()
+            }
+        }
     }
 
     property Connections zoom: Connections {

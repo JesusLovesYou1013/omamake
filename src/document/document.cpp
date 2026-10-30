@@ -3,9 +3,11 @@
 #include "view/meshgeometry.h"
 
 #include <QDateTime>
+#include <QDebug>
 #include <QJsonObject>
 
 #include <algorithm>
+#include <functional>
 #include <cmath>
 #include <limits>
 #include <set>
@@ -35,11 +37,13 @@ void Document::addCube(double sizeMm) {
         m_body = joined;
     } else {
         m_body = placed;
-        m_bodies[int(m_body)] = {0, QStringLiteral("Body1")};
+        m_bodies[int(m_body)] = {0, QStringLiteral("Body1"), {}};
         m_components[0].bodies.push_back(int(m_body));
         emit structureChanged();
     }
-    record({{QStringLiteral("type"), QStringLiteral("cube")}, {QStringLiteral("size_mm"), sizeMm}});
+    record({{QStringLiteral("type"), QStringLiteral("cube")}, {QStringLiteral("size_mm"), sizeMm},
+            {QStringLiteral("undoable"), false}},   // the starting model, until real modelling exists
+           QStringLiteral("Placed a %1 mm cube (Body1)").arg(sizeMm));
     refreshMesh();
     emit changed();
 }
@@ -58,7 +62,8 @@ int Document::addSketch(const QVariantMap &plane) {
     Component *owner = component(m_active);
     const QString name = QStringLiteral("Sketch%1").arg(owner->nextSketch++);
     owner->sketches.push_back(id);
-    m_sketches[id] = {owner->id, name};
+    m_sketches[id] = {owner->id, name, plane};
+    const QString on = plane.value(QStringLiteral("label")).toString();
     record({{QStringLiteral("type"), QStringLiteral("sketch")},
             {QStringLiteral("id"), id},
             {QStringLiteral("name"), name},
@@ -66,32 +71,95 @@ int Document::addSketch(const QVariantMap &plane) {
             {QStringLiteral("origin"), xyz(plane.value(QStringLiteral("origin")))},
             {QStringLiteral("normal"), xyz(plane.value(QStringLiteral("normal")))},
             {QStringLiteral("x_axis"), xyz(plane.value(QStringLiteral("xAxis")))},
-            {QStringLiteral("y_axis"), xyz(plane.value(QStringLiteral("yAxis")))}});
+            {QStringLiteral("y_axis"), xyz(plane.value(QStringLiteral("yAxis")))},
+            {QStringLiteral("on"), on},
+            {QStringLiteral("active_component"), m_active}},
+           QStringLiteral("Created %1 in %2 on %3").arg(name, owner->name, on.isEmpty() ? QStringLiteral("a plane") : on));
+    m_openSketch = id;
     emit structureChanged();
     return id;
 }
 
+void Document::finishSketch(int id) {
+    const auto found = m_sketches.find(id);
+    if (found == m_sketches.end())
+        return;
+    record({{QStringLiteral("type"), QStringLiteral("finish_sketch")}, {QStringLiteral("sketch"), id},
+            {QStringLiteral("name"), found->second.name}},
+           QStringLiteral("Finished %1").arg(found->second.name));
+    m_openSketch = 0;
+}
+
+QVariantMap Document::sketchPlane(int id) const {
+    const auto found = m_sketches.find(id);
+    return found == m_sketches.end() ? QVariantMap{} : found->second.plane;
+}
+
+QVariantMap Document::undo() {
+    if (m_actions.isEmpty())
+        return {};
+    const QJsonObject last = m_actions.last().toObject();
+    if (!last.value(QStringLiteral("undoable")).toBool(true))
+        return {};
+    const QString type = last.value(QStringLiteral("type")).toString();
+    if (type == QLatin1String("sketch")) {
+        removeSketch(last.value(QStringLiteral("id")).toInt());
+        m_openSketch = 0;
+    } else if (type == QLatin1String("component")) {
+        removeComponent(last.value(QStringLiteral("id")).toInt());
+        m_active = last.value(QStringLiteral("previous_active")).toInt();
+        emit structureChanged();
+    } else if (type == QLatin1String("visibility")) {
+        const QString key = last.value(QStringLiteral("key")).toString();
+        if (last.value(QStringLiteral("shown")).toBool())
+            m_hidden.insert(key);
+        else
+            m_hidden.erase(key);
+        emit structureChanged();
+    } else if (type == QLatin1String("activate")) {
+        m_active = last.value(QStringLiteral("from")).toInt();
+        emit structureChanged();
+    } else if (type == QLatin1String("finish_sketch")) {
+        m_openSketch = last.value(QStringLiteral("sketch")).toInt();   // the window goes back into it
+    }
+    m_actions.removeLast();
+    qInfo().noquote() << "history: undid:" << last.value(QStringLiteral("summary")).toString();
+    emit historyChanged();
+    return last.toVariantMap();
+}
+
 void Document::removeSketch(int id) {
     const auto found = m_sketches.find(id);
-    if (found != m_sketches.end()) {
-        // Undoing the newest sketch hands its number back, so the next is named the same.
-        Component *owner = component(found->second.component);
-        auto &list = owner->sketches;
-        if (!list.empty() && list.back() == id)
-            --owner->nextSketch;
-        list.erase(std::remove(list.begin(), list.end(), id), list.end());
-        m_sketches.erase(found);
-        emit structureChanged();
-    }
-    for (int i = m_actions.size() - 1; i >= 0; --i) {
-        const QJsonObject a = m_actions.at(i).toObject();
-        if (a.value(QStringLiteral("type")).toString() == QLatin1String("sketch")
-            && a.value(QStringLiteral("id")).toInt() == id) {
-            m_actions.removeAt(i);
-            emit historyChanged();
-            return;
-        }
-    }
+    if (found == m_sketches.end())
+        return;
+    // Undoing the newest sketch hands its number back, so the next is named the same.
+    Component *owner = component(found->second.component);
+    auto &list = owner->sketches;
+    if (!list.empty() && list.back() == id)
+        --owner->nextSketch;
+    list.erase(std::remove(list.begin(), list.end(), id), list.end());
+    m_sketches.erase(found);
+    emit structureChanged();
+}
+
+void Document::removeComponent(int id) {
+    if (id == 0)
+        return;
+    Component *gone = component(id);
+    auto &siblings = component(gone->parent)->components;
+    siblings.erase(std::remove(siblings.begin(), siblings.end(), id), siblings.end());
+    m_components.erase(std::remove_if(m_components.begin(), m_components.end(),
+                                      [id](const Component &c) { return c.id == id; }),
+                       m_components.end());
+    if (id == m_nextComponent - 1)
+        --m_nextComponent;   // the next new one gets the same number again
+}
+
+QString Document::componentName(int id) const {
+    for (const Component &c : m_components)
+        if (c.id == id)
+            return c.name;
+    return {};
 }
 
 Document::Component *Document::component(int id) {
@@ -103,6 +171,9 @@ Document::Component *Document::component(int id) {
 
 void Document::setActiveComponent(int id) {
     if (id != m_active && component(id)->id == id) {
+        record({{QStringLiteral("type"), QStringLiteral("activate")}, {QStringLiteral("from"), m_active},
+                {QStringLiteral("to"), id}},
+               QStringLiteral("Activated %1 (was %2)").arg(componentName(id), componentName(m_active)));
         m_active = id;
         emit structureChanged();
     }
@@ -116,15 +187,58 @@ int Document::newComponent() {
     c.name = QStringLiteral("Component%1:1").arg(id);   // name:occurrence, as Fusion shows it
     component(m_active)->components.push_back(id);
     m_components.push_back(c);
+    m_hidden.insert(QStringLiteral("c%1/origin").arg(id));   // origins start hidden, as in Fusion
     record({{QStringLiteral("type"), QStringLiteral("component")}, {QStringLiteral("id"), id},
-            {QStringLiteral("name"), c.name}, {QStringLiteral("parent"), c.parent}});
+            {QStringLiteral("name"), c.name}, {QStringLiteral("parent"), c.parent},
+            {QStringLiteral("previous_active"), m_active}},
+           QStringLiteral("New Component %1 inside %2, made active").arg(c.name, componentName(c.parent)));
     m_active = id;
     emit structureChanged();
     return id;
 }
 
 QVariantMap Document::browser() const {
-    return componentNode(m_components[0]);
+    return markVisible(componentNode(m_components[0]), true);
+}
+
+QVariantMap Document::markVisible(QVariantMap node, bool parentVisible) const {
+    const QString key = node.value(QStringLiteral("key")).toString();
+    const bool shown = key == QLatin1String("c0") || !m_hidden.count(key);
+    const bool visible = parentVisible && shown;
+    node.insert(QStringLiteral("shown"), shown);
+    node.insert(QStringLiteral("visible"), visible);
+    QVariantList children;
+    for (const QVariant &child : node.value(QStringLiteral("children")).toList())
+        children << markVisible(child.toMap(), visible);
+    node.insert(QStringLiteral("children"), children);
+    return node;
+}
+
+void Document::setShown(const QString &key, bool shown) {
+    if (key == QLatin1String("c0") || shown == !m_hidden.count(key))
+        return;
+    if (shown)
+        m_hidden.erase(key);
+    else
+        m_hidden.insert(key);
+    // The row's name, and the component it sits in, for the summary.
+    QString name = key, inside;
+    std::function<void(const QVariantMap &, const QString &)> find = [&](const QVariantMap &n, const QString &comp) {
+        const bool isComp = n.value(QStringLiteral("kind")).toString() == QLatin1String("component");
+        const QString here = isComp ? n.value(QStringLiteral("name")).toString() : comp;
+        if (n.value(QStringLiteral("key")).toString() == key) {
+            name = n.value(QStringLiteral("name")).toString();
+            inside = comp;
+        }
+        for (const QVariant &child : n.value(QStringLiteral("children")).toList())
+            find(child.toMap(), here);
+    };
+    find(componentNode(m_components[0]), QString());
+    record({{QStringLiteral("type"), QStringLiteral("visibility")}, {QStringLiteral("key"), key},
+            {QStringLiteral("name"), name}, {QStringLiteral("shown"), shown}},
+           QStringLiteral("%1 %2%3").arg(shown ? QStringLiteral("Showed") : QStringLiteral("Hid"), name,
+                                         inside.isEmpty() ? QString() : QStringLiteral(" in ") + inside));
+    emit structureChanged();
 }
 
 QVariantMap Document::componentNode(const Component &c) const {
@@ -165,9 +279,17 @@ QVariantMap Document::componentNode(const Component &c) const {
     return me;
 }
 
-void Document::record(const QJsonObject &action) {
+void Document::record(const QJsonObject &action, const QString &summary) {
     QJsonObject entry = action;
+    // Done inside a sketch: that sketch's own history (its own row in the Timeline). Starting
+    // and finishing it belong to the design's history, where the sketch is one point.
+    const QString type = action.value(QStringLiteral("type")).toString();
+    if (m_openSketch && type != QLatin1String("sketch") && type != QLatin1String("finish_sketch"))
+        entry.insert(QStringLiteral("in_sketch"), m_openSketch);
     entry.insert(QStringLiteral("at"), QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
+    entry.insert(QStringLiteral("summary"), summary);
+    qInfo().noquote() << "history:" << (entry.contains(QStringLiteral("in_sketch"))
+                                            ? QStringLiteral("[in %1] %2").arg(m_sketches[m_openSketch].name, summary) : summary);
     m_actions.append(entry);
     emit historyChanged();
 }
@@ -286,8 +408,11 @@ QVariantMap Document::pick(QVector3D origin, QVector3D direction, float pointRea
     }
     auto visible = [&](float t, float reach) { return t <= hitT + reach * 2; };
 
-    auto result = [](const char *kind, int index) {
-        return QVariantMap{{QStringLiteral("kind"), QString::fromLatin1(kind)}, {QStringLiteral("index"), index}};
+    // depth: how far along the ray the nearest surface is (none: -1), so the origin's
+    // planes (Selection.qml) can tell whether they're in front of the model or behind it.
+    auto result = [&](const char *kind, int index) {
+        return QVariantMap{{QStringLiteral("kind"), QString::fromLatin1(kind)}, {QStringLiteral("index"), index},
+                           {QStringLiteral("depth"), std::isfinite(hitT) ? hitT : -1.0f}};
     };
 
     int best = -1;

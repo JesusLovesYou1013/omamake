@@ -25,11 +25,93 @@ Window {
         property alias followSystem: theme.followSystem
         property alias lightFollowsView: root.lightFollowsView
         property alias browserShown: browserTree.shown
+        property alias timelineShown: historyTimeline.shown
+        property alias searchTimesOpened: search.timesOpened
+        property alias planeStyle: root.planeStyle
+        property alias planeStyleOverrides: root.planeStyleOverrides
+    }
+
+    // How the origin planes look (PlaneStyleMenu): "cross" or "corner". planeStyle is the
+    // default, set by the menu's "all" choice; single planes chosen apart from it are kept
+    // in planeStyleOverrides (JSON, {XY: "corner"}), until "all" is chosen again.
+    property string planeStyle: "cross"
+    property string planeStyleOverrides: "{}"
+    readonly property var planeStyles: {
+        let over = {}
+        try { over = JSON.parse(planeStyleOverrides) } catch (e) {}
+        const out = {}
+        for (const p of ["XY", "XZ", "YZ"])
+            out[p] = over[p] === "cross" || over[p] === "corner" ? over[p] : planeStyle
+        return out
+    }
+    function setPlaneStyle(plane, style) {
+        if (plane === "" ? (planeStyle === style && planeStyleOverrides === "{}") : planeStyles[plane] === style)
+            return
+        crossfade(() => {
+            if (plane === "") {
+                planeStyle = style
+                planeStyleOverrides = "{}"
+            } else {
+                const over = {}
+                for (const p of ["XY", "XZ", "YZ"]) {
+                    const s = p === plane ? style : planeStyles[p]
+                    if (s !== planeStyle)
+                        over[p] = s
+                }
+                planeStyleOverrides = JSON.stringify(over)
+            }
+        })
     }
 
     // Only the space behind the model follows OmaSkins' transparency; models stay solid.
     // The lamp turns with the view, or stays put in the room (search "Light Follows View").
     property bool lightFollowsView: true
+
+    // What the Browser's eyes leave visible, by node key (a row counts as visible only
+    // when every row above it is shown too).
+    readonly property var visibleKeys: {
+        const out = {}
+        const walk = node => {
+            out[node.key] = node.visible
+            for (const child of node.children)
+                walk(child)
+        }
+        walk(doc.browser)
+        return out
+    }
+    // Is any body visible? One mesh holds the model until bodies are separate meshes.
+    readonly property bool bodyVisible: Object.keys(visibleKeys).some(k => k.startsWith("b") && visibleKeys[k])
+    // Each origin part, shown if it's visible in any component (they share one place for now).
+    // While sketching, the planes are hidden unless shown again with their eye during the
+    // sketch (sketch.shownPlanes; owner, 2026-10-29); the point and axes stay as they are.
+    readonly property var originVisible: {
+        const out = {}
+        for (const k in visibleKeys) {
+            const part = k.split("/")[1]
+            const plane = ["XY", "XZ", "YZ"].includes(part)
+            if (plane && sketch.active ? !!sketch.shownPlanes[k]
+                                       : visibleKeys[k] && (plane || ["O", "X", "Y", "Z"].includes(part)))
+                out[part] = true
+        }
+        return out
+    }
+
+    property int fadeMs: 250                 // how long showing or hiding takes (owner, 2026-10-29)
+
+    // Show or hide something cleanly: a snapshot of the view as it is now goes on top, the
+    // change happens underneath at once, and the snapshot fades away. Everything (body,
+    // edges, origin lines and planes, grid, shading) goes from before to after together,
+    // with no part of it changing ahead of the rest. Moving the view ends it early, so the
+    // snapshot never lags behind the camera.
+    function crossfade(change) {
+        view.grabToImage(result => {
+            beforeShot.source = result.url
+            fading.progress = 0
+            fading.on = true
+            change()
+            fadeAway.restart()
+        })
+    }
 
     readonly property real spaceOpacity: root.active ? transparency.focused : transparency.unfocused
 
@@ -139,48 +221,108 @@ Window {
             id: modelSpace
             eulerRotation.x: -90
 
-            Model {
-                geometry: MeshGeometry { id: faces }
-                materials: PrincipledMaterial {
-                    baseColor: theme.model
-                    metalness: 0.08
-                    roughness: 0.42
+            // The body, hidden by its eye in the Browser (the fade is the view's crossfade).
+            Node {
+                visible: root.bodyVisible
+
+                Model {
+                    geometry: MeshGeometry { id: faces }
+                    materials: PrincipledMaterial {
+                        baseColor: theme.model
+                        metalness: 0.08
+                        roughness: 0.42
+                    }
+                    castsShadows: true
+                    receivesShadows: true
                 }
-                castsShadows: true
-                receivesShadows: true
+                // Selected parts, then the hovered part on top (Selection.qml fills these).
+                Model {
+                    geometry: MeshGeometry { id: selectedParts }
+                    depthBias: -60
+                    materials: PrincipledMaterial {
+                        baseColor: theme.selection
+                        metalness: 0.05
+                        roughness: 0.45
+                    }
+                }
+                Model {
+                    geometry: MeshGeometry { id: hoverParts }
+                    depthBias: -80
+                    materials: PrincipledMaterial {
+                        baseColor: theme.hover
+                        metalness: 0.05
+                        roughness: 0.45
+                    }
+                }
+                Model {
+                    geometry: MeshGeometry { id: edges; lines: true }
+                    depthBias: -40
+                    materials: PrincipledMaterial {
+                        lighting: PrincipledMaterial.NoLighting
+                        baseColor: theme.modelEdge
+                    }
+                }
             }
-            // Selected parts, then the hovered part on top (Selection.qml fills these).
-            Model {
-                geometry: MeshGeometry { id: selectedParts }
-                depthBias: -60
-                materials: PrincipledMaterial {
-                    baseColor: theme.selection
-                    metalness: 0.05
-                    roughness: 0.45
-                }
-            }
-            Model {
-                geometry: MeshGeometry { id: hoverParts }
-                depthBias: -80
-                materials: PrincipledMaterial {
-                    baseColor: theme.hover
-                    metalness: 0.05
-                    roughness: 0.45
-                }
-            }
-            Model {
-                geometry: MeshGeometry { id: edges; lines: true }
-                depthBias: -40
-                materials: PrincipledMaterial {
-                    lighting: PrincipledMaterial.NoLighting
-                    baseColor: theme.modelEdge
-                }
+
+            OriginShapes {
+                id: originShapes
+                theme: theme
+                shown: root.originVisible
+                styles: root.planeStyles
+                size: Math.max(100, navigation.sceneBounds().radius * 0.75)
+                lineRadius: navigation.distance * 0.0011
             }
             SketchGrid {
                 theme: theme
                 plane: sketch.plane
                 fadeDistance: Math.max(3000, navigation.distance * 4)
             }
+        }
+    }
+
+    // The crossfade itself: the snapshot and the live view (kept off screen meanwhile),
+    // mixed by a small shader.
+    Image {
+        id: beforeShot
+        anchors.fill: view
+        cache: false
+        visible: false
+    }
+    ShaderEffectSource {
+        id: afterLive
+        anchors.fill: view
+        sourceItem: fading.on ? view : null
+        hideSource: true
+        visible: false
+    }
+    ShaderEffect {
+        id: fading
+        property bool on: false
+        property real progress: 0
+        property var before: beforeShot
+        property var after: afterLive
+        anchors.fill: view
+        visible: on
+        fragmentShader: "shaders/crossfade.frag.qsb"
+        NumberAnimation on progress {
+            id: fadeAway
+            running: false
+            to: 1
+            duration: root.fadeMs
+            easing.type: Easing.InOutQuad
+            onFinished: fading.on = false
+        }
+    }
+    Connections {
+        target: navigation
+        function onYawChanged() { root.stopCrossfade() }
+        function onPitchChanged() { root.stopCrossfade() }
+        function onDistanceChanged() { root.stopCrossfade() }
+    }
+    function stopCrossfade() {
+        if (fading.on) {
+            fadeAway.stop()
+            fading.on = false
         }
     }
 
@@ -203,6 +345,8 @@ Window {
         nav: navigation
         hoverGeometry: hoverParts
         selectedGeometry: selectedParts
+        origin: originShapes
+        pickable: root.bodyVisible
     }
 
     Browser {
@@ -212,6 +356,12 @@ Window {
         anchors.bottom: parent.bottom
         width: 300
         theme: theme
+        crossfade: root.crossfade
+        sketch: sketch
+        onPlaneMenuRequested: (x, y) => {
+            const at = mapToItem(root.contentItem, x, y)
+            planeMenu.show(at.x + 4, at.y + 4)
+        }
     }
 
     Sketch {
@@ -281,6 +431,8 @@ Window {
             { name: "Simple Look", hint: navigation.simpleLook ? "Back to full shading and shadows" : "Fewer effects, for slower computers", group: "Look", modes: both, keys: "", run: () => navigation.simpleLook = !navigation.simpleLook },
             { name: "New Component", hint: "An empty component inside the active one, made active", group: "Assemble", modes: ["model"], keys: "", run: () => doc.newComponent() },
             { name: "Browser", hint: browserTree.shown ? "Hide the design tree" : "Show the design tree", group: "Look", modes: both, keys: "", run: () => browserTree.shown = !browserTree.shown },
+            { name: "Origin Planes: Cross", hint: "All planes full size, through the centre (how OmaMake opens)", group: "Look", modes: both, keys: "", run: () => root.setPlaneStyle("", "cross") },
+            { name: "Origin Planes: Cube Corner", hint: "All planes smaller, plus side only, apart (how OmaMake opens)", group: "Look", modes: both, keys: "", run: () => root.setPlaneStyle("", "corner") },
             { name: "Create Sketch", hint: "Pick a flat face, or empty space for an origin plane (or triple-click one)", group: "Create", modes: ["model"], keys: "", run: () => sketch.picking = true },
             { name: "Finish Sketch", hint: "Back to the model", group: "Sketch", modes: ["sketch"], keys: "", run: () => sketch.finish() },
             { name: "Quit OmaMake", hint: "Close the window", group: "App", modes: both, keys: "Ctrl Q", run: () => Qt.quit() }
@@ -291,6 +443,12 @@ Window {
     Shortcut {
         sequence: "Alt+Space"
         onActivated: search.toggle()
+    }
+    PlaneStyleMenu {
+        id: planeMenu
+        theme: theme
+        styles: root.planeStyles
+        onChose: (plane, style) => root.setPlaneStyle(plane, style)
     }
     ModeMenu {
         id: modeMenu
@@ -305,7 +463,7 @@ Window {
         id: escKey
         sequence: "Esc"
         enabled: (sketch.picking || sketch.active || navigation.panMode || selection.selected.length > 0)
-                 && !search.open && !modeMenu.open
+                 && !search.open && !modeMenu.open && !planeMenu.open
         onActivated: {
             if (sketch.picking)
                 sketch.picking = false
@@ -317,29 +475,58 @@ Window {
                 selection.clear()
         }
     }
-    // Ctrl+Z in a sketch: undo its creation, leaving no sketch in the history (owner, 2026-10-29).
+    // Ctrl+Z: take back the newest action in the document's history, in Model and Sketch
+    // mode alike, one at a time in the order they were done (owner, 2026-10-29). The
+    // window follows: undoing a finish reopens that sketch, undoing a start leaves it.
+    function undoLast() {
+        sketch.picking = false
+        const history = doc.history
+        const next = history.length ? history[history.length - 1] : null
+        if (next && next.type === "visibility") {
+            crossfade(() => doc.undo())
+            return
+        }
+        const action = doc.undo()
+        if (action.type === "finish_sketch")
+            sketch.open(action.sketch, doc.sketchPlane(action.sketch))
+        else if (action.type === "sketch" && sketch.active && sketch.sketchId === action.id)
+            sketch.leave()
+    }
     Shortcut {
         id: undoKey
         sequence: "Ctrl+Z"
-        enabled: sketch.active && !search.open && !modeMenu.open
-        onActivated: sketch.undo()
+        enabled: !search.open && !modeMenu.open && !planeMenu.open
+        onActivated: root.undoLast()
     }
     Shortcut {
         sequence: "Ctrl+Q"
         onActivated: Qt.quit()
     }
 
-    // A faint hint until the search has been opened once.
-    Rectangle {
+    // The history along the bottom (owner, 2026-10-29): the design's, or the open sketch's own.
+    HistoryTimeline {
+        id: historyTimeline
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.bottom: parent.bottom
-        anchors.bottomMargin: 26
+        width: parent.width - 160
+        theme: theme
+        history: doc.history
+        sketchId: sketch.active ? sketch.sketchId : 0
+    }
+
+    // A faint hint at the top until the search has been opened 3 times (owner, 2026-10-29:
+    // learnt by then). It steps aside for the sketch bar and the search itself, which
+    // use the same spot.
+    Rectangle {
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.top: parent.top
+        anchors.topMargin: 17
         width: hintRow.implicitWidth + 28
         height: 34
         radius: height / 2
         color: Qt.rgba(theme.panelBg.r, theme.panelBg.g, theme.panelBg.b, 0.6)
         border.color: Qt.rgba(theme.border.r, theme.border.g, theme.border.b, 0.6)
-        opacity: search.usedOnce ? 0 : 0.85
+        opacity: search.timesOpened >= 3 || search.open || sketch.active || sketch.picking ? 0 : 0.85
         visible: opacity > 0
         Behavior on opacity { NumberAnimation { duration: 400 } }
 

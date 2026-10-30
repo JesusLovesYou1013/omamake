@@ -32,7 +32,7 @@ Item {
             anchors.rightMargin: 12
             anchors.verticalCenter: parent.verticalCenter
             elide: Text.ElideRight
-            text: bar.sketch.active ? "<b>SKETCH</b>" : "Click a flat face, or empty space"
+            text: bar.sketch.active ? "<b>SKETCH</b>" : "Click a plane or a flat face"
             textFormat: Text.StyledText
             color: bar.sketch.active ? bar.theme.textPrimary : bar.theme.textSecondary
             font.pixelSize: 13
