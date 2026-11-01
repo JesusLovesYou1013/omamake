@@ -2,7 +2,7 @@
 
 A parametric 3D CAD program made for [Omarchy](https://omarchy.org), and for any Linux system.
 
-**Status: version 0.45.** Sketch mode is about 95% done, and sketching is less than half of what a CAD program does. Extrude and the other modelling tools are next.
+**Status: version 0.45.2.** Sketch mode is about 95% done, and sketching is less than half of what a CAD program does. Extrude and the other modelling tools are next.
 
 ## What works so far
 

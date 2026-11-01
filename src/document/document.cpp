@@ -26,7 +26,6 @@
 
 Document::Document(std::unique_ptr<omamake::GeometryEngine> engine, QObject *parent)
     : QObject(parent), m_engine(std::move(engine)) {
-    connect(this, &Document::sketchesChanged, this, [this] { m_profiles.clear(); });
     connect(this, &Document::structureChanged, this, [this] { m_profiles.clear(); });
 }
 
@@ -650,7 +649,7 @@ QString Document::openFrom(const QString &path) {
     refreshMesh();
     emit changed();
     emit structureChanged();
-    emit sketchesChanged();
+    sketchesEdited();
     emit historyChanged();
     emit fileChanged();
     return {};
@@ -802,12 +801,12 @@ QVariantMap Document::undo() {
             found->second.geometry = kept->second;
             m_snapshots.erase(kept);
         }
-        emit sketchesChanged();
+        sketchesEdited();
     } else if (type == QLatin1String("line") || type == QLatin1String("rectangle") || type == QLatin1String("shape")) {
         const auto found = m_sketches.find(last.value(QStringLiteral("sketch")).toInt());
         if (found != m_sketches.end())
             forgetSketchLines(found->second, last);
-        emit sketchesChanged();
+        sketchesEdited();
     } else if (type == QLatin1String("dimension_value")) {
         const auto found = m_sketches.find(last.value(QStringLiteral("sketch")).toInt());
         if (found != m_sketches.end()) {
@@ -823,7 +822,7 @@ QVariantMap Document::undo() {
                                                                     m.value(QStringLiteral("v")).toDouble()};
             }
         }
-        emit sketchesChanged();
+        sketchesEdited();
     } else if (type == QLatin1String("drag") || type == QLatin1String("fix")) {
         const auto found = m_sketches.find(last.value(QStringLiteral("sketch")).toInt());
         if (found != m_sketches.end()) {
@@ -842,7 +841,7 @@ QVariantMap Document::undo() {
                     c.value(QStringLiteral("u")).toDouble(), c.value(QStringLiteral("v")).toDouble()};
             }
         }
-        emit sketchesChanged();
+        sketchesEdited();
     } else if (type == QLatin1String("delete_constraints")) {
         const auto found = m_sketches.find(last.value(QStringLiteral("sketch")).toInt());
         if (found != m_sketches.end()) {
@@ -858,7 +857,7 @@ QVariantMap Document::undo() {
                 g.constraints[o.value(QStringLiteral("id")).toInt()] = c;
             }
         }
-        emit sketchesChanged();
+        sketchesEdited();
     } else if (type == QLatin1String("constraint")) {
         const auto found = m_sketches.find(last.value(QStringLiteral("sketch")).toInt());
         if (found != m_sketches.end()) {
@@ -870,7 +869,7 @@ QVariantMap Document::undo() {
                                                                     m.value(QStringLiteral("v")).toDouble()};
             }
         }
-        emit sketchesChanged();
+        sketchesEdited();
     }
     m_actions.removeLast();
     qInfo().noquote() << "history: undid:" << last.value(QStringLiteral("summary")).toString();
@@ -1765,7 +1764,7 @@ QVariantMap Document::addSketchLine(int sketch, const QVariant &from, const QVar
             {QStringLiteral("from_uv"), uv(a)}, {QStringLiteral("to_uv"), uv(b)},
             {QStringLiteral("new_points"), created}, {QStringLiteral("constraints"), constraints}},
            QStringLiteral("Drew Line%1").arg(line));
-    emit sketchesChanged();
+    sketchesEdited();
     return {{QStringLiteral("line"), line}, {QStringLiteral("from"), a}, {QStringLiteral("to"), b}};
 }
 
@@ -1815,7 +1814,7 @@ QVariantMap Document::addSketchRectangle(int sketch, const QVariant &corner, con
             {QStringLiteral("lines"), lines}, {QStringLiteral("constraints"), constraints},
             {QStringLiteral("corners"), QJsonArray{p0, p1, p2, p3}}, {QStringLiteral("new_points"), created}},
            QStringLiteral("Drew a 2-Point Rectangle (Line%1 to Line%2)").arg(ids[0]).arg(ids[3]));
-    emit sketchesChanged();
+    sketchesEdited();
     return {{QStringLiteral("lines"), QVariantList{ids[0], ids[1], ids[2], ids[3]}}};
 }
 
@@ -1897,7 +1896,10 @@ QVariantMap Document::projectIntoSketch(int sketch, int face) {
                 g.lines[g.nextLine++] = {a, b};
                 ++lines;
             } else {
+                const bool newCentre = !known.count(cell(piece.c));
                 const int c = pointAt(piece.c);
+                if (piece.kind == projection::Piece::Arc && newCentre)   // only a circle's is worth showing:
+                    g.helperPoints.insert(c);                            // a shallow arc's floats far outside
                 const int b = piece.kind == projection::Piece::Circle ? a : pointAt(piece.b);
                 if (a == b && piece.kind == projection::Piece::Arc)
                     continue;
@@ -1919,7 +1921,7 @@ QVariantMap Document::projectIntoSketch(int sketch, int face) {
                                 .arg(lines).arg(arcs).arg(circles);
     record({{QStringLiteral("type"), QStringLiteral("shape")}, {QStringLiteral("sketch"), sketch},
             {QStringLiteral("snapshot"), snapshot}}, summary);
-    emit sketchesChanged();
+    sketchesEdited();
     return {{QStringLiteral("summary"), summary}, {QStringLiteral("lines"), lines}, {QStringLiteral("arcs"), arcs},
             {QStringLiteral("circles"), circles}};
 }
@@ -2078,6 +2080,7 @@ QVariantMap Document::addSketchShape(int sketch, const QVariantMap &spec) {
         if (!used(p)) {
             g.points.erase(p);
             g.helperPoints.erase(p);
+            g.projectedPoints.erase(p);
         }
     }
     for (const QVariant &v : spec.value(QStringLiteral("helpers")).toList())
@@ -2109,24 +2112,115 @@ QVariantMap Document::addSketchShape(int sketch, const QVariantMap &spec) {
             c->second.value = m.value(QStringLiteral("value")).toDouble();
     }
     // Constraints on anything that's gone go too; a follower whose leader went keeps its value.
-    for (auto it = g.constraints.begin(); it != g.constraints.end();) {
-        const QString made = SketchGeometry::kinds(it->second.type);
-        const int ids[3] = {it->second.first, it->second.second, it->second.third};
-        bool gone = false;
-        for (int i = 0; i < made.size(); ++i)
-            gone = gone || (made[i] == QLatin1Char('P') ? !g.hasPoint(ids[i])
-                            : made[i] == QLatin1Char('A') ? !g.arcs.count(ids[i]) : !g.hasLine(ids[i]));
-        if (it->second.type == QLatin1String("fix") && !g.points.count(it->second.first))
-            gone = true;
-        if (gone) {
-            it = g.constraints.erase(it);
-            continue;
+    const auto dropDangling = [&] {
+        for (auto it = g.constraints.begin(); it != g.constraints.end();) {
+            const QString made = SketchGeometry::kinds(it->second.type);
+            const int ids[3] = {it->second.first, it->second.second, it->second.third};
+            bool gone = false;
+            for (int i = 0; i < made.size(); ++i)
+                gone = gone || (made[i] == QLatin1Char('P') ? !g.hasPoint(ids[i])
+                                : made[i] == QLatin1Char('A') ? !g.arcs.count(ids[i]) : !g.hasLine(ids[i]));
+            if (it->second.type == QLatin1String("fix") && !g.points.count(it->second.first))
+                gone = true;
+            if (gone) {
+                it = g.constraints.erase(it);
+                continue;
+            }
+            if (it->second.follows() && !g.constraints.count(it->second.third)) {
+                it->second.value = before.constraints.count(it->second.third) ? before.valueOf(it->second) : it->second.value;
+                it->second.third = 0;
+            }
+            ++it;
         }
-        if (it->second.follows() && !g.constraints.count(it->second.third)) {
-            it->second.value = before.constraints.count(it->second.third) ? before.valueOf(it->second) : it->second.value;
-            it->second.third = 0;
+    };
+    dropDangling();
+    // Helpers (a polygon's circle, a chamfer's lost corner) live only for what they hold: once a
+    // delete leaves one tied to nothing that's seen, it goes too; so does one whose point was deleted.
+    if (!remove.isEmpty()) {
+        std::set<int> deletedPoints;
+        for (const QVariant &v : remove.value(QStringLiteral("points")).toList())
+            deletedPoints.insert(ref(v));
+        const auto seenUses = [](const SketchGeometry &in, int p) {
+            for (const auto &[id, l] : in.lines)
+                if (!in.helperLines.count(id) && (l.a == p || l.b == p))
+                    return true;
+            for (const auto &[id, k] : in.arcs)
+                if (!in.helperArcs.count(id) && (k.c == p || k.a == p || k.b == p))
+                    return true;
+            for (const auto &[id, k] : in.curves)
+                if (std::find(k.points.begin(), k.points.end(), p) != k.points.end())
+                    return true;
+            return false;
+        };
+        // Tied: something seen uses one of its points, or a constraint joins it to something seen.
+        const auto tied = [&](const SketchGeometry &in, std::set<int> own, char kind, int id) {
+            if (std::any_of(own.begin(), own.end(), [&](int p) { return seenUses(in, p); }))
+                return true;
+            for (const auto &[cid, c] : in.constraints) {
+                const QString made = SketchGeometry::kinds(c.type);
+                const int ids[3] = {c.first, c.second, c.third};
+                bool mine = false, seen = false;
+                for (int i = 0; i < made.size(); ++i) {
+                    const char slot = char(made[i].toLatin1());
+                    if ((slot == 'P' && own.count(ids[i])) || (slot == kind && ids[i] == id))
+                        mine = true;
+                    else if (slot == 'P' ? (in.points.count(ids[i]) && seenUses(in, ids[i]))
+                             : slot == 'A' ? (in.arcs.count(ids[i]) && !in.helperArcs.count(ids[i]))
+                                           : (in.lines.count(ids[i]) && !in.helperLines.count(ids[i])))
+                        seen = true;
+                }
+                if (mine && seen)
+                    return true;
+            }
+            return false;
+        };
+        bool swept = false;
+        for (const int id : std::set<int>(g.helperArcs)) {
+            if (!g.arcs.count(id))
+                continue;
+            const auto k = g.arcs.at(id);
+            const std::set<int> own{k.c, k.a, k.b};
+            const bool pointDeleted = deletedPoints.count(k.c) || deletedPoints.count(k.a);
+            if (pointDeleted || (tied(before, own, 'A', id) && !tied(g, own, 'A', id))) {
+                g.arcs.erase(id);
+                g.helperArcs.erase(id);
+                for (const int p : own)
+                    if (!used(p)) {
+                        g.points.erase(p);
+                        g.helperPoints.erase(p);
+                    }
+                swept = true;
+            }
         }
-        ++it;
+        for (const int id : std::set<int>(g.helperLines)) {
+            if (!g.lines.count(id))
+                continue;
+            const auto l = g.lines.at(id);
+            const std::set<int> own{l.a, l.b};
+            if (tied(before, own, 'L', id) && !tied(g, own, 'L', id)) {
+                g.lines.erase(id);
+                g.helperLines.erase(id);
+                for (const int p : own)
+                    if (!used(p)) {
+                        g.points.erase(p);
+                        g.helperPoints.erase(p);
+                    }
+                swept = true;
+            }
+        }
+        for (const int p : std::set<int>(g.helperPoints))
+            if (!used(p) && tied(before, {p}, 'P', 0) && !tied(g, {p}, 'P', 0)) {
+                g.points.erase(p);
+                g.helperPoints.erase(p);
+                swept = true;
+            }
+        for (const int p : deletedPoints)
+            if (g.points.count(p) && !used(p)) {
+                g.points.erase(p);
+                g.helperPoints.erase(p);
+            }
+        if (swept)
+            dropDangling();
     }
     for (int i = 0; i < specPoints.size(); ++i)
         holdSnap(g, pointIds[i].toInt(), specPoints[i], created, constraintIds);
@@ -2144,7 +2238,7 @@ QVariantMap Document::addSketchShape(int sketch, const QVariantMap &spec) {
             {QStringLiteral("lines"), lineIds}, {QStringLiteral("arcs"), arcIds}, {QStringLiteral("curves"), curveIds},
             {QStringLiteral("constraints"), constraintIds}, {QStringLiteral("new_points"), created}},
            spec.value(QStringLiteral("summary")).toString());
-    emit sketchesChanged();
+    sketchesEdited();
     return {{QStringLiteral("points"), pointIds}, {QStringLiteral("lines"), lineList}, {QStringLiteral("arcs"), arcList},
             {QStringLiteral("curves"), curveList}, {QStringLiteral("constraints"), constraintList}};
 }
@@ -2215,7 +2309,7 @@ QString Document::addSketchConstraint(int sketch, const QString &type, int first
             {QStringLiteral("moved"), moved}},   // where those points were, for Ctrl+Z
            QStringLiteral("Made %1 and %2 %3").arg(sketchPartName(found->second, QLatin1Char('L'), first),
                                                    sketchPartName(found->second, QLatin1Char('L'), second), name.toLower()));
-    emit sketchesChanged();
+    sketchesEdited();
     return {};
 }
 
@@ -2349,7 +2443,14 @@ QString Document::addOtherConstraint(Named &named, int sketch, const QString &ty
             pinned = true;
     if (slides && !pinned)
         g.touch(c, moving);
-    if (!g.solveNear({touched.begin(), touched.end()}, steady)) {
+    bool holds = g.solveNear({touched.begin(), touched.end()}, steady);
+    if (!holds && type == QLatin1String("coincident")) {
+        g.constraints.erase(id);
+        const bool slid = g.slideTogether(ids[1 - kept], ids[kept]) || g.slideTogether(ids[kept], ids[1 - kept]);
+        g.constraints[id] = c;
+        holds = slid && g.solveNear({touched.begin(), touched.end()}, steady);
+    }
+    if (!holds) {
         g.constraints.erase(id);
         g.nextConstraint--;
         g.points = before;
@@ -2360,7 +2461,7 @@ QString Document::addOtherConstraint(Named &named, int sketch, const QString &ty
             {QStringLiteral("first"), first}, {QStringLiteral("second"), second}, {QStringLiteral("third"), third},
             {QStringLiteral("moved"), movedSince(g, before)}},
            summary);
-    emit sketchesChanged();
+    sketchesEdited();
     return {};
 }
 
@@ -2474,7 +2575,7 @@ void Document::placeDimensionLabel(int sketch, int constraint, double u, double 
     c->second.labelPlaced = placed;
     c->second.labelU = u;
     c->second.labelV = v;
-    emit sketchesChanged();
+    sketchesEdited();
 }
 
 QString Document::addSketchDimension(int sketch, const QString &type, int first, int second, double value,
@@ -2521,7 +2622,7 @@ QString Document::addSketchDimension(int sketch, const QString &type, int first,
             {QStringLiteral("first"), first}, {QStringLiteral("second"), second},
             {QStringLiteral("moved"), movedSince(g, before)}},
            QStringLiteral("Dimensioned %1: %2").arg(what, label));
-    emit sketchesChanged();
+    sketchesEdited();
     return {};
 }
 
@@ -2551,7 +2652,7 @@ QString Document::setSketchDimension(int sketch, int constraint, double value, c
             {QStringLiteral("id"), constraint}, {QStringLiteral("value"), oldValue}, {QStringLiteral("unit"), oldUnit},
             {QStringLiteral("moved"), movedSince(g, before)}},
            QStringLiteral("Changed a dimension to %1").arg(label));
-    emit sketchesChanged();
+    sketchesEdited();
     return {};
 }
 
@@ -2572,7 +2673,7 @@ bool Document::dragSketch(int sketch, const QVariantList &moves) {
     }
     if (!found->second.geometry.drag(targets))
         return false;
-    emit sketchesChanged();
+    sketchesEdited();
     return true;
 }
 
@@ -2580,7 +2681,7 @@ bool Document::dragSketchSize(int sketch, int arc, double radius) {
     const auto found = m_sketches.find(sketch);
     if (found == m_sketches.end() || !found->second.geometry.resize(arc, radius))
         return false;
-    emit sketchesChanged();
+    sketchesEdited();
     return true;
 }
 
@@ -2645,7 +2746,7 @@ QString Document::endSketchDrag(int sketch, const QString &summary, const QVaria
             {QStringLiteral("added"), added}},   // the constraint the drop made, if any
            made.isEmpty() ? summary : summary + QStringLiteral(" (") + made + QStringLiteral(")"));
     if (!added.isEmpty())
-        emit sketchesChanged();
+        sketchesEdited();
     return made;
 }
 
@@ -2691,7 +2792,7 @@ QString Document::fixSketchPoints(int sketch, const QVariantList &pointIds) {
     record({{QStringLiteral("type"), QStringLiteral("fix")}, {QStringLiteral("sketch"), sketch},
             {QStringLiteral("added"), added}, {QStringLiteral("removed"), removed}},
            summary);
-    emit sketchesChanged();
+    sketchesEdited();
     return summary;
 }
 
@@ -2729,7 +2830,7 @@ QString Document::toggleSketchConstruction(int sketch, const QVariantList &parts
     record({{QStringLiteral("type"), QStringLiteral("construction")}, {QStringLiteral("sketch"), sketch},
             {QStringLiteral("snapshot"), snapshot}},
            summary);
-    emit sketchesChanged();
+    sketchesEdited();
     return summary;
 }
 
@@ -2756,8 +2857,54 @@ int Document::deleteSketchConstraints(int sketch, const QVariantList &ids, const
     record({{QStringLiteral("type"), QStringLiteral("delete_constraints")}, {QStringLiteral("sketch"), sketch},
             {QStringLiteral("removed"), removed}},
            summary);
-    emit sketchesChanged();
+    sketchesEdited();
     return int(removed.size());
+}
+
+// Show Points and Show Projected Geometries: what's switched off is neither drawn nor picked.
+void Document::setSketchShows(bool points, bool projected) {
+    m_showPoints = points;
+    m_showProjected = projected;
+}
+
+bool Document::lineHidden(const SketchGeometry &g, int a, int b) const {
+    return !m_showProjected && g.projectedPoints.count(a) && g.projectedPoints.count(b);
+}
+
+bool Document::pointHidden(const SketchGeometry &g, int id) const {
+    return g.isHidden(id) || !m_showPoints || (!m_showProjected && g.projectedPoints.count(id));
+}
+
+// Everything pickable in a sketch as paths in space, for a box drag to test on screen.
+QVariantList Document::sketchOutlines(int sketch) const {
+    QVariantList out;
+    const auto found = m_sketches.find(sketch);
+    if (found == m_sketches.end())
+        return out;
+    const Named &s = found->second;
+    const SketchGeometry &g = s.geometry;
+    const auto add = [&](const char *kind, int id, const std::vector<std::vector<SketchGeometry::Point>> &paths) {
+        QVariantList runs;
+        for (const auto &path : paths) {
+            QVariantList run;
+            for (const auto &p : path)
+                run << onSketch(s, p.u, p.v);
+            runs << QVariant(run);
+        }
+        out << QVariantMap{{QStringLiteral("kind"), QString::fromLatin1(kind)}, {QStringLiteral("index"), id}, {QStringLiteral("paths"), runs}};
+    };
+    for (const auto &[id, p] : g.points)
+        if (!pointHidden(g, id))
+            add("sketch_point", id, {{p}});
+    for (const auto &[id, l] : g.lines)
+        if (!g.helperLines.count(id) && !lineHidden(g, l.a, l.b))
+            add("sketch_line", id, {{g.points.at(l.a), g.points.at(l.b)}});
+    for (const auto &[id, k] : g.arcs)
+        if (!g.helperArcs.count(id) && !lineHidden(g, k.c, k.c))
+            add("sketch_arc", id, g.arcPath(id));
+    for (const auto &[id, k] : g.curves)
+        add("sketch_curve", id, g.curvePath(id));
+    return out;
 }
 
 QVariantMap Document::pickSketch(int sketch, QVector3D origin, QVector3D direction, float pointReach, float edgeReach) const {
@@ -2775,7 +2922,7 @@ QVariantMap Document::pickSketch(int sketch, QVector3D origin, QVector3D directi
     int best = 0;
     float bestScore = INFINITY, bestT = 0;
     for (const auto &[id, p] : g.points) {
-        if (g.isHidden(id))
+        if (pointHidden(g, id))
             continue;                     // a circle's rim point or a helper isn't a point you can see
         const QVector3D at = onSketch(s, p.u, p.v);
         const float t = QVector3D::dotProduct(at - origin, d);
@@ -2790,7 +2937,7 @@ QVariantMap Document::pickSketch(int sketch, QVector3D origin, QVector3D directi
     if (best)
         return hit("sketch_point", best, bestT);
     for (const auto &[id, l] : g.lines) {
-        if (g.helperLines.count(id))
+        if (g.helperLines.count(id) || lineHidden(g, l.a, l.b))
             continue;
         const auto [t, gap] = raySegment(origin, d, onSketch(s, g.points.at(l.a).u, g.points.at(l.a).v),
                                          onSketch(s, g.points.at(l.b).u, g.points.at(l.b).v));
@@ -2818,7 +2965,7 @@ QVariantMap Document::pickSketch(int sketch, QVector3D origin, QVector3D directi
             }
     };
     for (const auto &[id, k] : g.arcs)
-        if (!g.helperArcs.count(id))
+        if (!g.helperArcs.count(id) && !lineHidden(g, k.c, k.c))
             along(g.arcPath(id), "sketch_arc", id);
     for (const auto &[id, k] : g.curves)
         along(g.curvePath(id), "sketch_curve", id);
@@ -2845,11 +2992,12 @@ void finish(omamake::Mesh &out) {
 } // namespace
 
 void Document::fillSketches(MeshGeometry *target, MeshGeometry *fullTarget, MeshGeometry *construction,
-                            MeshGeometry *constructionFull, MeshGeometry *projected, const QVariantList &sketches,
-                            float radius) const {
-    if (!target || !fullTarget || !construction || !constructionFull || !projected)
+                            MeshGeometry *constructionFull, MeshGeometry *projected, MeshGeometry *projectedDashed,
+                            const QVariantList &sketches, float radius) const {
+    if (!target || !fullTarget || !construction || !constructionFull || !projected || !projectedDashed)
         return;
-    omamake::Mesh free = emptyMesh(), full = emptyMesh(), dashed = emptyMesh(), dashedFull = emptyMesh(), fromModel = emptyMesh();
+    omamake::Mesh free = emptyMesh(), full = emptyMesh(), dashed = emptyMesh(), dashedFull = emptyMesh(), fromModel = emptyMesh(),
+                  fromModelDashed = emptyMesh();
     for (const QVariant &v : sketches) {
         const auto found = m_sketches.find(v.toInt());
         if (found == m_sketches.end())
@@ -2860,15 +3008,19 @@ void Document::fillSketches(MeshGeometry *target, MeshGeometry *fullTarget, Mesh
         const auto solidIn = [&](bool isProjected, bool fully) -> omamake::Mesh & {
             return isProjected ? fromModel : fully ? full : free;
         };
+        const auto dashedIn = [&](bool isProjected, bool fully) -> omamake::Mesh & {
+            return isProjected ? fromModelDashed : fully ? dashedFull : dashed;
+        };
         for (const auto &[id, l] : g.lines) {
-            if (g.helperLines.count(id))
+            if (g.helperLines.count(id) || lineHidden(g, l.a, l.b))
                 continue;
             const auto &a = g.points.at(l.a), &b = g.points.at(l.b);
             const bool fully = held.count(l.a) && held.count(l.b);
+            const bool isProjected = g.projectedPoints.count(l.a) && g.projectedPoints.count(l.b);
             if (g.constructionLines.count(id))
-                addDashed(fully ? dashedFull : dashed, {onSketch(s, a.u, a.v), onSketch(s, b.u, b.v)}, radius);
+                addDashed(dashedIn(isProjected, fully), {onSketch(s, a.u, a.v), onSketch(s, b.u, b.v)}, radius);
             else
-                addTube(solidIn(g.projectedPoints.count(l.a) && g.projectedPoints.count(l.b), fully),
+                addTube(solidIn(isProjected, fully),
                         onSketch(s, a.u, a.v), onSketch(s, b.u, b.v), radius);
         }
         auto tubes = [&](const std::vector<std::vector<SketchGeometry::Point>> &paths, bool fully, bool isConstruction,
@@ -2878,21 +3030,21 @@ void Document::fillSketches(MeshGeometry *target, MeshGeometry *fullTarget, Mesh
                 for (const auto &p : path)
                     at.push_back(onSketch(s, p.u, p.v));
                 if (isConstruction)
-                    addDashed(fully ? dashedFull : dashed, at, radius);
+                    addDashed(dashedIn(isProjected, fully), at, radius);
                 else
                     for (std::size_t i = 0; i + 1 < at.size(); ++i)
                         addTube(solidIn(isProjected, fully), at[i], at[i + 1], radius);
             }
         };
         for (const auto &[id, k] : g.arcs)
-            if (!g.helperArcs.count(id))
+            if (!g.helperArcs.count(id) && !lineHidden(g, k.c, k.c))
                 tubes(g.arcPath(id), held.count(k.c) && held.count(k.a) && held.count(k.b), g.constructionArcs.count(id),
                       g.projectedPoints.count(k.c));
         for (const auto &[id, k] : g.curves)
             tubes(g.curvePath(id), std::all_of(k.points.begin(), k.points.end(), [&](int p) { return held.count(p); }),
                   g.constructionCurves.count(id));
         for (const auto &[id, p] : s.geometry.points)
-            if (!s.geometry.isHidden(id))
+            if (!pointHidden(g, id))
                 addBall(solidIn(g.projectedPoints.count(id), held.count(id)), onSketch(s, p.u, p.v), radius * 2.2f);
     }
     finish(free);
@@ -2900,7 +3052,9 @@ void Document::fillSketches(MeshGeometry *target, MeshGeometry *fullTarget, Mesh
     finish(dashed);
     finish(dashedFull);
     finish(fromModel);
+    finish(fromModelDashed);
     projected->setMesh(fromModel);
+    projectedDashed->setMesh(fromModelDashed);
     target->setMesh(free);
     fullTarget->setMesh(full);
     construction->setMesh(dashed);
@@ -2921,6 +3075,13 @@ void Document::fillProfiles(MeshGeometry *target, const QVariantList &sketches) 
     }
     finish(out);
     target->setMesh(out);
+}
+
+// QML's handlers run before any C++ connection to a signal, so the old profiles go first: a
+// connection clearing them would leave the shading drawn from the old ones.
+void Document::sketchesEdited() {
+    m_profiles.clear();
+    emit sketchesChanged();
 }
 
 const std::vector<profiles::Profile> &Document::profilesOf(int id, const Named &sketch) const {

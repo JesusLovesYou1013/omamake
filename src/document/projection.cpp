@@ -75,6 +75,16 @@ bool isArc(const std::vector<Flat> &p, std::size_t from, std::size_t to, double 
     }
     if (swept > 2 * M_PI)
         return false;
+    // A long straight with a few points at each end fits a circle too, and nothing between them
+    // says otherwise: no one step of a real arc takes up most of it.
+    double length = 0, step = 0;
+    for (std::size_t i = from; i < to; ++i) {
+        const double d = std::hypot(p[i + 1].u - p[i].u, p[i + 1].v - p[i].v);
+        length += d;
+        step = std::max(step, d);
+    }
+    if (step > length * 0.4)
+        return false;
     for (std::size_t i = from; i <= to; ++i)
         if (std::abs(std::hypot(p[i].u - centre.u, p[i].v - centre.v) - r) > tol * 2)
             return false;
@@ -215,7 +225,11 @@ std::vector<std::vector<Piece>> outline(const std::vector<std::array<Flat, 3>> &
     std::vector<std::vector<Piece>> out;
     if (input.empty())
         return out;
-    const manifold::Polygons shadow = covered(input).ToPolygons();
+    // Neighbouring triangles can leave a crack of no width running in from the edge, which would
+    // read as lines inside the outline: grow the shadow to seal them, then shrink it back.
+    const double seal = tol / 2;
+    const manifold::Polygons shadow = covered(input).Offset(seal, manifold::CrossSection::JoinType::Miter, 8)
+                                          .Offset(-seal, manifold::CrossSection::JoinType::Miter, 8).ToPolygons();
     for (const manifold::SimplePolygon &loop : shadow) {
         std::vector<Flat> p;
         double area = 0;

@@ -671,6 +671,50 @@ bool SketchGeometry::solveNear(const std::set<int> &seeds, const std::set<int> &
     return false;
 }
 
+// Nudged from one corner, an even polygon throws the solver about until it gives up: its sides and
+// tangents repeat each other, so the steps have nothing to hold them. Slid whole, nothing has to be
+// solved at all. Only for a shape that's free: not tied to `to`, the origin, a Fix or projected points.
+bool SketchGeometry::slideTogether(int moving, int to) {
+    std::map<int, std::set<int>> next;
+    const auto tie = [&](const std::vector<int> &group) {
+        for (int a : group)
+            for (int b : group)
+                if (a != b)
+                    next[a].insert(b);
+    };
+    for (const auto &[id, l] : lines)
+        tie({l.a, l.b});
+    for (const auto &[id, arc] : arcs)
+        tie({arc.c, arc.a, arc.b});
+    for (const auto &[id, k] : curves)
+        tie(k.points);
+    for (const auto &[id, c] : constraints)
+        tie(pointsOf(c));
+    std::set<int> shape{moving};
+    std::vector<int> open{moving};
+    while (!open.empty()) {
+        const int p = open.back();
+        open.pop_back();
+        for (int n : next[p])
+            if (shape.insert(n).second)
+                open.push_back(n);
+    }
+    if (shape.count(to))
+        return false;
+    for (int p : shape)
+        if (!points.count(p) || projectedPoints.count(p))
+            return false;
+    for (const auto &[id, c] : constraints)
+        if (c.type == QLatin1String("fix") && shape.count(c.first))
+            return false;
+    const Point from = point(moving), target = point(to);
+    for (int p : shape) {
+        points[p].u += target.u - from.u;
+        points[p].v += target.v - from.v;
+    }
+    return true;
+}
+
 QString SketchGeometry::kinds(const QString &type) {
     static const std::map<QString, QString> made = {
         {QStringLiteral("parallel"), QStringLiteral("LL")}, {QStringLiteral("perpendicular"), QStringLiteral("LL")},

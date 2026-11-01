@@ -139,6 +139,8 @@ QtObject {
         midpoint: "PL", symmetry: "PPL", symmetrylines: "LLL", tangent: "LA", tangentarcs: "AA",
         concentric: "AA", equalradius: "AA", pointonarc: "PA", midpoints: "PPP", rotation: "PPP", translation: "PP"
     })
+    property var box: null                  // the box being dragged, in window pixels (selectBox)
+    property var screenOf: null             // a point in space to window pixels
     property int drawnTick: 0               // bumped when the document changes, so badges follow
     readonly property Connections drawnWatch: Connections {
         target: doc
@@ -318,7 +320,8 @@ QtObject {
         selection.clear()
     }
     function cancel() {
-        if (tool && !picking)
+        box = null
+        if (tool && (!picking || tool === "project"))
             selection.clearHover()
         if (tool === "shape" && gather.length)
             selection.clear()
@@ -1285,8 +1288,12 @@ QtObject {
         if (!sketch.active || tool)
             return false
         const part = selection.partAt(x, y)
-        if (!part || !part.kind.startsWith("sketch_"))
-            return false
+        if (!part || !part.kind.startsWith("sketch_")) {
+            if (!selection.sketchId)
+                return false
+            box = { x: x, y: y, x2: x, y2: y, adding: modifiers & (Qt.ControlModifier | Qt.ShiftModifier) }
+            return true
+        }
         const at = onPlane(x, y)
         if (!at)
             return false
@@ -1371,6 +1378,10 @@ QtObject {
         return true
     }
     function dragMove(x, y) {
+        if (box) {
+            box = { x: box.x, y: box.y, x2: x, y2: y, adding: box.adding }
+            return
+        }
         if (handleGrab)
             return handleMove(x, y)
         if (!grab)
@@ -1424,6 +1435,10 @@ QtObject {
         showSnap(dragSnap)
     }
     function dragEnd() {
+        if (box) {
+            selectBox()
+            return
+        }
         if (handleGrab) {
             handleGrab = null
             return
@@ -1443,23 +1458,120 @@ QtObject {
             sketch.say(dragSummary + ", held by " + made + " (Ctrl+Z takes both back)")
     }
 
-    // Every line joined to this one, through shared points, as selection parts; normal lines
-    // and construction lines each only along their own kind.
-    function profileOf(lineId) {
+    // Delete: what's selected goes, whatever kind of line it is; areas are only ever selected, so
+    // they stay. A selected point takes what's drawn from it along (as in Fusion). Points nothing
+    // else uses go with their lines, shared ones stay; constraints on what's gone go too. One step.
+    function deleteSelected() {
         const g = doc.sketchGeometry(sketch.sketchId)
-        const seen = new Set([lineId])
-        const todo = [lineId]
+        const chosen = (kind, id) => selection.selected.some(p => p.kind === kind && p.index === id)
+        const points = new Set(selection.selected.filter(p => p.kind === "sketch_point").map(p => p.index))
+        const on = ids => ids.some(p => points.has(p))
+        const lines = g.lines.filter(l => chosen("sketch_line", l.id) || on([l.a, l.b]))
+        const arcs = g.arcs.filter(a => chosen("sketch_arc", a.id) || on([a.c, a.a, a.b]))
+        const curves = g.curves.filter(c => chosen("sketch_curve", c.id) || on(c.points))
+        for (const l of lines) { points.add(l.a); points.add(l.b) }
+        for (const a of arcs) { points.add(a.c); points.add(a.a); points.add(a.b) }
+        for (const c of curves)
+            for (const p of c.points)
+                points.add(p)
+        const count = lines.length + arcs.length + curves.length
+        if (!count && !points.size)
+            return
+        const one = lines.length ? "Line" + lines[0].id : arcs.length ? "Arc" + arcs[0].id : curves.length ? "Curve" + curves[0].id : "Point"
+        const result = doc.addSketchShape(sketch.sketchId, {
+            summary: count > 1 ? "Deleted " + count + " pieces" : "Deleted " + one,
+            remove: { points: [...points], lines: lines.map(l => l.id), arcs: arcs.map(a => a.id), curves: curves.map(c => c.id) }
+        })
+        if (result.why)
+            sketch.say(result.why)
+        selection.clear()
+    }
+
+    // A box drag (Fusion's window select): left to right takes what's wholly inside, right to left
+    // anything it touches. The points of what's taken stay out of the selection, so two lines
+    // boxed are still two lines to Parallel, Equal and the like; a point on its own is taken.
+    function selectBox() {
+        const left = Math.min(box.x, box.x2), right = Math.max(box.x, box.x2)
+        const top = Math.min(box.y, box.y2), bottom = Math.max(box.y, box.y2)
+        const touching = box.x2 < box.x
+        const inside = p => p.x >= left && p.x <= right && p.y >= top && p.y <= bottom
+        const crosses = (a, b) => {                             // a piece of a path against the box
+            let from = 0, to = 1
+            const edges = [[a.x - b.x, a.x - left], [b.x - a.x, right - a.x], [a.y - b.y, a.y - top], [b.y - a.y, bottom - a.y]]
+            for (const [d, room] of edges) {
+                if (d === 0 && room < 0)
+                    return false
+                if (d < 0)
+                    from = Math.max(from, room / d)
+                else if (d > 0)
+                    to = Math.min(to, room / d)
+            }
+            return from <= to
+        }
+        const taken = doc.sketchOutlines(sketch.sketchId).filter(part => {
+            const paths = part.paths.map(path => path.map(p => screenOf(p)))
+            if (!touching)
+                return paths.every(path => path.every(inside))
+            return paths.some(path => path.some(inside) || path.some((p, i) => i > 0 && crosses(path[i - 1], p)))
+        })
+        const g = doc.sketchGeometry(sketch.sketchId)
+        const owned = new Set()
+        const has = (kind, id) => taken.some(p => p.kind === kind && p.index === id)
+        for (const l of g.lines)
+            if (has("sketch_line", l.id)) { owned.add(l.a); owned.add(l.b) }
+        for (const a of g.arcs)
+            if (has("sketch_arc", a.id)) { owned.add(a.c); owned.add(a.a); owned.add(a.b) }
+        for (const c of g.curves)
+            if (has("sketch_curve", c.id))
+                for (const p of c.points)
+                    owned.add(p)
+        const parts = taken.filter(p => p.kind !== "sketch_point" || !owned.has(p.index))
+                           .map(p => ({ kind: p.kind, sketch: sketch.sketchId, index: p.index }))
+        const same = (p, q) => p.kind === q.kind && p.index === q.index
+        selection.selected = box.adding ? selection.selected.concat(parts.filter(p => !selection.selected.some(q => same(p, q)))) : parts
+        box = null
+        selection.redraw()
+    }
+
+    // The whole chain this part is on, as selection parts: lines, arcs and curves joined end to
+    // end through a shared point, a Coincident, or a point held on them (Point On, Midpoint). Two
+    // lines that only cross are not joined. Normal and construction each only along their own kind.
+    function profileOf(part) {
+        const g = doc.sketchGeometry(sketch.sketchId)
+        const pieces = [
+            ...g.lines.map(l => ({ kind: "sketch_line", id: l.id, construction: l.construction, ends: [l.a, l.b] })),
+            ...g.arcs.map(a => ({ kind: "sketch_arc", id: a.id, construction: a.construction, ends: a.circle ? [] : [a.a, a.b] })),
+            ...g.curves.map(c => ({ kind: "sketch_curve", id: c.id, construction: c.construction,
+                                    ends: c.type === "conic" ? c.points.slice(0, 2)
+                                        : c.type.endsWith("spline") ? [c.points[0], c.points[c.points.length - 1]] : [] }))
+        ]
+        const tied = new Map()
+        const point = p => tied.has(p) ? point(tied.get(p)) : p
+        for (const c of g.constraints)
+            if (c.type === "coincident" && point(c.first) !== point(c.second))
+                tied.set(point(c.first), point(c.second))
+        for (const c of g.constraints) {
+            const kind = { pointonline: "sketch_line", midpoint: "sketch_line", pointonarc: "sketch_arc" }[c.type]
+            const held = kind && pieces.find(q => q.kind === kind && q.id === c.second)
+            if (held)
+                held.ends.push(c.first)
+        }
+        const at = q => q.ends.map(point)
+        const first = part.kind === "sketch_point" ? pieces.find(q => at(q).includes(point(part.index)))
+                                                   : pieces.find(q => q.kind === part.kind && q.id === part.index)
+        if (!first)
+            return []
+        const seen = new Set([first])
+        const todo = [first]
         while (todo.length) {
-            const at = todo.pop()
-            const l = g.lines.find(q => q.id === at)
-            for (const other of g.lines)
-                if (!seen.has(other.id) && other.construction === l.construction
-                    && [other.a, other.b].some(p => p === l.a || p === l.b)) {
-                    seen.add(other.id)
-                    todo.push(other.id)
+            const ends = at(todo.pop())
+            for (const other of pieces)
+                if (!seen.has(other) && other.construction === first.construction && at(other).some(p => ends.includes(p))) {
+                    seen.add(other)
+                    todo.push(other)
                 }
         }
-        return [...seen].map(id => ({ kind: "sketch_line", sketch: sketch.sketchId, index: id }))
+        return [...seen].map(q => ({ kind: q.kind, sketch: sketch.sketchId, index: q.id }))
     }
 
     // The points of the selected lines and points (Fix/UnFix works on points).

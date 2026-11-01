@@ -236,6 +236,8 @@ public:
 
     // The open sketch's point or line under a ray (engine coordinates):
     // {kind: "sketch_point" | "sketch_line" | "", sketch, index, depth}. Points win over lines.
+    Q_INVOKABLE void setSketchShows(bool points, bool projected);
+    Q_INVOKABLE QVariantList sketchOutlines(int sketch) const;
     Q_INVOKABLE QVariantMap pickSketch(int sketch, QVector3D origin, QVector3D direction,
                                        float pointReach, float edgeReach) const;
 
@@ -248,7 +250,7 @@ public:
     // The face a ray hits first, edges and points ignored; -1 for none.
     Q_INVOKABLE int faceAt(QVector3D origin, QVector3D direction) const;
     Q_INVOKABLE void fillSketches(MeshGeometry *target, MeshGeometry *fullTarget, MeshGeometry *construction,
-                                  MeshGeometry *constructionFull, MeshGeometry *projected, const QVariantList &sketches,
+                                  MeshGeometry *constructionFull, MeshGeometry *projected, MeshGeometry *projectedDashed, const QVariantList &sketches,
                                   float radius) const;
     // Loose segments as tubes (a tool's preview): points in engine coordinates, two per segment;
     // dashed when what's drawn will be construction.
@@ -344,6 +346,10 @@ private:
     std::pair<std::vector<profiles::Path>, std::vector<int>> profilePaths(const SketchGeometry &g) const;
     // Each sketch's profiles, worked out once per change (hovering asks on every mouse move).
     const std::vector<profiles::Profile> &profilesOf(int id, const Named &sketch) const;
+    void sketchesEdited();
+    bool lineHidden(const SketchGeometry &g, int a, int b) const;
+    bool pointHidden(const SketchGeometry &g, int id) const;
+    bool m_showPoints = true, m_showProjected = true;
     void addProfile(omamake::Mesh &out, const Named &sketch, const profiles::Profile &p) const;
     mutable std::map<int, std::vector<profiles::Profile>> m_profiles;
     // "Point3", "Line2", or the origin's own: "the Origin", "the X axis" (named after the model's

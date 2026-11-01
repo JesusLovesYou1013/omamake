@@ -63,7 +63,7 @@ Window {
         return Families.families.map(f => Object.assign({}, f, { def: Families.defaultOf(f, defaults) }))
     }
     function noteUse(command) {
-        if (sketch.active && !["Toggle Construction", "Finish Sketch"].includes(command)
+        if (sketch.active && !["Toggle Construction", "Finish Sketch"].includes(command) && !command.startsWith("Show ")
                 && search.commands.some(c => c.name === command && c.modes.length === 1))
             lastSketchTool = command
         const n = Families.next(readJson(toolUses), readJson(toolDefaults), command)
@@ -411,6 +411,16 @@ Window {
                 }
             }
             Model {
+                geometry: MeshGeometry { id: sketchProjectedDashed }
+                depthBias: -40
+                castsShadows: false
+                receivesShadows: false
+                materials: PrincipledMaterial {
+                    lighting: PrincipledMaterial.NoLighting
+                    baseColor: theme.sketchProjected
+                }
+            }
+            Model {
                 geometry: MeshGeometry { id: sketchConstructionFull }
                 depthBias: -40
                 castsShadows: false
@@ -514,8 +524,9 @@ Window {
             if (!sketch.active || sketchTools.tool)
                 return
             const part = selection.partAt(x, y)
-            if (part && part.kind === "sketch_line") {
-                selection.selected = sketchTools.profileOf(part.index)
+            const chain = part && part.kind.startsWith("sketch_") ? sketchTools.profileOf(part) : []
+            if (chain.length) {
+                selection.selected = chain
                 selection.redraw()
             }
         }
@@ -585,7 +596,7 @@ Window {
     // Distances between points get a thin line between them; a line's length sits beside it.
     Item {
         anchors.fill: parent
-        visible: root.openSketchShown
+        visible: root.openSketchShown && root.showDimensions
         Repeater {
             model: root.dimensions
             delegate: Item {
@@ -601,8 +612,19 @@ Window {
                                           : dragging ? root.angleLook(modelData, sketchTools.onPlane(dragSpot.x, dragSpot.y))
                                           : root.angleLooks[index] || null
                 readonly property point spot: look ? look.spot
-                                            : dragging ? dragSpot
-                                            : (root.labelSpots[index] || root.dimensionSpot(a, b, modelData.type))
+                                            : root.keptNear(dragging ? dragSpot
+                                                            : (root.labelSpots[index] || root.dimensionSpot(a, b, modelData.type)), a, b)
+                // The dashed line from the value back to what it measures: from wherever on the
+                // box is closest to wherever on the line is closest, so it stays short and tidy.
+                readonly property var leader: {
+                    if (look)
+                        return null
+                    const near = root.nearestOn(spot, a, b)
+                    const at = Qt.point(Math.max(spot.x - tag.width / 2, Math.min(spot.x + tag.width / 2, near.x)),
+                                        Math.max(spot.y - tag.height / 2, Math.min(spot.y + tag.height / 2, near.y)))
+                    const to = root.nearestOn(at, a, b)
+                    return Math.hypot(at.x - to.x, at.y - to.y) > 14 ? { x: at.x, y: at.y, x2: to.x, y2: to.y } : null
+                }
                 anchors.fill: parent
 
                 AngleMarks { look: dim.look }
@@ -617,25 +639,43 @@ Window {
                     color: theme.textSecondary
                     opacity: 0.8
                 }
+                Shape {
+                    objectName: "dimensionLeader"
+                    visible: !!dim.leader
+                    ShapePath {
+                        strokeColor: theme.textSecondary
+                        strokeWidth: 1
+                        fillColor: "transparent"
+                        strokeStyle: ShapePath.DashLine
+                        dashPattern: [3, 3]
+                        startX: dim.leader ? dim.leader.x : 0
+                        startY: dim.leader ? dim.leader.y : 0
+                        PathLine { x: dim.leader ? dim.leader.x2 : 0; y: dim.leader ? dim.leader.y2 : 0 }
+                    }
+                }
                 Rectangle {
+                    id: tag
                     x: Math.round(dim.spot.x - width / 2)
                     y: Math.round(dim.spot.y - height / 2)
                     width: label.implicitWidth + 14
                     height: 22
                     radius: 6
-                    color: Qt.rgba(theme.panelBg.r, theme.panelBg.g, theme.panelBg.b, 0.85)
-                    border.color: area.containsMouse ? theme.accent : theme.border
+                    readonly property bool picked: sketchTools.pickedConstraints.includes(dim.modelData.id)
+                    color: picked ? theme.accent : Qt.rgba(theme.panelBg.r, theme.panelBg.g, theme.panelBg.b, 0.85)
+                    border.color: picked || area.containsMouse ? theme.accent : theme.border
                     Text {
                         id: label
                         anchors.centerIn: parent
                         text: Units.show(dim.look ? dim.look.shown : dim.modelData.value, dim.modelData.unit)
-                        color: theme.textPrimary
+                        color: parent.picked ? theme.panelBg : theme.textPrimary
                         font.pixelSize: 12
                     }
-                    // Double-click: change the value. Drag: move it where you like (it stays there).
+                    // Click: pick it, like a constraint's badge, for Delete. Double-click: change the
+                    // value. Drag: move it where you like (it stays there).
                     MouseArea {
                         id: area
                         property point pressAt
+                        property bool wasDragged: false
                         anchors.fill: parent
                         hoverEnabled: true
                         cursorShape: dim.dragging ? Qt.ClosedHandCursor : Qt.PointingHandCursor
@@ -648,9 +688,10 @@ Window {
                             dim.dragging = true
                         }
                         onReleased: {
+                            wasDragged = dim.dragging
                             if (!dim.dragging)
                                 return
-                            const at = sketchTools.onPlane(dim.dragSpot.x, dim.dragSpot.y)
+                            const at = sketchTools.onPlane(dim.spot.x, dim.spot.y)
                             if (dim.look)
                                 doc.placeDimensionLabel(sketch.sketchId, dim.modelData.id, dim.look.along1, dim.look.along2)
                             else if (at)
@@ -658,7 +699,12 @@ Window {
                                                         at.u - dim.modelData.mid_u, at.v - dim.modelData.mid_v)
                             dim.dragging = false
                         }
-                        onDoubleClicked: root.editDimension(dim.modelData, dim.look)
+                        onClicked: if (!wasDragged) sketchTools.pickConstraint(dim.modelData.id, "Dimension")
+                        onDoubleClicked: {
+                            if (sketchTools.pickedConstraints.includes(dim.modelData.id))
+                                sketchTools.pickConstraint(dim.modelData.id, "Dimension")
+                            root.editDimension(dim.modelData, dim.look)
+                        }
                     }
                 }
             }
@@ -717,6 +763,27 @@ Window {
         selection: selection
         geometryShown: root.openSketchShown
         free: navigation.ctrlHeld
+        screenOf: p => root.toScreen(p)
+    }
+    // A box drag in a sketch: solid takes what's wholly inside, dashed anything it touches.
+    Shape {
+        readonly property var box: sketchTools.box
+        visible: !!box
+        anchors.fill: parent
+        z: 50
+        ShapePath {
+            readonly property var box: sketchTools.box || { x: 0, y: 0, x2: 0, y2: 0 }
+            strokeColor: theme.accent
+            strokeWidth: 1
+            fillColor: Qt.alpha(theme.accent, 0.12)
+            strokeStyle: box.x2 < box.x ? ShapePath.DashLine : ShapePath.SolidLine
+            dashPattern: [4, 3]
+            startX: box.x; startY: box.y
+            PathLine { x: sketchTools.box ? sketchTools.box.x2 : 0; y: sketchTools.box ? sketchTools.box.y : 0 }
+            PathLine { x: sketchTools.box ? sketchTools.box.x2 : 0; y: sketchTools.box ? sketchTools.box.y2 : 0 }
+            PathLine { x: sketchTools.box ? sketchTools.box.x : 0; y: sketchTools.box ? sketchTools.box.y2 : 0 }
+            PathLine { x: sketchTools.box ? sketchTools.box.x : 0; y: sketchTools.box ? sketchTools.box.y : 0 }
+        }
     }
 
     // A constraint from the search (SketchTools.ruleFor): what's selected counts as the first
@@ -844,6 +911,19 @@ Window {
     }
     // Where a dimension's value sits: halfway along, a little off to one side (above, for a
     // line's own length, so it doesn't sit on the line).
+    // The closest place on the line a-b to p, in pixels.
+    function nearestOn(p, a, b) {
+        const dx = b.x - a.x, dy = b.y - a.y, l = dx * dx + dy * dy
+        const t = l > 0 ? Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l)) : 0
+        return Qt.point(a.x + dx * t, a.y + dy * t)
+    }
+    // A dimension's value stays within twice what it measures of it, so it can't lose its line.
+    // 44 px at least, or a tiny dimension's value could never clear its line.
+    function keptNear(p, a, b) {
+        const near = nearestOn(p, a, b), far = Math.hypot(p.x - near.x, p.y - near.y)
+        const most = Math.max(44, 1.98 * Math.hypot(b.x - a.x, b.y - a.y))
+        return far <= most ? p : Qt.point(near.x + (p.x - near.x) * most / far, near.y + (p.y - near.y) * most / far)
+    }
     function dimensionSpot(a, b, type) {
         const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2
         if (type !== "length")
@@ -1342,6 +1422,17 @@ Window {
     }
     // Every shown sketch's closed profiles, lightly shaded (Fusion's profile shading): only when
     // a sketch changes or is shown or hidden, never on a zoom.
+    // Fusion's Sketch Palette switches, for this run: Show Points and Show Projected Geometries
+    // leave what's off neither drawn nor picked; profiles still count it, as snapping does.
+    property bool showDimensions: true
+    property bool showConstraints: true
+    property bool showPoints: true
+    property bool showProjected: true
+    function sketchShows() {
+        doc.setSketchShows(showPoints, showProjected)
+        selection.clear()
+        drawSketches()
+    }
     function drawProfiles() {
         const ids = []
         for (const k in visibleKeys)
@@ -1357,7 +1448,7 @@ Window {
             if (k[0] === "s" && visibleKeys[k])
                 ids.push(parseInt(k.slice(1)))
         const radius = navigation.distance * selection.perPixel() * 1.1
-        doc.fillSketches(sketchDrawn, sketchFull, sketchConstruction, sketchConstructionFull, sketchProjected, ids, radius)
+        doc.fillSketches(sketchDrawn, sketchFull, sketchConstruction, sketchConstructionFull, sketchProjected, sketchProjectedDashed, ids, radius)
         doc.fillSegments(sketchPreview, sketchTools.preview, radius, sketchTools.construction)
     }
     Connections {
@@ -1451,6 +1542,25 @@ Window {
                 }
             }
         }
+        Rectangle {
+            objectName: "projectDone"
+            width: 80
+            height: 34
+            radius: 8
+            color: theme.success
+            Text {
+                anchors.centerIn: parent
+                text: "Done"
+                color: theme.windowBg
+                font.pixelSize: 12
+                font.bold: true
+            }
+            MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: sketchTools.cancel()
+            }
+        }
     }
     // Enter: a tool gathering things (Mirror, Offset, a spline's points…) carries on.
     Shortcut {
@@ -1459,6 +1569,22 @@ Window {
         onActivated: sketchTools.confirm()
     }
 
+    SketchDisplay {
+        objectName: "sketchDisplay"
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: 10
+        anchors.right: parent.right
+        anchors.rightMargin: 8
+        visible: sketch.active
+        z: 40
+        theme: theme
+        rows: [
+            { name: "Show Points", on: root.showPoints, flip: () => { root.showPoints = !root.showPoints; root.sketchShows() } },
+            { name: "Show Dimensions", on: root.showDimensions, flip: () => root.showDimensions = !root.showDimensions },
+            { name: "Show Constraints", on: root.showConstraints, flip: () => root.showConstraints = !root.showConstraints },
+            { name: "Show Projected Geometries", on: root.showProjected, flip: () => { root.showProjected = !root.showProjected; root.sketchShows() } }
+        ]
+    }
     ViewCube {
         id: viewCube
         anchors.top: parent.top
@@ -1521,7 +1647,7 @@ Window {
             { name: "Create Sketch", hint: "Pick a flat face, or empty space for an origin plane (or triple-click one)", group: "Create", modes: ["model"], keys: "", run: () => sketch.picking = true },
             { name: "Line", letter: "l", hint: "Click the start, then each next point; Esc stops", group: "Create", modes: ["sketch"], keys: "L", run: () => sketchTools.use("line") },
             { name: "2-Point Rectangle", hint: "Click one corner, then the opposite one", group: "Create", modes: ["sketch"], keys: "", run: () => sketchTools.use("rectangle") },
-            { name: "Project", letter: "p", words: "project geometry include silhouette outline profile shadow", hint: "Pick Whole Model or Face above, then click the model", group: "Create", modes: ["sketch"], keys: "", run: () => sketchTools.use("project") },
+            { name: "Project", letter: "p", words: "project geometry include silhouette outline profile shadow", hint: "Choose Whole Model or Face, click the model as often as you like, then Done", group: "Create", modes: ["sketch"], keys: "", run: () => sketchTools.use("project") },
             { name: "Center Diameter Circle", hint: "Click the centre, then the edge", group: "Create", modes: ["sketch"], keys: "", run: () => sketchTools.use("circle") },
             { name: "Center Point Arc", words: "arc", hint: "Click the centre, where it starts, then where it ends", group: "Create", modes: ["sketch"], keys: "", run: () => sketchTools.use("arc") },
             { name: "Tangent", hint: "Click a line, arc or circle, then an arc or circle: they touch smoothly", group: "Constraints", modes: ["sketch"], keys: "", run: () => root.constrain("tangent") },
@@ -1537,6 +1663,10 @@ Window {
             { name: "Midpoint", letter: "m", hint: "Click a point and a line (either first): the point goes to the line's middle", group: "Constraints", modes: ["sketch"], keys: "", run: () => root.constrain("midpoint") },
             { name: "Collinear", hint: "Click two lines (or select them first): the second lines up along the first", group: "Constraints", modes: ["sketch"], keys: "", run: () => root.constrain("collinear") },
             { name: "Symmetry", hint: "Click two points or two lines, then the line to mirror them across", group: "Constraints", modes: ["sketch"], keys: "", run: () => root.constrain("symmetry") },
+            { name: "Show Points", words: "sketch palette display hide", hint: root.showPoints ? "Hide the sketch's points" : "Show the sketch's points", group: "Look", modes: ["sketch"], keys: "", run: () => { root.showPoints = !root.showPoints; root.sketchShows() } },
+            { name: "Show Dimensions", words: "sketch palette display hide", hint: root.showDimensions ? "Hide the dimensions" : "Show the dimensions", group: "Look", modes: ["sketch"], keys: "", run: () => root.showDimensions = !root.showDimensions },
+            { name: "Show Constraints", words: "sketch palette display hide badges", hint: root.showConstraints ? "Hide the constraint badges" : "Show the constraint badges", group: "Look", modes: ["sketch"], keys: "", run: () => root.showConstraints = !root.showConstraints },
+            { name: "Show Projected Geometries", words: "sketch palette display hide purple", hint: root.showProjected ? "Hide what's projected from the model" : "Show what's projected from the model", group: "Look", modes: ["sketch"], keys: "", run: () => { root.showProjected = !root.showProjected; root.sketchShows() } },
             { name: "Toggle Construction", letter: "x", words: "construction normal reference guide dashed", hint: "Turn the selected lines construction or back; with nothing selected or while drawing, what you draw next", group: "Sketch", modes: ["sketch"], keys: "X", keepsTool: true, run: () => root.toggleConstruction() },
             { name: "Find Profile Gaps", words: "gap gaps break broken open leak profile closed close not closing", hint: "Rings in red, for 10 s (Esc sooner), where lines come within 1 mm without being joined", group: "Sketch", modes: ["sketch"], keys: "", keepsTool: true, run: () => root.showGaps() },
             { name: "Fix/UnFix", hint: "Click points or lines (or select them first) to hold them where they are, or let them go", group: "Constraints", modes: ["sketch"], keys: "", run: () => root.fixSelected() },
@@ -1648,13 +1778,14 @@ Window {
         noteUse(kind.name)
         kind.run()
     }
-    // Delete (or Backspace): takes the constraints picked on their badges off the sketch; the
-    // lines and points stay (owner, 2026-10-30).
+    // Delete (or Backspace): constraints picked on their badges go first, and only them, so the
+    // lines selected to reach those badges stay (owner, 2026-10-30); otherwise what's selected.
     Shortcut {
         sequences: ["Delete", "Backspace"]
-        enabled: sketch.active && sketchTools.pickedConstraints.length > 0
+        enabled: sketch.active && !sketchTools.tool
+                 && (sketchTools.pickedConstraints.length > 0 || selection.selected.some(p => p.kind.startsWith("sketch_")))
                  && !search.open && !modeMenu.open && !planeMenu.open && !dimInput.open
-        onActivated: sketchTools.deleteConstraints()
+        onActivated: sketchTools.pickedConstraints.length ? sketchTools.deleteConstraints() : sketchTools.deleteSelected()
     }
     // Ctrl+Z: take back the newest action in the document's history, in Model and Sketch
     // mode alike, one at a time in the order they were done (owner, 2026-10-29). The
@@ -1701,7 +1832,7 @@ Window {
     Item {
         anchors.fill: parent
         z: 8
-        visible: root.openSketchShown
+        visible: root.openSketchShown && root.showConstraints
         Repeater {
             model: sketchTools.badges
             delegate: Row {

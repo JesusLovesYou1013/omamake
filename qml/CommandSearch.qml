@@ -16,6 +16,15 @@ Item {
     property bool open: false
     property int timesOpened: 0          // remembered (Main.qml Settings); the hint goes after 3
     property int current: 0
+    property point mouseAt: Qt.point(-1, -1)
+    // Only a mouse that really moved takes the choice: rows appearing under a still one, as you
+    // type, leave it on the top result.
+    function hoverRow(index, at) {
+        const moved = mouseAt.x >= 0 && (at.x !== mouseAt.x || at.y !== mouseAt.y)
+        mouseAt = at
+        if (moved)
+            current = index
+    }
     property var families: []            // Families.families, each with `def`: its default kind's name now
     property string expanded: ""         // the family whose kinds are open under it
 
@@ -269,7 +278,7 @@ Item {
                     MouseArea {
                         anchors.fill: parent
                         hoverEnabled: true
-                        onEntered: search.current = index
+                        onPositionChanged: mouse => search.hoverRow(index, mapToGlobal(mouse.x, mouse.y))
                         onClicked: search.run(index)
                     }
                     // A family's arrow: opens its kinds (turns down while they're open).
@@ -293,7 +302,7 @@ Item {
                             id: arrowArea
                             anchors.fill: parent
                             hoverEnabled: true
-                            onEntered: search.current = index
+                            onPositionChanged: mouse => search.hoverRow(index, mapToGlobal(mouse.x, mouse.y))
                             onClicked: search.toggleKinds(modelData.family)
                         }
                     }

@@ -1318,6 +1318,11 @@ const tools = {
             if (uses(s, end) === 1) {
                 x = b.pt(end)
                 b.move.push({ point: end, u: k.x.at.u, v: k.x.at.v })
+                // Held on what it stopped at (Trim leaves that): it lets go, or it drags that along.
+                for (const c of s.g.constraints)
+                    if (((c.type === "pointonline" || c.type === "pointonarc" || c.type === "midpoint") && c.first === end)
+                            || (c.type === "coincident" && (c.first === end || c.second === end)))
+                        b.remove.constraints.push(c.id)
             } else {
                 x = b.pt(k.x.at)
                 const r = { end: k.atB ? "b" : "a", to: b.p(x) }; r[e.kind] = e.id

@@ -198,6 +198,8 @@ struct SketchGeometry {
     // Solve after a new constraint, moving as few points as possible, with `steady` (the
     // thing picked first, as in Fusion) staying put where it can.
     bool solveNear(const std::set<int> &seeds, const std::set<int> &steady);
+    // Slides the whole shape `moving` belongs to so that point lands on `to`. False if it isn't free to.
+    bool slideTogether(int moving, int to);
 
     // What a dimension would measure now (mm), with the two places it spans (u, v);
     // for "pointline" the second place is the foot of the square on the line; for "lineline"
