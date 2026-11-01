@@ -12,13 +12,21 @@ QMAKE_LFLAGS += -fuse-ld=mold
 
 INCLUDEPATH += src
 LIBS += -lmanifold
+# Heavy engine: OpenCascade (exact shapes, STEP).
+INCLUDEPATH += /usr/include/opencascade
+LIBS += -lTKernel -lTKMath -lTKG2d -lTKG3d -lTKGeomBase -lTKBRep -lTKGeomAlgo -lTKTopAlgo -lTKPrim -lTKBO -lTKBool -lTKMesh -lTKShHealing -lTKDESTEP -lTKDESTL -lTKXSBase
 
 # The QML files are read from the source tree at startup (no compile for UI changes).
 DEFINES += OMAMAKE_SOURCE_QML_DIR=\\\"$$PWD/qml\\\"
 
 HEADERS += \
     src/document/document.h \
+    src/document/sketchgeometry.h \
+    src/document/profiles.h \
+    src/document/projection.h \
     src/engine/engine.h \
+    src/engine/heavy/meshsolid.h \
+    src/theme/dialoglook.h \
     src/theme/omarchytheme.h \
     src/theme/transparency.h \
     src/view/meshgeometry.h
@@ -26,7 +34,13 @@ HEADERS += \
 SOURCES += \
     src/main.cpp \
     src/document/document.cpp \
+    src/document/sketchgeometry.cpp \
+    src/document/profiles.cpp \
+    src/document/projection.cpp \
     src/engine/lite/liteengine.cpp \
+    src/engine/heavy/heavyengine.cpp \
+    src/engine/heavy/meshsolid.cpp \
+    src/theme/dialoglook.cpp \
     src/theme/omarchytheme.cpp \
     src/theme/transparency.cpp \
     src/view/meshgeometry.cpp

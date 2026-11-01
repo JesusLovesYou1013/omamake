@@ -6,6 +6,7 @@ import QtQuick
 //   arrow tab, middle of the left edge   shows or hides the tree; it never moves
 //   click a row with children    open or close it
 //   round button on a component  make it the active one: new sketches and components go in it
+//   target left of the eye        Find in Window: the view flies to it, in full view
 //   eye on every row but the top  show or hide it (and all inside it); hidden things fade out
 //   while sketching, the planes' eyes show or hide them for this sketch only (they start
 //   hidden in every sketch, and nothing goes in the history)
@@ -23,6 +24,10 @@ Item {
 
     // Right-click on Origin or one of its planes; x, y in the Browser's own coordinates.
     signal planeMenuRequested(real x, real y)
+    // Double-click a sketch's row: back into it (Fusion's Edit Sketch; owner, 2026-10-29).
+    signal sketchEditRequested(int id)
+    // The target button: bring the row's things into view (Navigation.findInWindow).
+    signal findRequested(string key, string name)
 
     readonly property int rowHeight: 28
     readonly property int treeWidth: 250
@@ -134,7 +139,11 @@ Item {
                         anchors.fill: parent
                         hoverEnabled: true
                         acceptedButtons: Qt.LeftButton | Qt.RightButton
-                        cursorShape: row.parentNode ? Qt.PointingHandCursor : Qt.ArrowCursor
+                        cursorShape: row.parentNode || row.node.kind === "sketch" ? Qt.PointingHandCursor : Qt.ArrowCursor
+                        onDoubleClicked: mouse => {
+                            if (mouse.button === Qt.LeftButton && row.node.kind === "sketch")
+                                browser.sketchEditRequested(parseInt(row.node.key.slice(1)))
+                        }
                         onClicked: mouse => {
                             if (mouse.button === Qt.RightButton) {
                                 if (row.node.kind === "origin" || row.node.kind === "plane") {
@@ -172,7 +181,7 @@ Item {
                     Text {
                         anchors.left: icon.right
                         anchors.leftMargin: 7
-                        anchors.right: eye.left
+                        anchors.right: finder.left
                         anchors.rightMargin: 6
                         height: parent.height
                         verticalAlignment: Text.AlignVCenter
@@ -183,6 +192,16 @@ Item {
                                                                                          : browser.theme.textPrimary
                         font.pixelSize: 13
                         font.bold: row.active
+                    }
+
+                    FindButton {
+                        id: finder
+                        objectName: "find " + row.node.key
+                        anchors.right: eye.left
+                        anchors.rightMargin: 4
+                        anchors.verticalCenter: parent.verticalCenter
+                        theme: browser.theme
+                        onClicked: browser.findRequested(row.node.key, row.node.name)
                     }
 
                     // Same column on every row, whether or not it has the activate button.

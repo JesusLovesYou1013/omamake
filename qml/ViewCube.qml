@@ -223,6 +223,8 @@ Item {
             cube.dragging = false
         }
         onReleased: m => {
+            if (cube.dragging)
+                cube.nav.letGo()             // thrown: it turns on and slows down (inertia)
             if (!cube.dragging) {
                 const p = toCanvas(m)
                 const r = cube.regionAt(p.x, p.y)

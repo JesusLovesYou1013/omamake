@@ -10,6 +10,7 @@
 // Units: millimetres everywhere inside the engine. Inches are a display matter.
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -46,6 +47,13 @@ struct Mesh {
     std::vector<float> points;                 // x,y,z per corner point (where edges meet)
 };
 
+// What Fit Curved Surfaces did.
+struct FitResult {
+    int cylinders = 0, cones = 0, spheres = 0;
+    int trianglesLeft = 0;      // of the source triangles, those still flat facets
+    double worstMm = 0;         // the furthest a source point ended up from its surface
+};
+
 class GeometryEngine {
 public:
     virtual ~GeometryEngine() = default;
@@ -58,11 +66,30 @@ public:
     virtual BodyId extrude(const Profile &profile, double height) = 0;
     virtual BodyId combine(BodyId a, BodyId b, Combine op) = 0;
     virtual BodyId translate(BodyId body, double x, double y, double z) = 0;
+    // Read a STEP file, in its own position and sized in mm whatever its units. 0 and why if it
+    // can't be. stage is told what's happening, in a few words. May run off the main thread:
+    // nothing else may call the engine until it returns.
+    virtual BodyId importStep(const std::string &path, std::string &why,
+                              const std::function<void(const char *)> &stage) = 0;
+
+    // Read an STL or OBJ into a solid, its flat areas one face each. Same rules as importStep.
+    virtual BodyId importMesh(const std::string &path, std::string &why,
+                              const std::function<void(const char *)> &stage) = 0;
+    // A new body with facets standing in for a round surface turned into that surface, kept
+    // within `share` of its radius; `body` stays as it was. 0 and why if nothing could be fitted.
+    virtual BodyId fitSurfaces(BodyId body, double share, FitResult &result, std::string &why,
+                               const std::function<void(const char *)> &stage) = 0;
+    // Write a body as a STEP file, in mm. False and why if it can't be.
+    virtual bool exportStep(BodyId body, const std::string &path, std::string &why) const = 0;
+    // A body's exact solid as bytes and back, for the design file. Empty / 0 if not possible.
+    virtual std::string saveBody(BodyId body) const = 0;
+    virtual BodyId loadBody(const std::string &bytes) = 0;
 
     virtual Mesh mesh(BodyId body) const = 0;
     virtual void release(BodyId body) = 0;
 };
 
 std::unique_ptr<GeometryEngine> makeLiteEngine();
+std::unique_ptr<GeometryEngine> makeHeavyEngine();
 
 } // namespace omamake

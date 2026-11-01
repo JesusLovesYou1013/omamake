@@ -53,13 +53,15 @@ Item {
                 theme: menu.theme
                 text: "Dark"
                 mark: !menu.theme.light ? "●" : ""
-                onActivated: menu.theme.light = false
+                enabled: !menu.theme.locked
+                onActivated: menu.theme.setLight(false)
             }
             MenuRow {
                 theme: menu.theme
                 text: "Light"
                 mark: menu.theme.light ? "●" : ""
-                onActivated: menu.theme.light = true
+                enabled: !menu.theme.locked
+                onActivated: menu.theme.setLight(true)
             }
             // Only offered on Omarchy.
             Rectangle {

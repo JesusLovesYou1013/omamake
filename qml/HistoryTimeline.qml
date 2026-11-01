@@ -3,7 +3,8 @@ import QtQuick
 // The history along the bottom (Fusion calls it the Timeline), oldest on the left: the
 // same list Ctrl+Z steps back through, shown as two kinds of row (owner, 2026-10-29):
 //   the design's row   one dot per action; a sketch is ONE dot, at the point it was made
-//                      (starting and finishing it, and all that was done inside it)
+//                      (starting, finishing and editing it, and all that was done inside
+//                      it); double-click it to go back into the sketch (Fusion's Edit Sketch)
 //   a sketch's row     while that sketch is open, only what was done inside it (entries
 //                      tagged in_sketch with its id), in the sketch green and named; no
 //                      other sketch's steps and none of the design's
@@ -20,6 +21,8 @@ Item {
     property int sketchId: 0                 // the open sketch (0: none)
     property bool shown: true
 
+    signal sketchEditRequested(int id)
+
     readonly property int dot: 12
     readonly property int pitch: 26           // dot to dot
     readonly property string sketchName: {
@@ -28,7 +31,7 @@ Item {
     }
     readonly property color dotColor: sketchId ? theme.success : theme.accent
 
-    // The row on show: [{summary}], oldest first.
+    // The row on show: [{summary, sketch?}], oldest first.
     readonly property var actions: {
         const out = []
         if (sketchId) {
@@ -38,9 +41,12 @@ Item {
             return out
         }
         for (const a of history) {
-            if (a.in_sketch || a.type === "finish_sketch")
+            if (a.in_sketch || a.type === "finish_sketch" || a.type === "edit_sketch")
                 continue
-            out.push({ summary: a.type === "sketch" ? a.name + (a.on ? " on " + a.on : "") : a.summary })
+            if (a.type === "sketch")
+                out.push({ summary: a.name + (a.on ? " on " + a.on : "") + "  ·  double-click to edit", sketch: a.id })
+            else
+                out.push({ summary: a.summary })
         }
         return out
     }
@@ -148,6 +154,8 @@ Item {
                     id: dotArea
                     anchors.fill: parent
                     hoverEnabled: true
+                    cursorShape: slot.modelData.sketch ? Qt.PointingHandCursor : Qt.ArrowCursor
+                    onDoubleClicked: if (slot.modelData.sketch) timeline.sketchEditRequested(slot.modelData.sketch)
                     onContainsMouseChanged: {
                         if (containsMouse)
                             tip.showFor(slot, slot.modelData.summary)

@@ -8,6 +8,9 @@ import QtQuick
 // for this sketch (shownPlanes, by row key; not in the history).
 //   Create Sketch (search)      the next click picks the face or empty space, Esc cancels
 //   Finish Sketch, Esc          back to the model, keeping the sketch
+//   double-click a sketch (its Timeline dot or Browser row)   back into it (Fusion's Edit
+//                               Sketch; owner, 2026-10-29). From inside another sketch,
+//                               that one is finished first.
 // Leaving (Finish Sketch, Esc, or Ctrl+Z) flies the view back to exactly how it was
 // before the sketch was started or reopened (owner, 2026-10-29).
 // Starting and finishing are both actions in the document's history, so Ctrl+Z (Main.qml)
@@ -112,6 +115,28 @@ QtObject {
         nav.lookAlong(Qt.vector3d(p.normal.x, p.normal.z, -p.normal.y))   // engine → scene
     }
 
+    // The sketch bar's look-at button (owner, 2026-10-30): face the sketch again after panning
+    // or turning away. On a face: that face in the middle, filling the view; on an origin plane:
+    // the whole model, as when the sketch opened. Not in the history.
+    function lookAtSketch() {
+        const p = plane
+        if (!p)
+            return
+        const c = p.center, r = p.radius
+        nav.lookAlong(Qt.vector3d(p.normal.x, p.normal.z, -p.normal.y),       // engine → scene
+                      c && r > 0 ? { center: Qt.vector3d(c.x, c.z, -c.y), radius: r } : null)
+    }
+
+    // Edit Sketch: an action in the history (Ctrl+Z leaves again).
+    function edit(id) {
+        if (active && sketchId === id)
+            return
+        if (active)
+            doc.finishSketch(sketchId)         // still active, so the view to go back to stays
+        doc.editSketch(id)
+        open(id, doc.sketchPlane(id))
+    }
+
     // Finish Sketch / Esc: an action in the history.
     function finish() {
         doc.finishSketch(sketchId)
@@ -128,8 +153,10 @@ QtObject {
         viewBefore = null
     }
 
+    property double messageAt: 0     // when it was said (ms)
     function say(text) {
         message = text
+        messageAt = Date.now()
         messageTimer.restart()
     }
 

@@ -61,17 +61,21 @@ Item {
         }
     }
 
+    // Dimmed and not clickable while the look is locked (a Save As dialog is open); the
+    // right-click menu still opens, with its Dark and Light rows off.
+    opacity: mode.theme.locked ? 0.4 : 1
+
     MouseArea {
         id: area
         anchors.fill: parent
         hoverEnabled: true
-        cursorShape: Qt.PointingHandCursor
+        cursorShape: mode.theme.locked ? Qt.ArrowCursor : Qt.PointingHandCursor
         acceptedButtons: Qt.LeftButton | Qt.RightButton
         onClicked: m => {
             if (m.button === Qt.RightButton)
                 mode.menuRequested()
             else
-                mode.theme.light = !mode.theme.light
+                mode.theme.setLight(!mode.theme.light)
         }
     }
 }

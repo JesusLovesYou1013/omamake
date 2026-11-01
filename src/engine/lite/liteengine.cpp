@@ -53,6 +53,29 @@ public:
         return keep(m_bodies.at(body).Translate({x, y, z}));
     }
 
+    BodyId importStep(const std::string &, std::string &why, const std::function<void(const char *)> &) override {
+        why = "STEP files need the Heavy engine.";
+        return 0;
+    }
+
+    BodyId importMesh(const std::string &, std::string &why, const std::function<void(const char *)> &) override {
+        why = "Mesh files need the Heavy engine.";
+        return 0;
+    }
+
+    BodyId fitSurfaces(BodyId, double, FitResult &, std::string &why, const std::function<void(const char *)> &) override {
+        why = "Curved surfaces need the Heavy engine.";
+        return 0;
+    }
+
+    bool exportStep(BodyId, const std::string &, std::string &why) const override {
+        why = "STEP files need the Heavy engine.";
+        return false;
+    }
+
+    std::string saveBody(BodyId) const override { return {}; }
+    BodyId loadBody(const std::string &) override { return 0; }
+
     Mesh mesh(BodyId body) const override;
 
     void release(BodyId body) override { m_bodies.erase(body); }

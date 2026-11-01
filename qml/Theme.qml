@@ -15,6 +15,13 @@ QtObject {
     id: theme
 
     property bool light: false
+    // While a Save As dialog is open the look can't be switched (owner, 2026-10-29): the dialog
+    // and the app couldn't be made to change in exactly the same moment, so neither changes.
+    property bool locked: false
+    function setLight(on) {
+        if (!locked)
+            light = on
+    }
     property bool followSystem: false
     // Only on Omarchy; elsewhere the option isn't offered and the saved switch is ignored.
     readonly property bool following: followSystem && omarchyTheme.onOmarchy && omarchyTheme.available
@@ -130,6 +137,25 @@ QtObject {
     readonly property color modelEdge: p.modelEdge
     readonly property color hover: p.hover            // part under the mouse
     readonly property color selection: p.selection    // selected parts
+    // Sketch lines (owner, 2026-10-29): the text colour while they can still move (white in
+    // dark themes, so never mistaken for an axis), and the same with its colour drained and
+    // toned down once fully constrained: about halfway to the background, so the two tell
+    // apart at a glance even on thin lines (owner, 2026-10-30: 68% was too close to white).
+    readonly property color sketchFree: textPrimary
+    readonly property color sketchFull: Qt.hsla(0, 0, light ? textPrimary.hslLightness + (1 - textPrimary.hslLightness) * 0.6
+                                                            : textPrimary.hslLightness * 0.5, 1)
+    // Construction lines (owner, 2026-10-30): the origin planes' colour, dashed; toned down the
+    // same way once fully constrained.
+    readonly property color sketchConstruction: warning
+    // Projected from the model (owner, 2026-10-31): a violet no other line uses, as in Fusion.
+    readonly property color sketchProjected: light ? "#7C3AED" : "#C084FC"
+    // Closed profiles' shading (owner, 2026-10-30): a light see-through wash of the sketch-line
+    // colour, so lines and the model show through it. Not Fusion's pale orange: here that's the
+    // origin planes' colour, and the two looked the same.
+    readonly property color sketchProfile: Qt.rgba(textPrimary.r, textPrimary.g, textPrimary.b, light ? 0.10 : 0.12)
+    readonly property color sketchConstructionFull: Qt.hsla(warning.hslHue, warning.hslSaturation * 0.55,
+                                                            light ? warning.hslLightness + (1 - warning.hslLightness) * 0.45
+                                                                  : warning.hslLightness * 0.6, 1)
     readonly property color gridMinor: following && light ? Qt.rgba(p.gridMinor.r, p.gridMinor.g, p.gridMinor.b, lightGridMinorAlpha) : p.gridMinor
     readonly property color gridMajor: following && light ? Qt.rgba(p.gridMajor.r, p.gridMajor.g, p.gridMajor.b, lightGridMajorAlpha) : p.gridMajor
     readonly property color axisX: p.axisX
