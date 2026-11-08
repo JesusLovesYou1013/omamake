@@ -30,6 +30,9 @@ QtObject {
     property var viewBefore: null    // the view to go back to on leaving
     property string message: ""      // a short note when a pick can't start a sketch
     property var shownPlanes: ({})   // origin plane rows shown again during this sketch
+    // Just before Finish Sketch or going into another sketch: the sketch's steps behind the Timeline's
+    // marker come back first (owner, 2026-11-07: leaving puts the marker back at the end).
+    signal leaving()
 
     function showPlane(key, show) {
         const next = Object.assign({}, shownPlanes)
@@ -101,6 +104,25 @@ QtObject {
     }
 
     // Into a sketch that exists (new, or reopened by undoing its finish).
+    // Showing and hiding things cleanly, and the camera waiting until the fade is over (Main.qml).
+    property var crossfade: change => change()
+    property var fadeBusy: () => false
+    property int fadeMs: 250
+    property Timer cameraWait: Timer {
+        property var run: null
+        interval: sketch.fadeMs + 30
+        onTriggered: { if (run) run(); run = null }
+    }
+    // Move the camera now, or just after the fade that is running has finished.
+    function cameraDo(move) {
+        if (fadeBusy()) {
+            cameraWait.run = move
+            cameraWait.restart()
+        } else {
+            move()
+        }
+    }
+
     function open(id, p) {
         picking = false
         message = ""
@@ -112,7 +134,7 @@ QtObject {
         sketchId = id
         active = true
         selection.clear()
-        nav.lookAlong(Qt.vector3d(p.normal.x, p.normal.z, -p.normal.y))   // engine → scene
+        cameraDo(() => nav.lookAlong(Qt.vector3d(p.normal.x, p.normal.z, -p.normal.y)))   // engine → scene
     }
 
     // The sketch bar's look-at button (owner, 2026-10-30): face the sketch again after panning
@@ -128,19 +150,36 @@ QtObject {
     }
 
     // Edit Sketch: an action in the history (Ctrl+Z leaves again).
+    // Going back into a sketch from the past takes the design back to when it was made: what
+    // was made after it fades out (and fades back in when it's finished), then the camera turns.
     function edit(id) {
         if (active && sketchId === id)
             return
-        if (active)
-            doc.finishSketch(sketchId)         // still active, so the view to go back to stays
-        doc.editSketch(id)
-        open(id, doc.sketchPlane(id))
+        const go = () => {
+            if (active) {
+                leaving()
+                doc.finishSketch(sketchId)     // still active, so the view to go back to stays
+            }
+            doc.editSketch(id)
+            open(id, doc.sketchPlane(id))
+        }
+        if (doc.rewinds(id) || (active && doc.rewinds(0)))
+            crossfade(go)
+        else
+            go()
     }
 
     // Finish Sketch / Esc: an action in the history.
     function finish() {
-        doc.finishSketch(sketchId)
-        leave()
+        const go = () => {
+            leaving()
+            doc.finishSketch(sketchId)
+            leave()
+        }
+        if (active && doc.rewinds(0))
+            crossfade(go)
+        else
+            go()
     }
 
     // Out of sketch mode without recording anything (the sketch was undone).
@@ -148,15 +187,18 @@ QtObject {
         active = false
         plane = null
         sketchId = 0
-        if (viewBefore)
-            nav.restoreView(viewBefore)
+        const back = viewBefore
         viewBefore = null
+        if (back)
+            cameraDo(() => nav.restoreView(back))
     }
 
     property double messageAt: 0     // when it was said (ms)
-    function say(text) {
+    // `ms`: how long it stays; left out, the usual 2.6 s (a long failure says how long it needs to be read).
+    function say(text, ms) {
         message = text
         messageAt = Date.now()
+        messageTimer.interval = ms > 0 ? ms : 2600
         messageTimer.restart()
     }
 

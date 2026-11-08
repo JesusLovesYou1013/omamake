@@ -10,3 +10,6 @@ build/
 
 # Compiled Qt Quick shaders (made by the build beside their source)
 qml/shaders/*.qsb
+
+# Failed operations' logs (dev builds write them here)
+logs/

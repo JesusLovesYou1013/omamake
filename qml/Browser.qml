@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Shapes
 
 // The Browser (Fusion's name): the design's tree on the left, top down. The root
 // component holds Origin, Bodies, Sketches and further components, which can hold
@@ -21,11 +22,22 @@ Item {
     // Runs a show/hide so it fades cleanly (Main.qml's crossfade).
     property var crossfade: change => change()
     property var sketch: null           // Sketch.qml: its planes are its own while it's open
+    // Held still while the Timeline's marker is dragged (owner, 2026-11-07: scrubbing must stay fluid):
+    // the tree as it was, brought up to date when the marker is let go.
+    property bool held: false
+    property var heldTree: null
+    onHeldChanged: heldTree = held ? doc.browser : null
+    readonly property var tree: held && heldTree ? heldTree : doc.browser
 
     // Right-click on Origin or one of its planes; x, y in the Browser's own coordinates.
     signal planeMenuRequested(real x, real y)
     // Double-click a sketch's row: back into it (Fusion's Edit Sketch; owner, 2026-10-29).
     signal sketchEditRequested(int id)
+    // Double-click a body's or a component's row: select it (a component: every body inside it).
+    signal selectRequested(string key)
+    // The rows to underline with dots: what is selected, and the components above it
+    // (Selection.treeKeys; owner, 2026-11-02).
+    property var underlined: ({})
     // The target button: bring the row's things into view (Navigation.findInWindow).
     signal findRequested(string key, string name)
 
@@ -36,7 +48,21 @@ Item {
     // Open or closed, by node key. Unlisted: components and folders open, the rest closed.
     property var expanded: ({})
 
+    // Extrude cutting into several bodies (owner, 2026-11-02): while it runs, {body number: cut or not}; the
+    // branches holding those bodies open, each with a checkbox. Cleared, the tree is as the owner had it.
+    property var cutChoices: null
+    signal cutToggled(int body, bool on)
+    function holdsCut(node) {
+        if (!cutChoices)
+            return false
+        if (node.kind === "body")
+            return Number(node.key.slice(1)) in cutChoices
+        return node.children.some(c => holdsCut(c))
+    }
+
     function isOpen(node) {
+        if (holdsCut(node))
+            return true
         return node.key in expanded ? expanded[node.key] : (node.kind === "component" || node.kind === "folder")
     }
 
@@ -55,7 +81,7 @@ Item {
                 for (const child of node.children)
                     walk(child, depth + 1)
         }
-        walk(doc.browser, 0)
+        walk(tree, 0)
         return out
     }
 
@@ -141,8 +167,14 @@ Item {
                         acceptedButtons: Qt.LeftButton | Qt.RightButton
                         cursorShape: row.parentNode || row.node.kind === "sketch" ? Qt.PointingHandCursor : Qt.ArrowCursor
                         onDoubleClicked: mouse => {
-                            if (mouse.button === Qt.LeftButton && row.node.kind === "sketch")
+                            if (mouse.button !== Qt.LeftButton)
+                                return
+                            if (row.node.kind === "sketch")
                                 browser.sketchEditRequested(parseInt(row.node.key.slice(1)))
+                            else if (row.node.kind === "body" || (row.node.kind === "component" && !row.isDesign))
+                                browser.selectRequested(row.node.key)
+                            else if (row.isDesign)
+                                browser.selectRequested(row.node.key)
                         }
                         onClicked: mouse => {
                             if (mouse.button === Qt.RightButton) {
@@ -179,9 +211,10 @@ Item {
                     }
 
                     Text {
+                        id: nameText
                         anchors.left: icon.right
                         anchors.leftMargin: 7
-                        anchors.right: finder.left
+                        anchors.right: cutBox.visible ? cutBox.left : finder.left
                         anchors.rightMargin: 6
                         height: parent.height
                         verticalAlignment: Text.AlignVCenter
@@ -192,6 +225,62 @@ Item {
                                                                                          : browser.theme.textPrimary
                         font.pixelSize: 13
                         font.bold: row.active
+                    }
+
+                    // The dotted underline: this row holds something that is selected.
+                    Shape {
+                        objectName: "underline " + row.node.key
+                        x: nameText.x
+                        y: parent.height / 2 + 9
+                        width: Math.min(nameText.contentWidth, nameText.width)
+                        height: 2
+                        opacity: !row.isDesign && !!browser.underlined[row.node.key] ? 1 : 0
+                        visible: opacity > 0
+                        Behavior on opacity { NumberAnimation { duration: 250 } }
+                        ShapePath {
+                            strokeColor: browser.theme.accent
+                            strokeWidth: 1.5
+                            strokeStyle: ShapePath.DashLine
+                            dashPattern: [1, 2.5]
+                            capStyle: ShapePath.RoundCap
+                            fillColor: "transparent"
+                            startX: 0; startY: 1
+                            PathLine { x: Math.min(nameText.contentWidth, nameText.width); y: 1 }
+                        }
+                    }
+
+                    // Extrude: this body is in the way of the cut; ticked, it is cut.
+                    Rectangle {
+                        id: cutBox
+                        objectName: "cutBox " + row.node.key
+                        readonly property int bodyId: row.node.kind === "body" ? Number(row.node.key.slice(1)) : -1
+                        readonly property bool on: !!browser.cutChoices && !!browser.cutChoices[bodyId]
+                        anchors.right: finder.left
+                        anchors.rightMargin: 6
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: 16
+                        height: 16
+                        radius: 4
+                        visible: !!browser.cutChoices && bodyId in browser.cutChoices
+                        color: on ? browser.theme.accent : "transparent"
+                        border.width: 1.5
+                        border.color: on ? browser.theme.accent : browser.theme.textMuted
+                        opacity: visible ? 1 : 0
+                        Behavior on opacity { NumberAnimation { duration: 250 } }
+                        Text {
+                            anchors.centerIn: parent
+                            text: "✓"
+                            color: browser.theme.windowBg
+                            font.pixelSize: 12
+                            font.bold: true
+                            visible: cutBox.on
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            anchors.margins: -4
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: browser.cutToggled(cutBox.bodyId, !cutBox.on)
+                        }
                     }
 
                     FindButton {
@@ -212,6 +301,7 @@ Item {
                         anchors.verticalCenter: parent.verticalCenter
                         theme: browser.theme
                         visible: !row.isDesign
+                        enabled: !row.node.future          // made after the sketch being edited: out of reach
                         open: row.shown
                         onClicked: browser.crossfade(() => row.sketchPlane ? browser.sketch.showPlane(row.node.key, !row.shown)
                                                                            : doc.setShown(row.node.key, !row.node.shown))

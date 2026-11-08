@@ -131,7 +131,8 @@ QtObject {
         fix: "Fix", coincident: "Coincident", pointonline: "Coincident (on a line)", midpoint: "Midpoint",
         symmetry: "Symmetry", symmetrylines: "Symmetry", tangent: "Tangent", tangentarcs: "Tangent",
         concentric: "Concentric", equalradius: "Equal", pointonarc: "Coincident (on a curve)",
-        midpoints: "Midpoint", rotation: "Circular Pattern", translation: "Rectangular Pattern"
+        midpoints: "Midpoint", rotation: "Circular Pattern", translation: "Rectangular Pattern",
+        curvature: "Curvature"
     })
     readonly property var constraintKinds: ({
         parallel: "LL", perpendicular: "LL", equal: "LL", collinear: "LL", horizontal: "L", vertical: "L",
@@ -185,7 +186,7 @@ QtObject {
     }
     readonly property var badges: {
         drawnTick
-        const chosen = selection.selected.filter(p => p.kind === "sketch_point" || p.kind === "sketch_line" || p.kind === "sketch_arc")
+        const chosen = selection.selected.filter(p => p.kind === "sketch_point" || p.kind === "sketch_line" || p.kind === "sketch_arc" || p.kind === "sketch_curve")
         const picked = pickedConstraints
         if (!sketch.active || (!chosen.length && !picked.length))
             return []
@@ -193,9 +194,11 @@ QtObject {
         const pointAt = id => g.points.find(q => q.id === id)
         const lineOf = id => g.lines.find(q => q.id === id)
         const arcOf = id => g.arcs.find(q => q.id === id)
-        const points = new Set(), lines = new Set(), arcs = new Set()
+        const points = new Set(), lines = new Set(), arcs = new Set(), splines = new Set()
         for (const p of chosen) {
-            if (p.kind === "sketch_point") {
+            if (p.kind === "sketch_curve") {
+                splines.add(p.index)
+            } else if (p.kind === "sketch_point") {
                 points.add(p.index)
             } else if (p.kind === "sketch_arc") {
                 arcs.add(p.index)
@@ -237,6 +240,16 @@ QtObject {
                 groups[key].badges.push(badge)
         }
         for (const c of g.constraints) {
+            if (c.type === "curvature") {
+                // On the join the two share (owner, 2026-11-02): shown when either curve, or the join, is picked.
+                const other = c.third === 1 ? lines.has(c.second) : c.third === 2 ? arcs.has(c.second) : splines.has(c.second)
+                if (!(picked.includes(c.id) || other || splines.has(c.first) || points.has(c.joint)))
+                    continue
+                const second = (c.third === 1 ? "Line" : c.third === 2 ? "Arc" : "Spline") + c.second
+                put("P", c.joint, { id: c.id, picked: picked.includes(c.id), kind: "curvature",
+                                    label: "Curvature: Spline" + c.first + ", " + second })
+                continue
+            }
             const kinds = constraintKinds[c.type]
             if (!kinds)
                 continue                      // a dimension
@@ -273,7 +286,7 @@ QtObject {
                                         parallel: "Parallel", perpendicular: "Perpendicular", equal: "Equal",
                                         collinear: "Collinear", hv: "Horizontal/Vertical", coincident: "Coincident",
                                         midpoint: "Midpoint", symmetry: "Symmetry", fix: "Fix/UnFix",
-                                        tangent: "Tangent", concentric: "Concentric", project: "Project" })
+                                        tangent: "Tangent", concentric: "Concentric", curvature: "Curvature", project: "Project" })
     readonly property string toolName: shapeDef ? shapeDef.name : toolNames[tool] || ""
     readonly property var drawingTools: ["line", "rectangle", "circle", "arc", "shape"]
     // Fusion's Construction switch (its Sketch Palette; X, owner 2026-10-30): what's drawn from
@@ -289,25 +302,425 @@ QtObject {
     // Project (Fusion's name): Whole Model throws the model's outline onto the sketch, Face just
     // that face's, curved or flat. Stays on for more, until Esc.
     property string projectWhat: "model"
+    // What this Project run has put on the sketch, one entry per click or box, each one step in the
+    // document's history: {what: "model" | "face" | "edge", face, kind, index}, or {what: "box",
+    // items: [edge entries]}. The badge beside the tool's name counts the things: a whole body or a
+    // face is 1, so is each edge or point (owner, 2026-11-01). Clicking one again takes it off; the
+    // x beside the count takes them all off.
+    property var projectPicks: []
+    // Picks left out because that thing is already projected into this sketch (it is never put on
+    // twice); the second bubble beside the count shows how many (owner, 2026-11-02).
+    property var projectSkipped: []
+    // ONLY a pick that an earlier Project run of this sketch already put on it counts as left out
+    // (owner, 2026-11-02, t45u). Something refused because its outline lands on lines the same run
+    // made (the front and back rim of a bore, a corner on an edge's end) is dropped without a word.
+    property var projectDone: ({})            // sketch id -> the picks its earlier runs made
+    function flatPicks(list) {
+        return list.reduce((all, q) => all.concat(q.what === "box" ? q.items : [q]), [])
+    }
+    function projectRemember(id, picks) {
+        if (!id || !picks.length)
+            return
+        const m = Object.assign({}, projectDone)
+        m[id] = (m[id] || []).concat(flatPicks(picks))
+        projectDone = m
+    }
+    function projectSkip(p) {
+        const before = projectDone[projectSketch || sketch.sketchId] || []
+        if (before.some(q => samePick(q, p)) && !projectSkipped.some(q => samePick(q, p)))
+            projectSkipped = projectSkipped.concat([p])
+    }
+    readonly property int projectCount: projectPicks.reduce((n, p) => n + (p.what === "box" ? p.items.length : 1), 0)
     function projectHover(x, y) {
         const face = projectWhat === "face" ? selection.faceAt(x, y) : -1
-        const part = face >= 0 ? { kind: "face", index: face } : null
+        const outside = projectWhat === "sketch" || projectWhat === "wholesketch"
+        const part = outside ? selection.outsideSketchAt(x, y)
+                   : projectWhat === "edge" ? selection.bodyEdgeOrPointAt(x, y)
+                   : face >= 0 ? { kind: "face", index: face } : null
         if (!selection.same(part, selection.hovered)) {
             selection.hovered = part
             selection.redraw()
         }
     }
+    function samePick(a, b) {
+        if (a.what !== b.what)
+            return false
+        if (a.what === "model")
+            return true
+        if (a.what === "face")
+            return a.face === b.face
+        if (a.what === "wholesketch")
+            return a.sketch === b.sketch
+        return a.kind === b.kind && a.index === b.index && a.sketch === b.sketch
+    }
+    function projectApply(p) {
+        if (p.what === "sketchpart")
+            return doc.projectSketchIntoSketch(sketch.sketchId, p.sketch, [{ kind: p.kind, index: p.index }])
+        if (p.what === "wholesketch")
+            return doc.projectSketchIntoSketch(sketch.sketchId, p.sketch, [])
+        return p.what === "edge" ? doc.projectPartIntoSketch(sketch.sketchId, p.kind, p.index)
+                                 : doc.projectIntoSketch(sketch.sketchId, p.what === "face" ? p.face : -1)
+    }
+    // A pick whose outline lands on lines this run already made (the front and back rim of a bore
+    // seen end-on, a corner on an edge's end) is still TAKEN: it is highlighted and counted, it just
+    // adds no new line (owner, 2026-11-02, t45u: the edges in front were left out and the ones
+    // behind were taken, depending on which went first). Only a pick an earlier run of the sketch
+    // already put on it is left out, and counted in the skipped bubble.
+    function projectWasBefore(p) {
+        return (projectDone[projectSketch || sketch.sketchId] || []).some(q => samePick(q, p))
+    }
+    function projectTaken(p, why) {
+        if (!why)
+            return true
+        if (!projectQuiet(why))
+            return false
+        if (projectWasBefore(p)) {
+            projectSkip(p)
+            return false
+        }
+        return true
+    }
+    // A box's edges and points, as one step; the ones taken.
+    // Edges and points go in as one batch, and faces as another, each in one go (a face a time took ~20 ms each).
+    function projectBatch(items) {
+        const faceItems = items.filter(p => p.what === "face"), partItems = items.filter(p => p.what !== "face")
+        const taken = new Set()
+        if (partItems.length) {
+            const done = doc.projectPartsIntoSketch(sketch.sketchId, partItems.map(p => ({ kind: p.kind, index: p.index })))
+            partItems.forEach((p, i) => { if (projectTaken(p, done[i].why)) taken.add(p) })
+        }
+        if (faceItems.length) {
+            const done = doc.projectFacesIntoSketch(sketch.sketchId, faceItems.map(p => p.face))
+            faceItems.forEach((p, i) => { if (projectTaken(p, done[i].why)) taken.add(p) })
+        }
+        return items.filter(p => taken.has(p))
+    }
+    // Each entry is one step in the history, so taking something off is: undo them all, then put
+    // the ones that stay back in the same order.
+    // The run is ONE history item all the way through (owner, 2026-11-02): each pick is joined into
+    // it as soon as it is made, and taking something off undoes that one item and puts the rest back.
+    function projectFold() {
+        if (projectSketch)
+            doc.foldProjectRun(projectSketch, projectCount)
+    }
+    // "Already projected" is no news: the same thing is never put on a sketch twice, quietly.
+    function projectQuiet(why) { return /already projected/.test(why) }
+    function projectRetake(keep) {
+        doc.undoProjectRun()
+        const again = []
+        for (const p of keep) {
+            if (p.what === "box") {
+                const items = projectBatch(p.items)
+                if (items.length)
+                    again.push({ what: "box", items: items })
+            } else if (projectTaken(p, projectApply(p).why)) {
+                again.push(p)
+            }
+        }
+        projectPicks = again
+        projectFold()
+    }
+    function projectClearAll() {
+        const n = projectCount, left = projectSkipped.length
+        projectSkipped = []
+        if (!n) {
+            if (left)
+                sketch.say(left === 1 ? "Cleared 1 left-out pick" : "Cleared " + left + " left-out picks")
+            return
+        }
+        projectRetake([])
+        selection.clearHover()
+        sketch.say(n === 1 ? "Took 1 projection off the sketch" : "Took " + n + " projections off the sketch")
+    }
+    function projectToggle(p) {
+        const inBox = (q, k) => q.what === "box" && q.items.some(i => samePick(i, p))
+        const i = projectPicks.findIndex((q, k) => samePick(q, p) || inBox(q, k))
+        if (i >= 0) {
+            const q = projectPicks[i]
+            const rest = q.what === "box" ? [{ what: "box", items: q.items.filter(it => !samePick(it, p)) }] : []
+            const keep = []
+            projectPicks.forEach((e, k) => {
+                if (k !== i)
+                    keep.push(e)
+                else if (rest.length && rest[0].items.length)
+                    keep.push(rest[0])
+            })
+            projectRetake(keep)
+            return sketch.say("Took it off the sketch")
+        }
+        const made = projectApply(p)
+        if (!projectTaken(p, made.why))
+            return sketch.say(projectQuiet(made.why) ? "" : made.why)
+        projectPicks = projectPicks.concat([p])
+        projectFold()
+        sketch.say(made.summary || "")
+    }
     function projectAt(x, y) {
-        const face = selection.faceAt(x, y)
+        if (projectWhat === "sketch" || projectWhat === "wholesketch") {
+            const part = selection.outsideSketchAt(x, y)
+            if (!part)
+                return sketch.say("Click a line, arc or point of an earlier sketch")
+            return projectToggle(projectWhat === "sketch" ? { what: "sketchpart", kind: part.kind, sketch: part.sketch, index: part.index }
+                                                         : { what: "wholesketch", sketch: part.sketch })
+        }
+        if (projectWhat === "edge") {
+            const part = selection.bodyEdgeOrPointAt(x, y)
+            if (!part)
+                return sketch.say("Click an edge or a corner of the model")
+            return projectToggle({ what: "edge", kind: part.kind, index: part.index })
+        }
+        const face = selection.faceAt(x, y, projectWhat === "model")
         if (face < 0)
             return sketch.say("Click the model")
-        const made = doc.projectIntoSketch(sketch.sketchId, projectWhat === "face" ? face : -1)
-        sketch.say(made.why || made.summary)
+        projectToggle(projectWhat === "face" ? { what: "face", face: face } : { what: "model" })
+    }
+    // A box dragged while Project runs takes what the chosen kind takes: edges and points, faces, the
+    // whole model, parts of earlier sketches or whole earlier sketches (owner, 2026-11-02). Left to
+    // right takes what lies wholly inside, right to left whatever the box touches.
+    function projectBox() {
+        const hits = boxHits()
+        const screen = part => part.paths.map(path => path.map(p => screenOf(p)))
+        const have = p => projectPicks.some(q => samePick(q, p) || (q.what === "box" && q.items.some(i => samePick(i, p))))
+        const bodyOn = !selection.bodyFiltered || selection.allow.bodies
+        const crossing = box.x2 < box.x
+        const left = Math.min(box.x, box.x2), right = Math.max(box.x, box.x2)
+        const top = Math.min(box.y, box.y2), bottom = Math.max(box.y, box.y2)
+        const wants = []                 // what the box took, as project picks (some may be there already)
+        let what = "edges or points"
+        if (projectWhat === "edge") {
+            const edges = selection.allow.edges || !selection.bodyFiltered
+            const points = selection.allow.bodyPoints || !selection.bodyFiltered
+            const near = doc.bodyOutlines(edges && bodyOn, points && bodyOn).filter(part => hits(screen(part)))
+            for (const part of seenOutlines(near, crossing, left, right, top, bottom))
+                wants.push({ what: "edge", kind: part.kind, index: part.index })
+        } else if (projectWhat === "face") {
+            what = "faces"
+            if (bodyOn && (selection.allow.faces || !selection.bodyFiltered))
+                for (const f of boxFaces(hits, crossing, left, right, top, bottom))
+                    wants.push({ what: "face", face: f })
+        } else if (projectWhat === "model") {
+            what = "model"
+            if (bodyOn && boxTouchesModel(hits, crossing, left, right, top, bottom))
+                wants.push({ what: "model" })
+        } else if (projectWhat === "sketch" || projectWhat === "wholesketch") {
+            what = projectWhat === "sketch" ? "parts of earlier sketches" : "earlier sketches"
+            if (!selection.bodyFiltered || selection.allow.outside) {
+                const earlier = doc.earlierSketches(sketch.sketchId)
+                for (const id of selection.outsideSketches.filter(id => earlier.indexOf(id) >= 0)) {
+                    const parts = doc.sketchOutlines(id, 15)
+                    if (projectWhat === "wholesketch") {
+                        if (parts.length && hits(allPaths(parts)))
+                            wants.push({ what: "wholesketch", sketch: id })
+                        continue
+                    }
+                    const taken = parts.filter(part => hits(screen(part)))
+                    const g = doc.sketchGeometry(id)
+                    const owned = new Set()
+                    const has = (kind, i) => taken.some(p => p.kind === kind && p.index === i)
+                    for (const l of g.lines) if (has("sketch_line", l.id)) { owned.add(l.a); owned.add(l.b) }
+                    for (const a of g.arcs) if (has("sketch_arc", a.id)) { owned.add(a.c); owned.add(a.a); owned.add(a.b) }
+                    for (const c of g.curves) if (has("sketch_curve", c.id)) for (const q of c.points) owned.add(q)
+                    for (const part of taken)
+                        if (part.kind !== "sketch_point" || !owned.has(part.index))
+                            wants.push({ what: "sketchpart", kind: part.kind, sketch: id, index: part.index })
+                }
+            }
+        }
+        const mode = box.mode
+        box = null
+        if (mode === "remove") {                         // Ctrl: take off what the box reaches, add nothing
+            const was = projectCount
+            const keep = []
+            for (const q of projectPicks) {
+                if (q.what === "box") {
+                    const items = q.items.filter(i => !wants.some(w => samePick(i, w)))
+                    if (items.length)
+                        keep.push({ what: "box", items: items })
+                } else if (!wants.some(w => samePick(q, w))) {
+                    keep.push(q)
+                }
+            }
+            const gone = was - keep.reduce((n, q) => n + (q.what === "box" ? q.items.length : 1), 0)
+            if (gone > 0)
+                projectRetake(keep)
+            return sketch.say(gone > 0 ? "Took " + gone + (gone === 1 ? " projection" : " projections") + " off the sketch"
+                                       : "The box reached nothing that is projected")
+        }
+        const fresh = wants.filter(p => !have(p))
+        let added = 0
+        if (projectWhat === "edge" || projectWhat === "face") {
+            const taken = fresh.length ? projectBatch(fresh) : []
+            if (taken.length)
+                projectPicks = projectPicks.concat([{ what: "box", items: taken }])
+            added = taken.length
+        } else {
+            for (const p of fresh) {                     // each one its own step, like a click
+                const r = projectApply(p)
+                if (!projectTaken(p, r.why))
+                    continue
+                projectPicks = projectPicks.concat([p])
+                added++
+            }
+        }
+        if (added)
+            projectFold()
+        sketch.say(!wants.length ? (what === "model" ? "The box took no part of the model" : "The box took no " + what)
+                   : added ? "Projected " + added + (projectWhat === "edge" ? (added === 1 ? " edge or point" : " edges and points")
+                                                    : projectWhat === "face" ? (added === 1 ? " face" : " faces")
+                                                    : projectWhat === "model" ? " model"
+                                                    : projectWhat === "sketch" ? (added === 1 ? " sketch part" : " sketch parts")
+                                                    : (added === 1 ? " sketch" : " sketches"))
+                   : "")
+    }
+    // The faces a box takes. A window takes faces whose whole rim is inside; a crossing also takes
+    // any face the box touches, or lies wholly within (found by what is seen under the box's corners
+    // and middle, since such a face has no rim line near the box).
+    // A box takes only what the camera can see, never what lies behind the model's wall (the thread
+    // inside a bore, the far side). Select Through, to take hidden things too, is a later addition
+    // (owner, 2026-11-02); this switch is where it will plug in.
+    property bool selectThrough: false
+    function eyeForHidden() {
+        const r = selection.rayAt(0, 0)          // the camera's place, or its direction when ortho
+        return selection.ortho ? r.direction : r.origin
+    }
+    // Which of these model edges and corner points (as bodyOutlines gives them) are seen inside the
+    // box: samples along each (nine on an edge), only those inside the box count when it touches, and
+    // an edge window-selected needs at least half of its samples seen.
+    function seenOutlines(parts, crossing, left, right, top, bottom) {
+        if (selectThrough || !parts.length)
+            return parts
+        const all = [], owner = []
+        const inBox = p => { const q = screenOf(p); return q.x >= left && q.x <= right && q.y >= top && q.y <= bottom }
+        parts.forEach((part, k) => {
+            const path = part.paths[0]
+            const n = path.length
+            const marks = []
+            if (n === 1) {
+                marks.push(path[0])
+            } else {
+                let total = 0
+                const len = [0]
+                for (let i = 1; i < n; ++i) {
+                    total += path[i].minus(path[i - 1]).length()
+                    len.push(total)
+                }
+                let at = 1
+                for (let m = 0; m < 9; ++m) {
+                    const want = total * m / 8
+                    while (at < n - 1 && len[at] < want)
+                        at++
+                    const span = len[at] - len[at - 1]
+                    const f = span > 0 ? Math.min(1, Math.max(0, (want - len[at - 1]) / span)) : 0
+                    marks.push(path[at - 1].times(1 - f).plus(path[at].times(f)))
+                }
+            }
+            let inside = marks.filter(inBox)
+            if (!inside.length)
+                inside = marks
+            for (const m of inside) {
+                all.push(m)
+                owner.push(k)
+            }
+        })
+        const hidden = doc.hiddenFrom(all, eyeForHidden(), selection.ortho)
+        const seen = new Array(parts.length).fill(0), total = new Array(parts.length).fill(0)
+        hidden.forEach((h, i) => { total[owner[i]]++; if (!h) seen[owner[i]]++ })
+        return parts.filter((part, k) => crossing ? seen[k] > 0 : seen[k] * 2 >= total[k] && seen[k] > 0)
+    }
+    // Which of these faces the camera sees any of (the middles of a dozen of its triangles).
+    function seenFaces(list) {
+        if (selectThrough || !list.length)
+            return list
+        const all = [], owner = []
+        list.forEach((f, k) => {
+            for (const m of doc.faceSamples(f, 12)) {
+                all.push(m)
+                owner.push(k)
+            }
+        })
+        const hidden = doc.hiddenFrom(all, eyeForHidden(), selection.ortho)
+        const seen = new Array(list.length).fill(false)
+        hidden.forEach((h, i) => { if (!h) seen[owner[i]] = true })
+        return list.filter((f, k) => seen[k])
+    }
+    function boxFaces(hits, crossing, left, right, top, bottom) {
+        const taken = new Set()
+        const rimmed = []
+        for (const part of doc.faceOutlines())
+            if (hits(part.paths.map(path => path.map(p => screenOf(p)))))
+                rimmed.push(part.index)
+        for (const f of seenFaces(rimmed))
+            taken.add(f)
+        if (crossing)
+            for (const [x, y] of [[left, top], [right, top], [left, bottom], [right, bottom], [(left + right) / 2, (top + bottom) / 2]]) {
+                const f = selection.faceAt(x, y, true)
+                if (f >= 0)
+                    taken.add(f)
+            }
+        return Array.from(taken).sort((a, b) => a - b)
+    }
+    // Every path of several parts, on screen (the model's lists have no flatMap).
+    function allPaths(parts) {
+        const paths = []
+        for (const part of parts)
+            for (const path of part.paths)
+                paths.push(path.map(p => screenOf(p)))
+        return paths
+    }
+    function boxTouchesModel(hits, crossing, left, right, top, bottom) {
+        const near = doc.bodyOutlines(true, false).filter(part => hits(part.paths.map(path => path.map(p => screenOf(p)))))
+        if (seenOutlines(near, crossing, left, right, top, bottom).length)
+            return true
+        return crossing && [[left, top], [right, top], [left, bottom], [right, bottom], [(left + right) / 2, (top + bottom) / 2]]
+                           .some(([x, y]) => selection.faceAt(x, y, true) >= 0)
+    }
+    // A box dragged in the model, outside a sketch: the faces, edges and corners it takes are selected.
+    function selectModelBox() {
+        const hits = boxHits()
+        const crossing = box.x2 < box.x
+        const left = Math.min(box.x, box.x2), right = Math.max(box.x, box.x2)
+        const top = Math.min(box.y, box.y2), bottom = Math.max(box.y, box.y2)
+        const screen = part => part.paths.map(path => path.map(p => screenOf(p)))
+        const parts = []
+        if (selection.pickable) {
+            const near = doc.bodyOutlines(true, true).filter(part => hits(screen(part)))
+            for (const part of seenOutlines(near, crossing, left, right, top, bottom))
+                parts.push({ kind: part.kind, index: part.index })
+            for (const f of boxFaces(hits, crossing, left, right, top, bottom))
+                parts.push({ kind: "face", index: f })
+        }
+        const taken = parts.filter(p => selection.allowed(p))
+        const same = (p, q) => p.kind === q.kind && p.index === q.index
+        const mode = box.mode
+        const changed = applyBox(mode, taken, taken)
+        box = null
+        selection.redraw()
+        sketch.say(mode === "remove" ? (changed ? "Took " + changed + (changed === 1 ? " part" : " parts") + " off the selection" : "The box took nothing that was selected")
+                   : taken.length ? (mode === "add" ? "Added " + changed : "Selected " + taken.length) + (changed === 1 && mode === "add" || taken.length === 1 && mode !== "add" ? " part" : " parts")
+                   : "The box took nothing")
     }
 
+    // One Project run (start to Done, or to the next click on Project) is one step in the history: the projections made meanwhile
+    // are joined when the run ends, by Done, Esc, another tool or leaving the sketch (owner, 2026-11-02).
+    property int projectSketch: 0
+    function endProject() {
+        if (!projectSketch)
+            return
+        const id = projectSketch
+        projectSketch = 0
+        projectRemember(id, projectPicks)
+        doc.endProjectRun(id, projectCount)
+    }
     function use(name) {
+        endProject()     // choosing Project again ends the run before and starts a new one (its own history item)
         if (Shapes.tools[name])
             return useShape(name)
+        if (name === "project") {
+            projectPicks = []
+            projectSkipped = []
+            projectSketch = sketch.sketchId
+            doc.beginProjectRun(projectSketch)
+        }
         tool = name
         shape = ""
         dimFirst = null
@@ -320,6 +733,7 @@ QtObject {
         selection.clear()
     }
     function cancel() {
+        endProject()
         box = null
         if (tool && (!picking || tool === "project"))
             selection.clearHover()
@@ -342,6 +756,10 @@ QtObject {
     }
     // After Ctrl+Z: the tool stays, but starts afresh.
     function reset() {
+        if (tool === "project" && (projectPicks.length || projectSkipped.length)) {
+            projectPicks = []   // the one step Ctrl+Z takes back is the whole run
+            projectSkipped = []
+        }
         clicks = []
         gather = []
         dimFirst = null
@@ -621,9 +1039,15 @@ QtObject {
     // A picked part as the sketch sees it: the origin's point and in-sketch axes become the
     // sketch's Origin / axes ({kind: "sketch_…", index < 0, shown: the origin part, still lit
     // as itself}); an axis square to the sketch or a plane → {why}; anything else as it is.
-    function asSketchPart(part) {
-        if (part && part.kind === "sketch_curve")
-            return { why: "Splines, ellipses and text take constraints through their points: pick a point." }
+    function asSketchPart(part, curveOk) {
+        if (part && part.kind === "sketch_curve") {
+            // Curvature works on a spline itself; the rest of the constraints take their points.
+            const k = doc.sketchGeometry(sketch.sketchId).curves.find(q => q.id === part.index)
+            if (curveOk && k && (k.type === "fitspline" || k.type === "controlspline"))
+                return part
+            return { why: curveOk ? "Curvature works on splines, lines and arcs: this curve isn't a spline."
+                                  : "Splines, ellipses and text take constraints through their points: pick a point." }
+        }
         if (!part || part.kind !== "origin")
             return part
         const as = (kind, index) => ({ kind: kind, sketch: sketch.sketchId, index: index, shown: part })
@@ -645,7 +1069,7 @@ QtObject {
     // What these picks make for a constraint tool: {done: {type, first, second, third, keep}},
     // {more: what to click next}, or {wrong: why that last pick doesn't fit}.
     function ruleFor(name, list) {
-        const kinds = list.map(p => p.kind === "sketch_line" ? "L" : p.kind === "sketch_arc" ? "A" : "P").join("")
+        const kinds = list.map(p => p.kind === "sketch_line" ? "L" : p.kind === "sketch_arc" ? "A" : p.kind === "sketch_curve" ? "C" : "P").join("")
         const id = i => list[i].index
         const label = toolNames[name]
         const g = () => doc.sketchGeometry(sketch.sketchId)
@@ -658,6 +1082,20 @@ QtObject {
         }
         if (name === "equal" && kinds.includes("A"))
             return { wrong: "Equal: two lines, or two arcs or circles." }
+        if (name === "curvature") {
+            // A spline's end runs on from a line, an arc or another spline's end (owner, 2026-11-02).
+            if (kinds.includes("P"))
+                return { wrong: "Curvature works on curves: click a spline, then the line, arc or spline it meets." }
+            if (kinds.length < 2)
+                return { more: kinds === "C" ? "Now the line, arc or spline it meets at its end." : "Now the spline." }
+            if (!kinds.includes("C"))
+                return { wrong: "Curvature needs a spline: click one." }
+            if (kinds === "CC")
+                return { done: { type: "curvature", first: id(1), second: id(0), third: 3, keep: 0 } }
+            const sp = kinds === "CL" || kinds === "CA" ? 0 : 1
+            const other = kinds.replace("C", "")
+            return { done: { type: "curvature", first: id(sp), second: id(1 - sp), third: other === "L" ? 1 : 2, keep: 0 } }
+        }
         if (name === "tangent") {
             if (kinds.includes("P"))
                 return { wrong: "Tangent works on lines, arcs and circles: click one." }
@@ -738,9 +1176,149 @@ QtObject {
         return { wrong: "" }
     }
 
+    // A constraint asked for with things already selected (owner, 2026-11-02, t50u; Fusion's way): the
+    // whole selection is read at once, never pair by pair. Returns {steps: [{type, first, second,
+    // third, keep}]} to apply now, {more: text} when the selection is too little (the tool then waits
+    // for clicks), or {wrong: text}. The first pick is the one the others follow (Equal follows a
+    // line that already has a length, a Coincident the origin when it's among the points).
+    //   Parallel / Collinear / Equal / Concentric   every other one follows the first
+    //   Perpendicular, Tangent, Midpoint            exactly two
+    //   Horizontal/Vertical   lines: all take the orientation most of them lean to; points: all line up with the first
+    //   Coincident   points join the first (or the origin); one line, arc or circle among points: each point goes on it
+    //   Symmetry     two points or two lines, then the line they mirror across (three picks)
+    function batchPlan(name, list) {
+        const parts = list.map(p => asSketchPart(p, name === "curvature"))
+        const bad = parts.find(p => p && p.why)
+        if (bad)
+            return { wrong: bad.why }
+        const ok = parts.filter(p => p && p.kind && p.kind.startsWith("sketch_"))
+        if (ok.length === 0)
+            return { more: "" }
+        const label = toolNames[name]
+        const lines = ok.filter(p => p.kind === "sketch_line"), arcs = ok.filter(p => p.kind === "sketch_arc")
+        const points = ok.filter(p => p.kind === "sketch_point")
+        const g = doc.sketchGeometry(sketch.sketchId)
+        const at = pid => pid === -1 ? g.origin : g.points.find(q => q.id === pid)
+        const pairs = (base, others) => {
+            const steps = []
+            for (const o of others) {
+                const r = ruleFor(name, [base, o])
+                if (r.wrong !== undefined)
+                    return { wrong: r.wrong }
+                if (r.done)
+                    steps.push(r.done)
+            }
+            return { steps: steps }
+        }
+        const dimensioned = p => g.constraints.some(c => c.first === p.index
+            && (p.kind === "sketch_line" ? c.type === "length" : c.type === "radius" || c.type === "diameter"))
+        if (name === "parallel" || name === "collinear") {
+            if (lines.length !== ok.length)
+                return { wrong: label + " works on lines: select only lines." }
+            if (lines.length < 2)
+                return { more: "Now the second line." }
+            return pairs(lines[0], lines.slice(1))
+        }
+        if (name === "perpendicular") {
+            if (lines.length !== ok.length)
+                return { wrong: label + " works on lines: select only lines." }
+            if (lines.length < 2)
+                return { more: "Now the second line." }
+            if (lines.length > 2)
+                return { wrong: "Perpendicular takes exactly two lines." }
+            return pairs(lines[0], [lines[1]])
+        }
+        if (name === "equal") {
+            const same = lines.length === ok.length ? lines : arcs.length === ok.length ? arcs : null
+            if (!same)
+                return { wrong: "Equal: only lines, or only arcs and circles." }
+            if (same.length < 2)
+                return { more: same === lines ? "Now the second line." : "Now the second arc or circle." }
+            // When some already have a size, the others take it; with none, all take the first one's.
+            const base = same.find(dimensioned) || same[0]
+            return pairs(base, same.filter(p => p !== base))
+        }
+        if (name === "concentric") {
+            if (arcs.length !== ok.length)
+                return { wrong: "Concentric works on arcs and circles: select only those." }
+            return arcs.length < 2 ? { more: "Now the second arc or circle." } : pairs(arcs[0], arcs.slice(1))
+        }
+        if (name === "curvature") {
+            if (ok.length < 2)
+                return { more: ok.length && ok[0].kind === "sketch_curve" ? "Now the line, arc or spline it meets at its end." : "Now the spline." }
+            if (ok.length > 2)
+                return { wrong: "Curvature takes two at a time: a spline and what it meets." }
+            const r = ruleFor(name, ok)
+            return r.done ? { steps: [r.done] } : r.wrong !== undefined ? { wrong: r.wrong } : { more: r.more }
+        }
+        if (name === "tangent") {
+            if (ok.length < 2)
+                return { more: lines.length ? "Now the arc or circle." : "Now a line, arc or circle." }
+            if (ok.length > 2)
+                return { wrong: "Tangent takes two at a time: a line, arc or circle and an arc or circle." }
+            const r = ruleFor(name, ok)
+            return r.done ? { steps: [r.done] } : r.wrong !== undefined ? { wrong: r.wrong } : { more: r.more }
+        }
+        if (name === "midpoint") {
+            if (ok.length < 2)
+                return { more: points.length ? "Now the line." : "Now the point." }
+            if (!(ok.length === 2 && points.length === 1 && lines.length === 1))
+                return { wrong: "Midpoint: a point and a line." }
+            const r = ruleFor(name, ok)
+            return r.done ? { steps: [r.done] } : { wrong: r.wrong || "Midpoint: a point and a line." }
+        }
+        if (name === "hv") {
+            if (arcs.length)
+                return { wrong: "Horizontal/Vertical: select lines, or points." }
+            if (lines.length && points.length)
+                return { wrong: "Horizontal/Vertical: select lines, or points, not both." }
+            if (lines.length) {
+                const real = lines.filter(p => p.index > 0)
+                if (!real.length)
+                    return { wrong: "The axes are already level and upright." }
+                const level = l => { const k = g.lines.find(q => q.id === l.index), a = at(k.a), b = at(k.b); return Math.abs(b.u - a.u) >= Math.abs(b.v - a.v) }
+                const flat = real.filter(level).length, upright = real.length - flat
+                const horizontal = flat > upright ? true : upright > flat ? false : level(real[0])
+                return { steps: real.map(l => ({ type: horizontal ? "horizontal" : "vertical", first: l.index, second: 0, third: 0, keep: 0 })) }
+            }
+            if (points.length < 2)
+                return { more: "Now the second point." }
+            const first = points[0], a = at(first.index)
+            const rest = points.slice(1).filter(p => p.index !== first.index)
+            const level = p => { const b = at(p.index); return Math.abs(b.u - a.u) >= Math.abs(b.v - a.v) }
+            const flat = rest.filter(level).length
+            const horizontal = flat * 2 > rest.length ? true : flat * 2 < rest.length ? false : level(rest[0])
+            return { steps: rest.map(p => ({ type: horizontal ? "horizontalpoints" : "verticalpoints", first: first.index, second: p.index, third: 0, keep: 0 })) }
+        }
+        if (name === "coincident") {
+            const curves = lines.length + arcs.length
+            if (curves > 1)
+                return { wrong: "Coincident: points to join, or points to put on one line, arc or circle." }
+            if (curves === 1) {
+                if (!points.length)
+                    return { more: "Now the point." }
+                const curve = lines[0] || arcs[0]
+                return { steps: points.map(p => ruleFor(name, [p, curve]).done).filter(s => s) }
+            }
+            if (points.length < 2)
+                return { more: "Now a point, or a line to put it on." }
+            const base = points.find(p => p.index === -1) || points[0]
+            return pairs(base, points.filter(p => p !== base))
+        }
+        if (name === "symmetry") {
+            if (ok.length < 3)
+                return { more: ok.length === 1 ? "Now the one that mirrors it." : "Now the line to mirror across." }
+            if (ok.length > 3)
+                return { wrong: "Symmetry takes two points or two lines, then the line to mirror across." }
+            const r = ruleFor(name, ok)
+            return r.done ? { steps: [r.done] } : { wrong: r.wrong || "Symmetry pairs two points or two lines." }
+        }
+        return { wrong: "" }
+    }
+
     // A constraint tool's click (or a selected part handed over). Fix/UnFix: at once.
     function pickWith(part) {
-        part = asSketchPart(part)
+        part = asSketchPart(part, tool === "curvature")
         if (part && part.why)
             return sketch.say(part.why)
         if (!part || !part.kind.startsWith("sketch_"))
@@ -754,8 +1332,13 @@ QtObject {
             doc.fixSketchPoints(sketch.sketchId, l ? [l.a, l.b] : k ? [k.c, k.a, k.b] : [part.index])
             return
         }
-        if (picks.some(p => p.kind === part.kind && p.index === part.index))
+        if (picks.some(p => p.kind === part.kind && p.index === part.index)) {
+            // Clicking a pick again takes it back.
+            picks = picks.filter(p => !(p.kind === part.kind && p.index === part.index))
+            selection.selected = lit(picks)
+            selection.redraw()
             return
+        }
         const r = ruleFor(tool, picks.concat([part]))
         if (r.wrong !== undefined)
             return sketch.say(r.wrong)
@@ -815,7 +1398,7 @@ QtObject {
                 return sketch.say("Click away from the centre: that sets the size.")
             const made = doc.addSketchShape(sketch.sketchId, {
                 points: [end(start), { u: start.u + r, v: start.v }], arcs: [[0, 1, 1]],
-                summary: "Drew a Center Diameter Circle", construction: construction })
+                summary: "Drew a Center Diameter Circle", construction: construction, tool: "circlec" })
             if (made.arcs)
                 start = null
         } else if (tool === "arc") {
@@ -834,7 +1417,7 @@ QtObject {
             const ends = sweep > 0 ? [1, 2] : [2, 1]
             const made = doc.addSketchShape(sketch.sketchId, {
                 points: [end(start), end(arcStart), far], arcs: [[0, ends[0], ends[1]]],
-                summary: "Drew a Center Point Arc", construction: construction })
+                summary: "Drew a Center Point Arc", construction: construction, tool: "arcc" })
             if (made.arcs) {
                 start = null
                 arcStart = null
@@ -903,9 +1486,19 @@ QtObject {
                 values[key][o.key] = o.value
             optionValues = values
         }
+        // A Text tool always starts with an empty box, never the words of the last one (owner, t83u).
+        if (key === "text" || key === "textpath") {
+            const values = Object.assign({}, optionValues)
+            values[key] = Object.assign({}, values[key], { text: "" })
+            optionValues = values
+        }
         const first = def.steps[0]
         if (first.kind === "objects") {
-            gather = objectsFrom(chosen, first.chain)
+            // A written text is never a path for the next text: starting a Text tool puts it down.
+            const textTool = key === "text" || key === "textpath"
+            const geo = textTool ? doc.sketchGeometry(sketch.sketchId) : null
+            gather = objectsFrom(textTool ? chosen.filter(p => !(p.kind === "sketch_curve"
+                            && geo.curves.some(c => c.id === p.index && c.type === "text"))) : chosen, first.chain)
             selection.selected = gather
             selection.redraw()
             sketch.say(gather.length ? gather.length + (gather.length === 1 ? " thing" : " things")
@@ -927,6 +1520,9 @@ QtObject {
         const values = Object.assign({}, optionValues)
         values[shape] = Object.assign({}, values[shape])
         values[shape][key] = value
+        // Typing a Height means that size, not the box's (Text).
+        if (shape === "text" && key === "height")
+            values[shape].fit = false
         optionValues = values
     }
 
@@ -943,7 +1539,9 @@ QtObject {
             clicks: clicks, gather: gather, cursor: cursor, hover: hoverPart, cursorEnd: cursorEnd,
             opt: optionValues[shape] || {}, g: g, sweep: sweep,
             pt: id => M.P(pts[id].u, pts[id].v), line: id => lines[id], arc: id => arcs[id], curve: id => curves[id],
-            textOutline: (text, height) => doc.sketchTextOutline(text, height)
+            textOutline: (text, height) => doc.sketchTextOutline(text, height),
+            textOnPath: (text, font, flags, height, codes) => doc.sketchTextOnPath(sketch.sketchId, text, font, flags, height, codes),
+            textInBox: (text, font, flags, height, w, h) => doc.sketchTextInBox(text, font, flags, height, w, h)
         }
     }
     // The preview as polylines ({u, v} lists), with Offset's arrow.
@@ -1057,7 +1655,27 @@ QtObject {
         }
         // objects: a click adds or takes away (Offset: the whole joined shape at once).
         const part = selection.partAt(x, y)
+        // A written text can't be a path to follow: clicking one (Text tools) picks THAT text, so its
+        // edit panel stays (owner, t79u: the options went dead once a text was clicked with the tool on).
+        if (part && part.kind === "sketch_curve" && (shape === "text" || shape === "textpath")) {
+            const tc = doc.sketchGeometry(sketch.sketchId).curves.find(c => c.id === part.index)
+            if (tc && tc.type === "text") {
+                if (!gather.length) {
+                    selection.selected = [part]
+                    selection.redraw()
+                    sketch.say("Text picked: change it above, or drag it along its path")
+                }
+                return
+            }
+        }
         const got = part ? objectsFrom([part], st.chain) : []
+        // Clicking away from a text that is picked (Text tools, nothing being picked for a new one) puts it down.
+        if (!got.length && (shape === "text" || shape === "textpath") && !gather.length && selection.selected.length === 1
+                && selection.selected[0].kind === "sketch_curve") {
+            selection.selected = []
+            selection.redraw()
+            return
+        }
         if (!got.length)
             return
         const has = q => gather.some(p => p.kind === q.kind && p.index === q.index)
@@ -1123,7 +1741,7 @@ QtObject {
             const spec = { points: made.points, lines: made.lines, arcs: made.arcs, curves: made.curves,
                            constraints: made.constraints, rewire: made.rewire, move: made.move, remove: made.remove,
                            helpers: made.helpers, values: made.values, steady: made.steady, summary: made.summary,
-                           construction: construction, like: made.like }
+                           construction: construction, like: made.like, tool: shape }
             const result = doc.addSketchShape(sketch.sketchId, spec)
             made = result.why ? result : made
             if (!result.why && !result.lines)
@@ -1142,6 +1760,14 @@ QtObject {
         clicks = []
         gather = []
         selection.clear()
+        // A text is made once and the tool ends, as Project does on Done (owner, t82u, t85u): finished means
+        // finished, nothing left picked (white text, dashed box); double-click it later to edit it.
+        if (shape === "text" || shape === "textpath") {
+            cancel()
+            selection.selected = []
+            selection.redraw()
+            return sketch.say(made.summary + " (Ctrl+Z takes it back). Double-click the text to change it")
+        }
         sketch.say(made.summary + " (Ctrl+Z takes it back). " + shapeDef.steps[0].say)
     }
 
@@ -1154,8 +1780,10 @@ QtObject {
             if (!((p.kind === "sketch_line" || p.kind === "sketch_point") && p.index > 0)
                     && p.kind !== "sketch_arc" && p.kind !== "sketch_curve")
                 continue
-            if (chain && (p.kind === "sketch_line" || p.kind === "sketch_arc"))
+            if (chain && (p.kind === "sketch_line" || p.kind === "sketch_arc")) {
+                add(p)                       // the one clicked leads (Text on Path starts there)
                 chainOf(p).forEach(add)
+            }
             else if (!chain || p.kind !== "sketch_point")
                 add(p)
         }
@@ -1272,6 +1900,7 @@ QtObject {
 
     // Dragging (Navigation.leftDrag, through Main).
     property var grab: null                // {u, v} where the drag started on the plane
+    property int slide: 0                  // a text on a path being slid along it: its curve id
     property var dragStarts: ({})          // point id → {u, v} at the start
     property var dragRim: null             // resizing a circle: {u, v} (its centre then), part
     property string dragSummary: ""
@@ -1282,16 +1911,86 @@ QtObject {
     property var dragSkip: null            // {points, lines}: what moves with the drag, never a target
     property var dragSnap: null            // the snap now: snapNear's answer + dragged (the point id)
 
+    // A box's way of working (owner, 2026-11-02, as Fusion's drag direction decides WHAT it takes):
+    // a plain drag replaces the selection with it, Shift adds all of it, Ctrl takes whatever of it
+    // is selected out again (it never selects anything new).
+    function boxMode(modifiers) {
+        return modifiers & Qt.ControlModifier ? "remove" : modifiers & Qt.ShiftModifier ? "add" : "replace"
+    }
+    // Is a point on (or within a third of the letter height of) the letters of a laid preview
+    // (the first polyline is the frame, left out)?
+    function previewHit(laid, at, height) {
+        const band = Math.max(0.3 * height, 1e-3), b2 = band * band
+        for (let i = 1; i < laid.length; i++) {
+            const sh = laid[i]
+            let inside = false
+            for (let j = 0, n = sh.length; j < n; j++) {
+                const p = sh[j], q = sh[(j + 1) % n]
+                if ((p.v > at.v) !== (q.v > at.v) && at.u < (q.u - p.u) * (at.v - p.v) / (q.v - p.v) + p.u)
+                    inside = !inside
+                const dx = q.u - p.u, dy = q.v - p.v, len2 = dx * dx + dy * dy
+                const t = len2 > 0 ? Math.max(0, Math.min(1, ((at.u - p.u) * dx + (at.v - p.v) * dy) / len2)) : 0
+                const ex = p.u + t * dx - at.u, ey = p.v + t * dy - at.v
+                if (ex * ex + ey * ey <= b2)
+                    return true
+            }
+            if (inside)
+                return true
+        }
+        return false
+    }
     function dragBegin(x, y, modifiers) {
-        if (tool === "shape")
+        if (tool === "shape") {
+            // The words shown while the lines are still picked (before Enter) can be grabbed too:
+            // the first drag writes them, then slides them along the path (owner, t71u/t76u: he
+            // types the words, picks the shape and drags, never pressing Enter).
+            if (sketch.active && shape === "textpath" && (gather.length || clicks.length) && String(optionValues.textpath && optionValues.textpath.text || "").trim()
+                    && !(modifiers & (Qt.ControlModifier | Qt.ShiftModifier))) {
+                const at = onPlane(x, y)
+                const laid = at ? shapePreview() : []
+                if (at && laid.length > 1 && previewHit(laid, at, optionValues.textpath.height || 6.35)) {
+                    const before = doc.sketchGeometry(sketch.sketchId).curves.length
+                    confirm()
+                    const cs = doc.sketchGeometry(sketch.sketchId).curves
+                    const made = cs.length > before ? cs[cs.length - 1] : null
+                    if (made && made.type === "text" && made.path.length && doc.beginSketchTextSlide(sketch.sketchId, made.id, at.u, at.v)) {
+                        slide = made.id
+                        selection.selected = [{ kind: "sketch_curve", sketch: sketch.sketchId, index: made.id }]
+                        selection.redraw()
+                        return true
+                    }
+                }
+            }
+            // Text on Path stays on after a text is written: a drag that starts on a path text
+            // still slides it along its path (owner, t61u) when nothing is picked yet.
+            if (sketch.active && shape === "textpath" && !(modifiers & (Qt.ControlModifier | Qt.ShiftModifier))) {
+                const hit = selection.partAt(x, y), at = hit ? onPlane(x, y) : null
+                if (hit && at && hit.kind === "sketch_curve"
+                        && doc.sketchGeometry(sketch.sketchId).curves.some(k => k.id === hit.index && k.type === "text" && k.path.length)
+                        && doc.beginSketchTextSlide(sketch.sketchId, hit.index, at.u, at.v)) {
+                    slide = hit.index
+                    selection.selected = [hit]
+                    selection.redraw()
+                    return true
+                }
+            }
             return handleBegin(x, y)
+        }
+        if (tool === "project" && sketch.active) {
+            box = { x: x, y: y, x2: x, y2: y, mode: boxMode(modifiers) }
+            return true
+        }
+        if (!sketch.active && !tool && !sketch.picking) {
+            box = { x: x, y: y, x2: x, y2: y, mode: boxMode(modifiers) }
+            return true
+        }
         if (!sketch.active || tool)
             return false
         const part = selection.partAt(x, y)
-        if (!part || !part.kind.startsWith("sketch_")) {
+        if (!part || !part.kind.startsWith("sketch_") || (modifiers & (Qt.ControlModifier | Qt.ShiftModifier))) {
             if (!selection.sketchId)
                 return false
-            box = { x: x, y: y, x2: x, y2: y, adding: modifiers & (Qt.ControlModifier | Qt.ShiftModifier) }
+            box = { x: x, y: y, x2: x, y2: y, mode: boxMode(modifiers) }
             return true
         }
         const at = onPlane(x, y)
@@ -1320,6 +2019,17 @@ QtObject {
             doc.beginSketchDrag(sketch.sketchId)
             return true
         }
+        // A text on a path slides along it (the justify then sits about where it is let go).
+        // Whatever else is picked along with it (the lines it follows, say) is let go: pressing a
+        // path text's letters always slides it (owner, t66u).
+        const slidable = part.kind === "sketch_curve" && !(modifiers & (Qt.ControlModifier | Qt.ShiftModifier))
+                       && g.curves.some(k => k.id === part.index && k.type === "text" && k.path.length)
+        if (slidable && doc.beginSketchTextSlide(sketch.sketchId, part.index, at.u, at.v)) {
+            slide = part.index
+            selection.selected = [part]
+            selection.redraw()
+            return true
+        }
         if (!moveFrom(parts, part, g))
             return false
         grab = at
@@ -1333,7 +2043,7 @@ QtObject {
         for (const p of parts) {
             const ends = p.kind === "sketch_point" ? [p.index]
                        : p.kind === "sketch_arc" ? (a => a ? [a.c, a.a, a.b] : [])(g.arcs.find(a => a.id === p.index))
-                       : p.kind === "sketch_curve" ? (k => k ? k.points : [])(g.curves.find(k => k.id === p.index))
+                       : p.kind === "sketch_curve" ? (k => k && !k.path.length ? k.points : [])(g.curves.find(k => k.id === p.index))
                        : (l => l ? [l.a, l.b] : [])(g.lines.find(l => l.id === p.index))
             for (const id of ends) {
                 const q = g.points.find(q => q.id === id)
@@ -1379,11 +2089,17 @@ QtObject {
     }
     function dragMove(x, y) {
         if (box) {
-            box = { x: box.x, y: box.y, x2: x, y2: y, adding: box.adding }
+            box = { x: box.x, y: box.y, x2: x, y2: y, mode: box.mode }
             return
         }
         if (handleGrab)
             return handleMove(x, y)
+        if (slide) {
+            const on = onPlane(x, y)
+            if (on)
+                doc.slideSketchText(sketch.sketchId, slide, on.u, on.v)
+            return
+        }
         if (!grab)
             return
         const at = onPlane(x, y)
@@ -1436,11 +2152,22 @@ QtObject {
     }
     function dragEnd() {
         if (box) {
-            selectBox()
+            if (tool === "project")
+                projectBox()
+            else if (!sketch.active)
+                selectModelBox()
+            else
+                selectBox()
             return
         }
         if (handleGrab) {
             handleGrab = null
+            return
+        }
+        if (slide) {
+            slide = 0
+            if (doc.endSketchTextSlide(sketch.sketchId))
+                sketch.say("Moved the text along its path (Ctrl+Z takes it back)")
             return
         }
         if (!grab)
@@ -1479,7 +2206,7 @@ QtObject {
             return
         const one = lines.length ? "Line" + lines[0].id : arcs.length ? "Arc" + arcs[0].id : curves.length ? "Curve" + curves[0].id : "Point"
         const result = doc.addSketchShape(sketch.sketchId, {
-            summary: count > 1 ? "Deleted " + count + " pieces" : "Deleted " + one,
+            summary: count > 1 ? "Deleted " + count + " pieces" : "Deleted " + one, tool: "delete",
             remove: { points: [...points], lines: lines.map(l => l.id), arcs: arcs.map(a => a.id), curves: curves.map(c => c.id) }
         })
         if (result.why)
@@ -1490,7 +2217,9 @@ QtObject {
     // A box drag (Fusion's window select): left to right takes what's wholly inside, right to left
     // anything it touches. The points of what's taken stay out of the selection, so two lines
     // boxed are still two lines to Parallel, Equal and the like; a point on its own is taken.
-    function selectBox() {
+    // Whether a set of on-screen paths is taken by the dragged box: wholly inside for a window
+    // (left to right), any touch for a crossing (right to left).
+    function boxHits() {
         const left = Math.min(box.x, box.x2), right = Math.max(box.x, box.x2)
         const top = Math.min(box.y, box.y2), bottom = Math.max(box.y, box.y2)
         const touching = box.x2 < box.x
@@ -1508,12 +2237,16 @@ QtObject {
             }
             return from <= to
         }
-        const taken = doc.sketchOutlines(sketch.sketchId).filter(part => {
-            const paths = part.paths.map(path => path.map(p => screenOf(p)))
+        return paths => {
             if (!touching)
                 return paths.every(path => path.every(inside))
             return paths.some(path => path.some(inside) || path.some((p, i) => i > 0 && crosses(path[i - 1], p)))
-        })
+        }
+    }
+    function selectBox() {
+        const hits = boxHits()
+        const taken = doc.sketchOutlines(sketch.sketchId, selection.sketchAllow())
+                         .filter(part => hits(part.paths.map(path => path.map(p => screenOf(p)))))
         const g = doc.sketchGeometry(sketch.sketchId)
         const owned = new Set()
         const has = (kind, id) => taken.some(p => p.kind === kind && p.index === id)
@@ -1527,10 +2260,27 @@ QtObject {
                     owned.add(p)
         const parts = taken.filter(p => p.kind !== "sketch_point" || !owned.has(p.index))
                            .map(p => ({ kind: p.kind, sketch: sketch.sketchId, index: p.index }))
-        const same = (p, q) => p.kind === q.kind && p.index === q.index
-        selection.selected = box.adding ? selection.selected.concat(parts.filter(p => !selection.selected.some(q => same(p, q)))) : parts
+        const all = taken.map(p => ({ kind: p.kind, sketch: sketch.sketchId, index: p.index }))
+        applyBox(box.mode, parts, all)
         box = null
         selection.redraw()
+    }
+    // What a finished box does to the selection: replace it, add `parts`, or take out of it whatever
+    // of `all` (everything the box reached, owned points too) is in it. Returns how many changed.
+    function applyBox(mode, parts, all) {
+        const same = (p, q) => p.kind === q.kind && p.index === q.index
+        const was = selection.selected
+        if (mode === "remove") {
+            selection.selected = was.filter(q => !all.some(p => same(p, q)))
+            return was.length - selection.selected.length
+        }
+        if (mode === "add") {
+            const fresh = parts.filter(p => !was.some(q => same(p, q)))
+            selection.selected = was.concat(fresh)
+            return fresh.length
+        }
+        selection.selected = parts
+        return parts.length
     }
 
     // The whole chain this part is on, as selection parts: lines, arcs and curves joined end to

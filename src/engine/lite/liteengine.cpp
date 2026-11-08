@@ -38,15 +38,64 @@ public:
         return keep(manifold::Manifold::Extrude(section.ToPolygons(), height));
     }
 
-    BodyId combine(BodyId a, BodyId b, Combine op) override {
+    BodyId extrudeOn(const Profile &profile, const Placement &place, double from, double to, double taper) override {
+        if (std::abs(taper) > 1e-9)
+            return 0;
+        if (to < from)
+            std::swap(from, to);
+        if (to - from < 1e-9)
+            return 0;
+        manifold::Polygons polygons;
+        for (const auto &loop : profile.loops) {
+            manifold::SimplePolygon polygon;
+            for (const auto &p : loop)
+                polygon.push_back({p.x, p.y});
+            polygons.push_back(std::move(polygon));
+        }
+        const manifold::CrossSection section(polygons, manifold::CrossSection::FillRule::EvenOdd);
+        manifold::Manifold prism = manifold::Manifold::Extrude(section.ToPolygons(), to - from).Translate({0, 0, from});
+        const manifold::vec3 x(place.x[0], place.x[1], place.x[2]), y(place.y[0], place.y[1], place.y[2]);
+        const manifold::vec3 n = manifold::la::cross(x, y);
+        const manifold::mat3x4 m(x, y, n, manifold::vec3(place.origin[0], place.origin[1], place.origin[2]));
+        return keep(prism.Transform(m));
+    }
+
+    double volume(BodyId body) const override { return m_bodies.at(body).Volume(); }
+
+    double gap(BodyId a, BodyId b, double search) const override {
         const auto &first = m_bodies.at(a);
         const auto &second = m_bodies.at(b);
-        switch (op) {
-        case Combine::Join: return keep(first + second);
-        case Combine::Cut: return keep(first - second);
-        case Combine::Intersect: return keep(first ^ second);
-        }
+        if ((first ^ second).Volume() > 1e-9)
+            return 0;
+        return std::min(first.MinGap(second, search), search);
+    }
+
+    bool faceProfile(BodyId, int, Placement &, Profile &) const override { return false; }
+    BodyId extrudeFace(BodyId, int, const Placement &, double, double, double) override { return 0; }
+    BodyId pushFace(BodyId, int, const Placement &, double, std::string &why) override {
+        why = "the Lite engine has no faces to move";
         return 0;
+    }
+    bool planeOfFace(BodyId, int, double *, double *) const override { return false; }
+    bool flatCurves(BodyId, int, const Placement &, std::vector<FlatCurve> &, std::vector<Point2> &) const override {
+        return false;      // triangles only: Project keeps what it traced
+    }
+    bool reach(BodyId, char, int, const double *, const double *, double &) const override { return false; }
+
+    BodyId combine(BodyId a, const std::vector<BodyId> &tools, Combine op, double fuzzy) override {
+        (void)fuzzy;   // the mesh engine has no fuzzy Booleans
+        if (tools.empty())
+            return 0;
+        manifold::Manifold result = m_bodies.at(a);
+        for (const BodyId b : tools) {
+            const auto &second = m_bodies.at(b);
+            switch (op) {
+            case Combine::Join: result = result + second; break;
+            case Combine::Cut: result = result - second; break;
+            case Combine::Intersect: result = result ^ second; break;
+            }
+        }
+        return keep(result);
     }
 
     BodyId translate(BodyId body, double x, double y, double z) override {

@@ -38,3 +38,32 @@ Problem: OmaMake's model space shows black where the wallpaper should show throu
 Not OmaMake or its engine: the app still draws the same see-through pixels on both engines (143 of 255 unfocused), but they reach Hyprland in a buffer with no alpha.
 
 Cause: the same as the toast above, and the same resolution cleared both.
+
+## OpenCascade booleans hand back empty or broken solids
+
+Status: worked around in OmaMake (each result checked and redone), one case still open, first seen 2026-11-03.
+
+Problem: on a body converted from a mesh, whose edges carry a loose tolerance (0.063 mm), OpenCascade's boolean can report success and return a solid that is empty or broken. Joining an extrude whose sides lay exactly on the body's notched outer wall came back with no volume, and the body vanished from the view while staying in the browser. The same join with the same settings could also come back whole on another run.
+
+Not OmaMake: OpenCascade 7.9 `BRepAlgoAPI_Fuse` with parallel running, oriented boxes and non-destructive mode returns 0 mm³ for a join of a 35,511 mm³ body and a 15,586 mm³ extrude. A plain fuse of the same two shapes gives 37,981 mm³. A fuzzy value (0.01 to 0.5 mm) made it worse.
+
+Resolution (OmaMake side): every join, cut and intersect is checked. The result must be a valid solid, and its volume must fit the operation: a join holds at least the bigger shape and at most both, a cut removes at most the tool, an intersect is no bigger than either. A failed result is redone plainly on copies of the shapes, with threads, then on one thread. If nothing passes, the body is left as it was and Extrude says so. Every attempt is written to the window's log as an `engine:` line. The checks add about 0.3 s per operation.
+
+Second form: a cut whose sides lie right on the body's own walls (an extrude of the body's projected outline) reported success and removed 18 mm³ of 13,000. A volume check can't catch that, since a cut that removes little still fits. Extrude now works out the overlap from the body's mesh first, checks every straight join, cut and intersect against it, and when one is far off redoes it with the outline moved 0.01 mm off the walls, and says so. The moved cut removes 13,115 mm³, as it should. Since then only the edges that lie on a wall are moved, toward the empty side (into the body for a join), so the shape is unchanged; such an outline goes straight to the moved try, as drawn it fails slowly. Exactly coplanar faces (a sketch placed exactly on the base) made the plain boolean return a broken solid too.
+
+Third form: a join whose tool stood on the body's face (the face itself pushed back down) came back the right volume, but OpenCascade's check called it broken: 7 new edges at the seam lay up to 0.0101 mm off their faces against 0.0091 allowed, and neither input had a loose edge. Such a result is now repaired with OpenCascade's own `BOPTools_AlgoTools::CorrectCurveOnSurface` (tolerance widened to fit, never past the loosest tolerance of the inputs) and used. The outline is never moved as a whole any more, since that changes the size; if nothing works, the extrude fails and says so. Still failing: a cut from a converted body's own face straight through the body, where the walls flare by less than the body's tolerance.
+
+Still open: a narrowing taper (−10°) cut through the speaker mount's thread is broken in all three ways, and is refused. A widening taper through it works.
+
+
+## A STEP file saved by OmaMake reads back with one wall inside out
+
+Status: open, first seen 2026-11-04.
+
+Problem: the speaker mount saved as STEP and opened again won't take a cut up to its top face, at 0.1 in or at 1 mm. Extrude says the cut couldn't be built. The same cut on the body before it was saved works.
+
+Cause: after the STEP round trip one spline wall's boundary curves run past the edge of its surface (to 1.0100 of a 0–1 range, where the original sits at exactly 1.0000). OpenCascade then measures that wall at −113.95 mm² instead of 400.86, and the whole body at 33,636 mm³ instead of 35,510. The mesh, and Fusion's import of the same file, still read 35,328. The engine's cut is actually right (23,595 mm³, the same as an exact overlap), but Extrude's check compares it with an estimate from the mesh, sees it 1,800 mm³ off, and refuses it.
+
+Not the inch change, the merge change or the touching tolerance: the cut fails with all three turned off, and the current build makes the same cut (whole model projected onto the base, up to the top face at −0.1 in and −1 mm) on the mesh-converted body in 0.8–1.0 s, 23,593 and 22,395 mm³ left. OpenCascade's own repairs (`ShapeFix_Shape`, `ShapeFix_Face`, rebuilding the boundary curves, every `read.surfacecurve.mode`) leave the wall as it is.
+
+Resolution: none yet. Options: repair such walls on import, write STEP that reads back cleanly, or check a cut against an exact overlap when the body's mesh and exact volume disagree.

@@ -49,8 +49,8 @@ Spec.prototype.circle = function (ci, centre, r, helper) {
     const rim = this.pt({ u: centre.u + r, v: centre.v }, helper)
     return this.arc(ci, rim, rim, helper)
 }
-Spec.prototype.curve = function (type, idx, value, text) {
-    this.curves.push({ type: type, points: idx, value: value || 0, text: text || "" })
+Spec.prototype.curve = function (type, idx, value, text, font, flags, path) {
+    this.curves.push({ type: type, points: idx, value: value || 0, text: text || "", font: font || "", flags: flags || 0, path: path || [] })
     return "k" + (this.curves.length - 1)
 }
 Spec.prototype.con = function (type, first, second, third, extra) {
@@ -196,6 +196,10 @@ function polygonSpec(b, centre, ci, corners, firstClick, r, touching) {
         idx.forEach(i => b.con("pointonarc", b.p(i), ring))
     for (let k = 1; k < lines.length; k++)
         b.con("equal", lines[0], lines[k])
+    // Equal sides touching a circle still leave an even polygon free to swap long and short
+    // corners, as a square can lean into a rhombus. One corner a set turn from the next stops it.
+    if (touching && idx.length % 2 === 0)
+        b.con("rotation", b.p(idx[0]), b.p(idx[1]), b.p(ci), { value: 2 * Math.PI / idx.length })
     return b
 }
 
@@ -249,7 +253,8 @@ function copyParts(s, b, set, map, keep, tie, flip) {
         }
     }
     for (const k of set.curves)
-        b.copyOf(b.curve(k.type, k.points.map(q => idx[q]), k.value, k.text), k.id)
+        if (!(k.path && k.path.length))        // a text on a path stays with its path
+            b.copyOf(b.curve(k.type, k.points.map(q => idx[q]), k.value, k.text, k.font, k.flags), k.id)
     return idx
 }
 function partsPreview(s, set, map) {
@@ -1073,15 +1078,83 @@ const tools = {
         }
     },
     text: {
-        name: "Text", group: "Create", words: "text letters words", hint: "Type the words above, then click where they go",
-        options: [{ key: "text", label: "Text", kind: "text", value: "Text" }, { key: "height", label: "Height", kind: "length", value: 6.35 }],
-        steps: [{ kind: "point", say: "Type the text above, then click where its bottom left goes" }],
-        preview: s => s.cursor && s.opt.text ? s.textOutline(s.opt.text, s.opt.height).map(path => path.map(p => M.add(p, at(s.cursor)))) : [],
+        // Fusion's Text (owner, 2026-11-02): drag out the box the words go in; they wrap to its
+        // width and, with Fit on, grow or shrink to fill it. Font from what's installed.
+        name: "Text", group: "Create", words: "text letters words font type", hint: "Type the words above (Enter starts a new line, Ctrl+Enter is done), then click two corners for the box",
+        options: [{ key: "text", label: "Text", kind: "text", value: "Text" },
+                  { key: "font", label: "Font", kind: "font", value: "" },
+                  { key: "height", label: "Height", kind: "length", value: 6.35 },
+                  { key: "fit", label: "Fit to box", kind: "toggle", value: true },
+                  { key: "bold", label: "Bold", kind: "toggle", value: false },
+                  { key: "italic", label: "Italic", kind: "toggle", value: false },
+                  { key: "across", label: "Across", kind: "choice", choices: ["Left", "Centre", "Right"], value: 0 },
+                  { key: "down", label: "Down", kind: "choice", choices: ["Top", "Middle", "Bottom"], value: 0 }],
+        steps: [{ kind: "point", say: "Type the text above, then click one corner of its box" },
+                { kind: "point", say: "Now the opposite corner of the box" }],
+        flagsOf: o => (o.bold ? 1 : 0) | (o.italic ? 2 : 0) | (o.fit ? 4 : 0) | ((o.across || 0) << 4) | ((o.down || 0) << 6),
+        preview: s => {
+            if (!s.cursor || !String(s.opt.text).trim()) return []
+            const flags = tools.text.flagsOf(s.opt)
+            let a, b
+            if (s.clicks.length) {
+                a = at(s.clicks[0]); b = at(s.cursor)
+            } else {      // nothing clicked: where the words would start, a box as long as they are
+                a = at(s.cursor); b = M.P(a.u + s.opt.height * Math.max(4, String(s.opt.text).length) * 0.75, a.v + s.opt.height * 1.5)
+            }
+            const lo = M.P(Math.min(a.u, b.u), Math.min(a.v, b.v)), w = Math.abs(b.u - a.u), h = Math.abs(b.v - a.v)
+            const words = s.textInBox(s.opt.text, s.opt.font, s.clicks.length ? flags : flags & ~4, s.opt.height, w, h)
+            return [[a, M.P(b.u, a.v), b, M.P(a.u, b.v), a]].concat(words.map(path => path.map(p => M.P(p.u + lo.u, p.v + lo.v))))
+        },
         build: s => {
             if (!String(s.opt.text).trim())
                 return why("Type some text first.")
+            const a = at(s.clicks[0]), c = at(s.clicks[1])
+            if (Math.abs(a.u - c.u) < 0.5 || Math.abs(a.v - c.v) < 0.5)
+                return why("Make the box a bit bigger: the text needs some room.")
             const b = new Spec("Wrote \"" + s.opt.text + "\"")
-            b.curve("text", [b.pt(s.clicks[0])], s.opt.height, s.opt.text)
+            b.curve("text", [b.pt(s.clicks[0]), b.pt(s.clicks[1])], s.opt.height, s.opt.text, s.opt.font, tools.text.flagsOf(s.opt))
+            return b
+        }
+    },
+    textpath: {
+        // Text on Path (owner, 2026-11-02): the words follow the lines, arcs and curves picked, end
+        // to end (a square's four sides, say), left, centre or right justified along them.
+        name: "Text on Path", group: "Create", words: "text path along follow curve line arc circle square justify font wrap",
+        hint: "Type the words above, click a shape or lines they follow, then press Enter",
+        options: [{ key: "text", label: "Text", kind: "text", value: "Text" },
+                  { key: "font", label: "Font", kind: "font", value: "" },
+                  { key: "height", label: "Height", kind: "length", value: 6.35 },
+                  { key: "bold", label: "Bold", kind: "toggle", value: false },
+                  { key: "italic", label: "Italic", kind: "toggle", value: false },
+                  { key: "across", label: "Justify", kind: "choice", choices: ["Left", "Centre", "Right"], value: 0 },
+                  { key: "flip", label: "Flip", kind: "toggle", value: false }],
+        steps: [{ kind: "objects", chain: true, say: "Click a shape (its joined lines come along) or single lines and curves, then press Enter" }],
+        flagsOf: o => (o.bold ? 1 : 0) | (o.italic ? 2 : 0) | ((o.across || 0) << 4) | (o.flip ? 256 : 0),
+        codesOf: (s, parts) => {
+            const out = []
+            for (const p of parts || []) {
+                const code = p.kind === "sketch_line" && p.index > 0 ? 1000000 + p.index : p.kind === "sketch_arc" ? 2000000 + p.index
+                           : p.kind === "sketch_curve" && s.curve(p.index) && s.curve(p.index).type !== "text" ? 3000000 + p.index : 0
+                if (code && !out.includes(code)) out.push(code)
+            }
+            return out
+        },
+        preview: s => {
+            const codes = tools.textpath.codesOf(s, s.clicks.length ? s.clicks[0] : s.gather)
+            if (!codes.length || !String(s.opt.text).trim()) return []
+            const laid = s.textOnPath(s.opt.text, s.opt.font, tools.textpath.flagsOf(s.opt), s.opt.height, codes)
+            return laid && laid.shapes ? [laid.frame].concat(laid.shapes) : []
+        },
+        build: s => {
+            if (!String(s.opt.text).trim())
+                return why("Type some text first.")
+            const codes = tools.textpath.codesOf(s, s.clicks[0])
+            if (!codes.length)
+                return why("Pick a line, an arc or a curve for the text to follow.")
+            const code = codes[0], kind = Math.floor(code / 1000000), id = code % 1000000
+            const start = kind === 1 ? s.line(id).a : kind === 2 ? (s.arc(id).circle ? s.arc(id).a : s.arc(id).b) : s.curve(id).points[0]
+            const b = new Spec("Wrote \"" + s.opt.text + "\" along " + codes.length + (codes.length === 1 ? " line" : " lines"))
+            b.curve("text", [b.pt(start)], s.opt.height, s.opt.text, s.opt.font, tools.textpath.flagsOf(s.opt), codes)
             return b
         }
     },
@@ -1453,6 +1526,6 @@ const tools = {
 // Search order: Fusion's Create menu, then Modify.
 const order = ["midline", "rect3", "rectc", "circle2", "circle3", "circle2t", "circle3t", "arc3", "arctan",
                "polyin", "polyout", "polyedge", "slotcc", "slotov", "slotcp", "slot3a", "slotca",
-               "splinefit", "splinectl", "conic", "point", "ellipse", "text", "mirror", "patternc", "patternr",
+               "splinefit", "splinectl", "conic", "point", "ellipse", "text", "textpath", "mirror", "patternc", "patternr",
                "fillet", "chamferequal", "chamferangle", "chamfertwo", "offset", "trim", "extend", "break",
                "scale", "blend", "movecopy"]

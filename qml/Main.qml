@@ -120,6 +120,8 @@ Window {
         return out
     }
     // Is any body visible? One mesh holds the model until bodies are separate meshes.
+    // The model is drawn and picked as one mesh of the bodies that are shown (their eyes, and a
+    // past sketch's rewind): the document joins those; it's told whenever that changes.
     readonly property bool bodyVisible: Object.keys(visibleKeys).some(k => k.startsWith("b") && visibleKeys[k])
     // Each origin part, shown if it's visible in any component (they share one place for now).
     // While sketching, the planes are hidden unless shown again with their eye during the
@@ -270,7 +272,7 @@ Window {
 
             // The body, hidden by its eye in the Browser (the fade is the view's crossfade).
             Node {
-                visible: root.bodyVisible
+                visible: root.bodyVisible && !rewind.showing
 
                 Model {
                     geometry: MeshGeometry { id: faces }
@@ -288,6 +290,55 @@ Window {
                     materials: PrincipledMaterial {
                         lighting: PrincipledMaterial.NoLighting
                         baseColor: theme.modelEdge
+                    }
+                }
+            }
+
+            // The Timeline's rewind (owner, 2026-11-07): while the marker is part way across an extrude,
+            // the design before it (the body's own geometry, which is the design now) and after it
+            // (rewind's afterFaces), each cut where the rewind has got to (RewindMaterial).
+            Node {
+                visible: rewind.showing
+                Model {
+                    geometry: faces
+                    materials: RewindMaterial {
+                        keepInside: 0
+                        origin: rewind.origin; axis: rewind.axis; low: rewind.low; high: rewind.high; glowWidth: rewind.glowWidth
+                        xDir: rewind.xDir; yDir: rewind.yDir; box: rewind.box
+                        tint: theme.model; glow: theme.accent
+                        metal: navigation.simpleLook ? 0.08 : 0.85
+                        rough: navigation.simpleLook ? 0.42 : 0.28
+                    }
+                }
+                Model {
+                    geometry: edges
+                    depthBias: -40
+                    materials: RewindMaterial {
+                        lines: true; keepInside: 0
+                        origin: rewind.origin; axis: rewind.axis; low: rewind.low; high: rewind.high; glowWidth: rewind.glowWidth
+                        xDir: rewind.xDir; yDir: rewind.yDir; box: rewind.box
+                        ink: theme.modelEdge; glow: theme.accent
+                    }
+                }
+                Model {
+                    geometry: MeshGeometry { id: afterFaces }
+                    materials: RewindMaterial {
+                        keepInside: 1
+                        origin: rewind.origin; axis: rewind.axis; low: rewind.low; high: rewind.high; glowWidth: rewind.glowWidth
+                        xDir: rewind.xDir; yDir: rewind.yDir; box: rewind.box
+                        tint: theme.model; glow: theme.accent
+                        metal: navigation.simpleLook ? 0.08 : 0.85
+                        rough: navigation.simpleLook ? 0.42 : 0.28
+                    }
+                }
+                Model {
+                    geometry: MeshGeometry { id: afterEdges; lines: true }
+                    depthBias: -40
+                    materials: RewindMaterial {
+                        lines: true; keepInside: 1
+                        origin: rewind.origin; axis: rewind.axis; low: rewind.low; high: rewind.high; glowWidth: rewind.glowWidth
+                        xDir: rewind.xDir; yDir: rewind.yDir; box: rewind.box
+                        ink: theme.modelEdge; glow: theme.accent
                     }
                 }
             }
@@ -312,12 +363,39 @@ Window {
                     roughness: 0.45
                 }
             }
+            // What Project has picked so far (Selection.drawProject): faces shaded translucent purple,
+            // edges and corners as thick lines drawn in front (owner, 2026-11-02).
+            Model {
+                objectName: "projectFaces"
+                geometry: MeshGeometry { id: projectFaceParts }
+                depthBias: -50
+                castsShadows: false
+                receivesShadows: false
+                materials: PrincipledMaterial {
+                    lighting: PrincipledMaterial.NoLighting
+                    baseColor: Qt.rgba(0.62, 0.30, 0.95, 0.42)
+                    alphaMode: PrincipledMaterial.Blend
+                    cullMode: Material.NoCulling
+                    depthDrawMode: Material.NeverDepthDraw
+                }
+            }
+            Model {
+                objectName: "projectEdges"
+                geometry: MeshGeometry { id: projectEdgeParts }
+                depthBias: -400
+                castsShadows: false
+                receivesShadows: false
+                materials: PrincipledMaterial {
+                    lighting: PrincipledMaterial.NoLighting
+                    baseColor: theme.selection
+                }
+            }
             OriginShapes {
                 id: originShapes
                 theme: theme
                 shown: root.originVisible
                 styles: root.planeStyles
-                size: Math.max(100, navigation.sceneBounds().radius * 0.75)
+                size: 150         // fixed, half-width in mm (owner, 2026-11-08: it followed the model and resized while scrubbing)
                 lineRadius: navigation.distance * 0.0011
             }
             SketchGrid {
@@ -332,13 +410,7 @@ Window {
                 depthBias: -25
                 castsShadows: false
                 receivesShadows: false
-                materials: PrincipledMaterial {
-                    lighting: PrincipledMaterial.NoLighting
-                    baseColor: Qt.rgba(theme.hover.r, theme.hover.g, theme.hover.b, 0.30)
-                    alphaMode: PrincipledMaterial.Blend
-                    cullMode: Material.NoCulling
-                    depthDrawMode: Material.NeverDepthDraw
-                }
+                materials: ProfileMaterial { tint: Qt.rgba(theme.hover.r, theme.hover.g, theme.hover.b, 0.30) }
             }
             Model {
                 objectName: "profileSelected"
@@ -346,13 +418,50 @@ Window {
                 depthBias: -25
                 castsShadows: false
                 receivesShadows: false
-                materials: PrincipledMaterial {
-                    lighting: PrincipledMaterial.NoLighting
-                    baseColor: Qt.rgba(theme.selection.r, theme.selection.g, theme.selection.b, 0.40)
-                    alphaMode: PrincipledMaterial.Blend
-                    cullMode: Material.NoCulling
-                    depthDrawMode: Material.NeverDepthDraw
-                }
+                materials: ProfileMaterial { tint: Qt.rgba(theme.selection.r, theme.selection.g, theme.selection.b, 0.40) }
+            }
+            // Extrude's preview per side: a faint fill, an outline (blue adds, red cuts), and the exact red region a cut removes.
+            Model {
+                objectName: "extrudePreviewA"
+                geometry: MeshGeometry { id: extrudePreviewA }
+                castsShadows: false
+                receivesShadows: false
+                materials: XrayMaterial { tint: extrudeTool.fillOf(0) }
+            }
+            Model {
+                objectName: "extrudeWireA"
+                geometry: MeshGeometry { id: extrudeWireA; lines: true }
+                castsShadows: false
+                receivesShadows: false
+                materials: XrayMaterial { tint: extrudeTool.lineOf(0) }
+            }
+            Model {
+                objectName: "extrudeCutA"
+                geometry: MeshGeometry { id: extrudeCutA }
+                castsShadows: false
+                receivesShadows: false
+                materials: XrayMaterial { tint: extrudeTool.cutColor }
+            }
+            Model {
+                objectName: "extrudePreviewB"
+                geometry: MeshGeometry { id: extrudePreviewB }
+                castsShadows: false
+                receivesShadows: false
+                materials: XrayMaterial { tint: extrudeTool.fillOf(1) }
+            }
+            Model {
+                objectName: "extrudeWireB"
+                geometry: MeshGeometry { id: extrudeWireB; lines: true }
+                castsShadows: false
+                receivesShadows: false
+                materials: XrayMaterial { tint: extrudeTool.lineOf(1) }
+            }
+            Model {
+                objectName: "extrudeCutB"
+                geometry: MeshGeometry { id: extrudeCutB }
+                castsShadows: false
+                receivesShadows: false
+                materials: XrayMaterial { tint: extrudeTool.cutColor }
             }
             // Closed profiles, lightly shaded (Main.drawProfiles), under the lines.
             Model {
@@ -361,13 +470,7 @@ Window {
                 depthBias: -20
                 castsShadows: false
                 receivesShadows: false
-                materials: PrincipledMaterial {
-                    lighting: PrincipledMaterial.NoLighting
-                    baseColor: theme.sketchProfile
-                    alphaMode: PrincipledMaterial.Blend
-                    cullMode: Material.NoCulling
-                    depthDrawMode: Material.NeverDepthDraw
-                }
+                materials: ProfileMaterial { tint: theme.sketchProfile }
             }
             // What's drawn in sketches (Main.drawSketches), and a tool's preview.
             Model {
@@ -521,9 +624,30 @@ Window {
                                       : sketchTools.tool ? sketchTools.click(x, y)
                                       : selection.clickAt(x, y, modifiers)
         onDoubleClickAt: (x, y) => {
+            if (!sketch.active && !sketchTools.tool) {
+                const written = selection.textAt(x, y)       // a text in a finished sketch: back into it to edit
+                if (written) {
+                    root.editText(written.sketch, written.index)
+                    return
+                }
+                selection.selectBodyAt(x, y)       // the whole body only, never its component
+                return
+            }
             if (!sketch.active || sketchTools.tool)
                 return
             const part = selection.partAt(x, y)
+            if (part && part.kind === "sketch_curve" && sketch.sketchId) {      // a text: open it for editing (t60u)
+                const k = doc.sketchGeometry(sketch.sketchId).curves.find(c => c.id === part.index)
+                if (k && k.type === "text") {
+                    root.editText(sketch.sketchId, part.index)
+                    return
+                }
+            }
+            // The model in view while sketching: its whole body too, the clicked item let go (owner, t50u).
+            if (part && (part.kind === "face" || part.kind === "edge" || part.kind === "point")) {
+                selection.selectBodyAt(x, y)
+                return
+            }
             const chain = part && part.kind.startsWith("sketch_") ? sketchTools.profileOf(part) : []
             if (chain.length) {
                 selection.selected = chain
@@ -531,7 +655,15 @@ Window {
             }
         }
         leftDrag: ({
-            begin: (x, y, modifiers) => sketchTools.dragBegin(x, y, modifiers),
+            begin: (x, y, modifiers) => {
+                // DRAGDIAG (temporary, owner t72u): what a press-drag did, in the window's log.
+                const pa = sketch.active ? selection.partAt(x, y) : null
+                const r = sketchTools.dragBegin(x, y, modifiers)
+                console.log("DRAGDIAG", Math.round(x), Math.round(y), "tool=" + sketchTools.tool, "shape=" + sketchTools.shape, "sketchActive=" + sketch.active,
+                            "gather=" + sketchTools.gather.length, "sel=" + selection.selected.length, "part=" + (pa ? pa.kind + ":" + pa.index : "none"),
+                            "slide=" + sketchTools.slide, "result=" + r)
+                return r
+            },
             move: (x, y) => sketchTools.dragMove(x, y),
             end: () => sketchTools.dragEnd()
         })
@@ -653,8 +785,33 @@ Window {
                         PathLine { x: dim.leader ? dim.leader.x2 : 0; y: dim.leader ? dim.leader.y2 : 0 }
                     }
                 }
+                // Says what a driven dimension is, for a few seconds after it appears (or when clicked), under it.
+                Rectangle {
+                    id: drivenToast
+                    readonly property bool shown: !!dim.modelData.driven && root.drivenToastId === dim.modelData.id
+                    visible: opacity > 0
+                    opacity: shown ? 1 : 0
+                    Behavior on opacity { NumberAnimation { duration: root.fadeMs } }
+                    x: Math.round(Math.max(8, Math.min(root.width - width - 8, dim.spot.x - width / 2)))
+                    y: Math.round(dim.spot.y + 18)
+                    width: toastText.implicitWidth + 20
+                    height: toastText.implicitHeight + 12
+                    radius: 8
+                    color: Qt.rgba(theme.panelBg.r, theme.panelBg.g, theme.panelBg.b, 0.95)
+                    border.color: theme.warning
+                    Text {
+                        id: toastText
+                        anchors.centerIn: parent
+                        text: "Driven dimension: the other dimensions decide it,\nso it can't be set by hand"
+                        color: theme.warning
+                        font.pixelSize: 12
+                        horizontalAlignment: Text.AlignHCenter
+                    }
+                }
                 Rectangle {
                     id: tag
+                    readonly property var tipTheme: theme
+                    readonly property var hitArea: area
                     x: Math.round(dim.spot.x - width / 2)
                     y: Math.round(dim.spot.y - height / 2)
                     width: label.implicitWidth + 14
@@ -662,13 +819,40 @@ Window {
                     radius: 6
                     readonly property bool picked: sketchTools.pickedConstraints.includes(dim.modelData.id)
                     color: picked ? theme.accent : Qt.rgba(theme.panelBg.r, theme.panelBg.g, theme.panelBg.b, 0.85)
-                    border.color: picked || area.containsMouse ? theme.accent : theme.border
+                    border.color: dim.modelData.driven ? "transparent" : picked || area.containsMouse ? theme.accent : theme.border
+                    // A driven dimension: a dotted border and amber italic text, so it can't be mistaken for one you set.
+                    Shape {
+                        visible: !!dim.modelData.driven
+                        anchors.fill: parent
+                        ShapePath {
+                            strokeColor: parent.parent.picked || area.containsMouse ? theme.accent : theme.warning
+                            strokeWidth: 1.5
+                            fillColor: "transparent"
+                            strokeStyle: ShapePath.DashLine
+                            dashPattern: [1.5, 2.5]
+                            capStyle: ShapePath.RoundCap
+                            PathRectangle { x: 1; y: 1; width: tag.width - 2; height: tag.height - 2; radius: 6 }
+                        }
+                    }
                     Text {
                         id: label
                         anchors.centerIn: parent
-                        text: Units.show(dim.look ? dim.look.shown : dim.modelData.value, dim.modelData.unit)
-                        color: parent.picked ? theme.panelBg : theme.textPrimary
+                        text: (dim.modelData.driven ? "(" : "") + (dim.modelData.expr ? "Fx " : "") + Units.show(dim.look ? dim.look.shown : dim.modelData.value, dim.modelData.unit)
+                              + (dim.modelData.driven ? ")" : "")
+                        color: parent.picked ? theme.panelBg : dim.modelData.driven ? theme.warning : theme.textPrimary
                         font.pixelSize: 12
+                        font.italic: !!dim.modelData.driven
+                    }
+                    // Fx: which parameter (or formula) gives this value (owner, 2026-11-02, t91u).
+                    Loader {
+                        active: !!dim.modelData.expr
+                        sourceComponent: HoverTip {
+                            theme: tag.tipTheme
+                            area: tag.hitArea
+                            title: dim.modelData.expr
+                            text: "Parameter formula: open Parameters to change it"
+                            delay: 600
+                        }
                     }
                     // Click: pick it, like a constraint's badge, for Delete. Double-click: change the
                     // value. Drag: move it where you like (it stays there).
@@ -723,6 +907,10 @@ Window {
         sketchSelectedGeometry: sketchSelectedParts
         profileHoverGeometry: profileHoverParts
         profileSelectedGeometry: profileSelectedParts
+        projectEdgeGeometry: projectEdgeParts
+        projectFaceGeometry: projectFaceParts
+        projectPicks: sketchTools.tool === "project" ? sketchTools.projectPicks : []
+        through: root.selectThrough
         origin: originShapes
         sketchId: root.openSketchShown ? sketch.sketchId : 0
         pickable: root.bodyVisible
@@ -737,7 +925,19 @@ Window {
         theme: theme
         crossfade: root.crossfade
         sketch: sketch
+        held: historyTimeline.frozen
         onSketchEditRequested: id => root.editSketch(id)
+        underlined: selection.treeKeys
+        cutChoices: extrudeTool.open ? extrudeTool.cutChoices : null
+        onCutToggled: (body, on) => extrudeTool.toggleCut(body, on)
+        // Double-click on a body row: that body. On a component row: every body inside it, and in
+        // the components within it (owner, 2026-11-02). Not while sketching.
+        onSelectRequested: key => {
+            if (sketch.active || sketchTools.tool)
+                return
+            const id = parseInt(key.slice(1))
+            selection.selectBodies(key[0] === "b" ? [id] : doc.bodiesUnder(id))
+        }
         onFindRequested: (key, name) => {
             const r = navigation.findInWindow(key)
             if (!r.found)
@@ -755,34 +955,75 @@ Window {
         id: sketch
         nav: navigation
         selection: selection
+        crossfade: root.crossfade
+        fadeBusy: () => fading.on
+        fadeMs: root.fadeMs
         onActiveChanged: { sketchTools.cancel(); sketchTools.construction = false; root.gapsOn = false; root.gapsFading = false; root.gapAt = -1 }
     }
     SketchTools {
         id: sketchTools
         sketch: sketch
         selection: selection
+        selectThrough: root.selectThrough
         geometryShown: root.openSketchShown
         free: navigation.ctrlHeld
         screenOf: p => root.toScreen(p)
     }
-    // A box drag in a sketch: solid takes what's wholly inside, dashed anything it touches.
-    Shape {
+    // A box drag in a sketch: dashed takes what's wholly inside, solid anything it touches (owner, 2026-11-02).
+    Rectangle {
+        id: boxOverlay
         readonly property var box: sketchTools.box
+        readonly property bool crossing: !!box && box.x2 < box.x
+        readonly property bool dashed: !!box && !crossing   // left to right: wholly inside, dashed
+        // Ctrl (taking off) is drawn in a colour that never matches the box for adding, whatever the
+        // theme: red when that sits well away from the accent's hue, else the next of yellow, green,
+        // else the accent's opposite (owner, 2026-11-02: a red Omarchy theme made the two alike).
+        function hueGap(c) {
+            const acc = theme.accent
+            if (c.hslSaturation < 0.12 || acc.hslSaturation < 0.12)
+                return c.hslSaturation < 0.12 && acc.hslSaturation < 0.12 ? 0 : 0.5
+            const d = Math.abs(c.hslHue - acc.hslHue)
+            return Math.min(d, 1 - d)
+        }
+        readonly property color removeTint: {
+            const pool = [theme.danger, theme.warning, theme.success]
+            for (const c of pool)
+                if (hueGap(c) > 0.14)
+                    return c
+            return Qt.hsla((theme.accent.hslHue + 0.5) % 1, 0.8, theme.accent.hslLightness < 0.5 ? 0.6 : 0.4, 1)
+        }
+        readonly property color tint: box && box.mode === "remove" ? removeTint : theme.accent
         visible: !!box
-        anchors.fill: parent
+        x: box ? Math.min(box.x, box.x2) : 0
+        y: box ? Math.min(box.y, box.y2) : 0
+        width: box ? Math.abs(box.x2 - box.x) : 0
+        height: box ? Math.abs(box.y2 - box.y) : 0
         z: 50
-        ShapePath {
-            readonly property var box: sketchTools.box || { x: 0, y: 0, x2: 0, y2: 0 }
-            strokeColor: theme.accent
-            strokeWidth: 1
-            fillColor: Qt.alpha(theme.accent, 0.12)
-            strokeStyle: box.x2 < box.x ? ShapePath.DashLine : ShapePath.SolidLine
-            dashPattern: [4, 3]
-            startX: box.x; startY: box.y
-            PathLine { x: sketchTools.box ? sketchTools.box.x2 : 0; y: sketchTools.box ? sketchTools.box.y : 0 }
-            PathLine { x: sketchTools.box ? sketchTools.box.x2 : 0; y: sketchTools.box ? sketchTools.box.y2 : 0 }
-            PathLine { x: sketchTools.box ? sketchTools.box.x : 0; y: sketchTools.box ? sketchTools.box.y2 : 0 }
-            PathLine { x: sketchTools.box ? sketchTools.box.x : 0; y: sketchTools.box ? sketchTools.box.y : 0 }
+        color: Qt.alpha(tint, dashed ? 0.08 : 0.14)
+        border.color: tint
+        border.width: dashed ? 0 : 1
+        // Left to right takes only what is wholly inside: a dashed edge; right to left a solid one.
+        Repeater {
+            model: boxOverlay.dashed ? 4 : 0
+            Item {
+                required property int index
+                readonly property bool horiz: index < 2
+                x: horiz ? 0 : (index === 2 ? 0 : boxOverlay.width - 1)
+                y: horiz ? (index === 0 ? 0 : boxOverlay.height - 1) : 0
+                width: horiz ? boxOverlay.width : 1
+                height: horiz ? 1 : boxOverlay.height
+                Repeater {
+                    model: Math.ceil((horiz ? boxOverlay.width : boxOverlay.height) / 7)
+                    Rectangle {
+                        required property int index
+                        x: parent.horiz ? index * 7 : 0
+                        y: parent.horiz ? 0 : index * 7
+                        width: parent.horiz ? 4 : 1
+                        height: parent.horiz ? 1 : 4
+                        color: boxOverlay.tint
+                    }
+                }
+            }
         }
     }
 
@@ -794,18 +1035,39 @@ Window {
         equal: "Click the first line, then the second.", collinear: "Click the first line, then the second.",
         hv: "Click a line, or two points.", coincident: "Click a point, then a point or a line.",
         midpoint: "Click a point and a line.", symmetry: "Click two points or two lines, then the line to mirror across.",
-        tangent: "Click a line, arc or circle, then an arc or circle.", concentric: "Click two arcs or circles."
+        tangent: "Click a line, arc or circle, then an arc or circle.", concentric: "Click two arcs or circles.",
+        curvature: "Click a spline, then the line, arc or spline it meets at its end."
     })
     function constrain(type) {
         const parts = selection.selected.filter(p => p.kind.startsWith("sketch_") || p.kind === "origin")
+        const plan = type === "fix" ? { more: "" } : sketchTools.batchPlan(type, parts)
+        // The selection is all it needs: every constraint is made now, at once (Fusion with things
+        // picked beforehand); the first pick is the one the others follow (SketchTools.batchPlan).
+        if (plan.steps) {
+            let made = 0, said = ""
+            for (const s of plan.steps) {
+                const why = doc.addSketchConstraint(sketch.sketchId, s.type, s.first, s.second, s.third, s.keep)
+                if (!why)
+                    made++
+                else if (!said || !/already/.test(why))
+                    said = said || why
+            }
+            selection.clear()
+            if (made === 0 && !said)
+                said = "Those already have that."
+            sketch.say(said ? (made ? made + " made; " : "") + said
+                            : made === 1 ? "Made it" : "Made " + made)
+            return
+        }
+        if (plan.wrong) {
+            sketch.say(plan.wrong)
+            return
+        }
+        // Too little selected: the tool starts with those as its first picks and waits for clicks.
         sketchTools.use(type)
-        const before = sketchTools.applied
         for (const part of parts)
             sketchTools.pickWith(part)
-        // The selection was all it needed: done, like Fusion with things picked beforehand.
-        if (sketchTools.applied > before)
-            sketchTools.cancel()
-        else if (parts.length === 0)
+        if (parts.length === 0)
             sketch.say(constraintStarts[type])
     }
 
@@ -834,6 +1096,13 @@ Window {
             return askDimension("distance", points[0].index, points[1].index)
         if (points.length === 1 && lines.length === 1)
             return askDimension("pointline", points[0].index, lines[0].index)
+        // An arc or circle with another arc, circle or a point: the distance from its centre.
+        const arcs = parts.filter(p => p.kind === "sketch_arc")
+        if (arcs.length && parts.length === 2 && lines.length === 0) {
+            const g = doc.sketchGeometry(sketch.sketchId)
+            const centre = p => p.kind === "sketch_arc" ? g.arcs.find(q => q.id === p.index).c : p.index
+            return askDimension("distance", centre(parts[0]), centre(parts[1]))
+        }
         if (parts.length === 0 && chosen.length === 0) {
             sketchTools.use("dimension")
             sketch.say("Click a line, an arc or circle, or a point and then another point or a line.")
@@ -852,6 +1121,21 @@ Window {
         }
         if (m.value === undefined)
             return sketch.say("Those can't be dimensioned.")
+        // The other dimensions already decide it (owner, t88u): no value to type, it goes in as a driven
+        // (reference) dimension showing what it is.
+        if (doc.dimensionIsDriven(sketch.sketchId, type, first, second, !!otherSide)) {
+            dimInput.close()
+            const unit = type === "angle" ? "deg" : "in"
+            const why = doc.addSketchDimension(sketch.sketchId, type, first, second, m.value, unit,
+                                               Units.show(m.value, unit), !!otherSide)
+            if (why)
+                return sketch.say(why)
+            sketchTools.dimLine = 0
+            const drivenNow = doc.sketchDimensions(sketch.sketchId).filter(d => d.driven).pop()
+            if (drivenNow)
+                showDrivenToast(drivenNow.id)
+            return sketch.say("The other dimensions already decide that one, so it's a driven dimension: shown in brackets, it follows them.")
+        }
         // An angle shows on the side of the corner where its lines were clicked (between the
         // spots, SketchTools.angleSpots), as in Fusion; picked beforehand: towards their middles.
         let look = null
@@ -874,7 +1158,7 @@ Window {
                 if (type === "angle" && !(v.mm > 1e-9 && v.mm < Math.PI - 1e-9))
                     return "An angle has to be more than 0° and less than 180°."
                 const why = doc.addSketchDimension(sketch.sketchId, type, first, second, v.mm, v.unit,
-                                                   Units.show(v.mm, v.unit), !!otherSide)
+                                                   Units.show(v.mm, v.unit), !!otherSide, v.expr || "")
                 if (!why)
                     sketchTools.dimLine = 0
                 if (!why && look) {
@@ -892,8 +1176,17 @@ Window {
         function onClosed() { root.newAngle = null }
     }
 
+    // The driven dimension whose explanation is showing (fades after a few seconds).
+    property int drivenToastId: 0
+    function showDrivenToast(id) { drivenToastId = id; drivenToastTimer.restart() }
+    Timer { id: drivenToastTimer; interval: 5000; onTriggered: root.drivenToastId = 0 }
+
     // An angle shown on the other side of its corner (angleLook) is typed as that side's angle.
     function editDimension(d, look) {
+        if (d.driven) {
+            showDrivenToast(d.id)
+            return sketch.say("That one is driven by the other dimensions, so it can't be typed. Change those instead.")
+        }
         const at = look ? look.spot : dimensionSpot(toScreen(d.a), toScreen(d.b), d.type)
         const flip = !!(look && look.flipped)
         dimInput.show(at.x, at.y, look ? look.shown : d.value, d.unit,
@@ -901,8 +1194,8 @@ Window {
                 if (d.type === "angle" && !(v.mm > 1e-9 && v.mm < Math.PI - 1e-9))
                     return "An angle has to be more than 0° and less than 180°."
                 return doc.setSketchDimension(sketch.sketchId, d.id, flip ? Math.PI - v.mm : v.mm, v.unit,
-                                              Units.show(v.mm, v.unit))
-            })
+                                              Units.show(v.mm, v.unit), v.expr || "", !!v.expr && flip)
+            }, d.expr || "")
     }
 
     // Engine coordinates → window pixels.
@@ -1123,7 +1416,7 @@ Window {
         function onDimensionWanted(type, first, second, otherSide) { root.askDimension(type, first, second, otherSide) }
         function onConstraintWanted(type, first, second, third, keep) {
             const why = doc.addSketchConstraint(sketch.sketchId, type, first, second, third, keep)
-            sketch.say(why)
+            sketch.say(why || (type === "curvature" ? "Curvature made: the spline now runs on from it with the same direction and bend" : ""))
         }
     }
 
@@ -1231,13 +1524,75 @@ Window {
             if (why)
                 return sketch.say(why)
             const made = [[cylinders, "cylinder"], [cones, "cone"], [spheres, "sphere"]].filter(k => k[0]).map(k => k[0] + " " + k[1] + (k[0] > 1 ? "s" : ""))
-            sketch.say("Fitted " + made.join(", ") + " in " + seconds.toFixed(1) + " s · at most " + worstMm.toFixed(3) + " mm off · " + trianglesLeft.toLocaleString(Qt.locale(), "f", 0) + " triangles left as facets")
+            sketch.say("Fitted " + made.join(", ") + " in " + seconds.toFixed(1) + " s · at most " + (worstMm / 25.4).toFixed(4) + " in off · " + trianglesLeft.toLocaleString(Qt.locale(), "f", 0) + " triangles left as facets")
         }
         function onImportFinished(why, seconds, faces, triangles) {
             if (why)
                 return sketch.say(why)
             navigation.fit()
             sketch.say("Imported " + doc.importName + " in " + seconds.toFixed(1) + " s · " + faces.toLocaleString(Qt.locale(), "f", 0) + " faces, " + triangles.toLocaleString(Qt.locale(), "f", 0) + " triangles")
+        }
+    }
+    // While an extrude's solid work runs: the view still turns, so this only says it's busy.
+    Rectangle {
+        id: workingCard
+        objectName: "workingCard"
+        property double started: 0
+        property real elapsed: 0
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: 90
+        width: 240
+        height: 54
+        radius: 12
+        z: 900
+        opacity: doc.working ? 1 : 0
+        visible: opacity > 0
+        Behavior on opacity { NumberAnimation { duration: 250 } }
+        color: Qt.rgba(theme.panelBg.r, theme.panelBg.g, theme.panelBg.b, 0.92)
+        Connections {
+            target: doc
+            function onWorkingChanged() {
+                if (doc.working) {
+                    workingCard.started = Date.now()
+                    workingCard.elapsed = 0
+                }
+            }
+        }
+        Timer {
+            interval: 100
+            repeat: true
+            running: doc.working
+            onTriggered: workingCard.elapsed = (Date.now() - workingCard.started) / 1000
+        }
+        Text {
+            x: 16; y: 10
+            text: "Extruding"
+            color: theme.textPrimary
+            font.pixelSize: 14
+            font.bold: true
+        }
+        Text {
+            x: parent.width - 86; y: 10; width: 70
+            horizontalAlignment: Text.AlignRight
+            text: workingCard.elapsed.toFixed(1) + " s"
+            color: theme.textPrimary
+            font.pixelSize: 14
+            font.features: { "tnum": 1 }
+        }
+        Rectangle {
+            x: 16; y: 36; width: parent.width - 32; height: 4; radius: 2
+            clip: true
+            color: Qt.rgba(theme.textPrimary.r, theme.textPrimary.g, theme.textPrimary.b, 0.15)
+            Rectangle {
+                width: 60; height: 4; radius: 2
+                color: theme.selection
+                NumberAnimation on x {
+                    from: -60; to: 210; duration: 1200
+                    loops: Animation.Infinite
+                    running: doc.working
+                }
+            }
         }
     }
     // Over everything, and takes the mouse, while the model is on its way.
@@ -1392,7 +1747,7 @@ Window {
     function tellGaps() {
         const closed = profileCheck.profiles.length
         if (!gapCount)
-            sketch.say("No gaps under 1 mm · " + closed + (closed === 1 ? " closed profile" : " closed profiles"))
+            sketch.say("No gaps under 0.039 in · " + closed + (closed === 1 ? " closed profile" : " closed profiles"))
     }
 
     function fixSelected() {
@@ -1428,6 +1783,41 @@ Window {
     property bool showConstraints: true
     property bool showPoints: true
     property bool showProjected: true
+    // The Selection menu (was Selectable): what a plain click or hover may pick while sketching (Selection.allow).
+    property bool selLines: true
+    property bool selPoints: true
+    property bool selConstraints: true
+    property bool selProfiles: true
+    property bool selConstruction: true
+    property bool selProjected: true
+    property bool selOrigin: true
+    property bool selFaces: true
+    property bool selEdges: true
+    property bool selBodyPoints: true
+    property bool selOutside: true
+    // Select Through (owner, 2026-11-02): global, in the Selection menu of both modes; what a box
+    // takes, and what a click or hover can reach, no longer stops at the model's front.
+    property bool selectThrough: false
+    Binding {
+        target: selection
+        property: "allow"
+        // Outside sketching the sketch-only switches are not in the menu, so they never hold anything back.
+        value: ({ lines: !sketch.active || root.selLines, points: !sketch.active || root.selPoints,
+                  construction: !sketch.active || root.selConstruction,
+                  projected: !sketch.active || root.selProjected, profiles: root.selProfiles, origin: root.selOrigin,
+                  bodies: root.selFaces || root.selEdges || root.selBodyPoints, faces: root.selFaces, edges: root.selEdges, bodyPoints: root.selBodyPoints,
+                  outside: root.selOutside })
+    }
+    Binding {
+        target: selection
+        property: "filtered"
+        value: !sketch.active || (!sketch.picking && !sketchTools.tool)
+    }
+    Binding {
+        target: selection
+        property: "bodyFiltered"
+        value: !sketch.active || (!sketch.picking && (!sketchTools.tool || sketchTools.tool === "project"))
+    }
     function sketchShows() {
         doc.setSketchShows(showPoints, showProjected)
         selection.clear()
@@ -1441,6 +1831,7 @@ Window {
         doc.fillProfiles(sketchProfiles, ids)
         // Picking: every shown sketch's profiles; while sketching, the open sketch's only.
         selection.profileSketches = sketch.active ? (openSketchShown ? [sketch.sketchId] : []) : ids
+        selection.outsideSketches = ids
     }
     function drawSketches() {
         const ids = []
@@ -1454,6 +1845,10 @@ Window {
     Connections {
         target: doc
         function onSketchesChanged() {
+            if (doc.takeLiveTween()) {
+                root.liveT = 0
+                liveGlide.restart()
+            }
             root.sketchTick++
             selection.keepIn(sketch.active ? doc.sketchGeometry(sketch.sketchId) : { lines: [], points: [] })
             root.drawSketches()
@@ -1461,11 +1856,20 @@ Window {
             root.refreshDimensions()
         }
     }
-    onVisibleKeysChanged: { drawSketches(); drawProfiles() }
+    onVisibleKeysChanged: {
+        doc.showBodies(Object.keys(visibleKeys).filter(k => k[0] === "b" && visibleKeys[k]).map(k => Number(k.slice(1))))
+        drawSketches(); drawProfiles()
+    }
     Connections {
         target: navigation
-        function onDistanceChanged() { root.drawSketches() }
+        // While zooming, redraw the sketch lines at most every 50 ms (the last step always lands).
+        function onDistanceChanged() {
+            if (Date.now() - root.sketchDrawnAt >= 50) { root.sketchDrawnAt = Date.now(); sketchRedrawLater.stop(); root.drawSketches() }
+            else sketchRedrawLater.restart()
+        }
     }
+    property double sketchDrawnAt: 0
+    Timer { id: sketchRedrawLater; interval: 50; onTriggered: { root.sketchDrawnAt = Date.now(); root.drawSketches() } }
     Connections {
         target: sketchTools
         function onPreviewChanged() { doc.fillSegments(sketchPreview, sketchTools.preview, navigation.distance * selection.perPixel() * 1.1, sketchTools.construction) }
@@ -1477,12 +1881,17 @@ Window {
     }
 
     SketchBar {
+        id: sketchBar
         anchors.top: parent.top
         anchors.topMargin: 14
+        guideBelow: extrudeTool.rowsBottom - 14
         anchors.horizontalCenter: parent.horizontalCenter
         theme: theme
         sketch: sketch
         toolName: sketchTools.toolName
+        toolCount: sketchTools.tool === "project" ? sketchTools.projectCount : -1
+        toolSkipped: sketchTools.tool === "project" ? sketchTools.projectSkipped.length : 0
+        onClearCount: sketchTools.projectClearAll()
         toolHint: (search.commands.find(c => c.name === sketchTools.toolName) || {}).hint || ""
         construction: sketchTools.construction
         onToggleConstruction: root.toggleConstruction()
@@ -1503,12 +1912,101 @@ Window {
         z: 9
         theme: theme
         tool: sketchTools.shape
-        fields: sketchTools.shapeDef && sketchTools.shapeDef.options ? sketchTools.shapeDef.options : []
+        fontList: sketchTools.shape === "text" || sketchTools.shape === "textpath" ? doc.fontFamilies() : []
+        fields: textEdit.curve ? [] : sketchTools.shapeDef && sketchTools.shapeDef.options ? sketchTools.shapeDef.options : []
         values: sketchTools.optionValues[sketchTools.shape] || ({})
+        twoRows: sketchTools.shape === "text" || sketchTools.shape === "textpath"
+        doneLabel: twoRows ? "Done" : ""
+        // Done writes the text (as Enter does); the tool then ends. With nothing picked it simply ends the tool.
+        onDone: {
+            if (sketchTools.gather.length || sketchTools.clicks.length) {
+                sketchTools.confirm()     // writes it and ends the tool; with no words typed it says so and waits
+            } else {
+                sketchTools.cancel()      // nothing picked: Done just ends the tool, like Project's Done
+            }
+        }
         onChanged: (key, value) => sketchTools.setOption(key, value)
         onConfirmed: sketchTools.confirm()
         onCancelled: sketchTools.cancel()
         onUndo: root.undoLast()
+        onRedo: root.redoLast()
+    }
+    // The one text picked (nothing else, no tool on): its words, font, size and look, changed
+    // here as they were made (owner, 2026-11-02). Each change is one undoable step.
+    ToolOptions {
+        id: textEdit
+        // The edit session of a text is kept by the document (same text, nothing else recorded since); the
+        // panel hiding for a moment (tool changed, a drag re-picking the text) must not end it.
+        readonly property var curve: {
+            sketchTools.drawnTick
+            // Also while a text tool is on with nothing picked for it yet: a written text picked then
+            // is edited here, in every detail (owner, t77u), not the tool's options for the next one.
+            const textTool = sketchTools.tool === "shape" && (sketchTools.shape === "text" || sketchTools.shape === "textpath")
+                           && !sketchTools.gather.length && !sketchTools.clicks.length
+            if (!sketch.active || (sketchTools.tool !== "" && !textTool) || selection.selected.length !== 1)
+                return null
+            const p = selection.selected[0]
+            if (p.kind !== "sketch_curve")
+                return null
+            const k = doc.sketchGeometry(sketch.sketchId).curves.find(c => c.id === p.index)
+            return k && k.type === "text" ? k : null
+        }
+        anchors.top: parent.top
+        anchors.topMargin: 14 + 116 + 6
+        anchors.horizontalCenter: parent.horizontalCenter
+        z: 9
+        theme: theme
+        tool: curve ? "text-edit" + curve.id : ""
+        fontList: curve ? doc.fontFamilies() : []
+        readonly property bool along: !!(curve && curve.path && curve.path.length)
+        readonly property bool single: !!(curve && !along && curve.points.length < 2)    // older text: one point
+        fields: !curve ? [] : single
+                ? [{ key: "text", label: "Text", kind: "text" }, { key: "font", label: "Font", kind: "font" },
+                   { key: "height", label: "Height", kind: "length" }, { key: "bold", label: "Bold", kind: "toggle" },
+                   { key: "italic", label: "Italic", kind: "toggle" }]
+                : along
+                ? [{ key: "text", label: "Text", kind: "text" }, { key: "font", label: "Font", kind: "font" },
+                   { key: "height", label: "Height", kind: "length" }, { key: "bold", label: "Bold", kind: "toggle" },
+                   { key: "italic", label: "Italic", kind: "toggle" },
+                   { key: "across", label: "Justify", kind: "choice", choices: ["Left", "Centre", "Right"] },
+                   { key: "flip", label: "Flip", kind: "toggle" }]
+                : [{ key: "text", label: "Text", kind: "text" }, { key: "font", label: "Font", kind: "font" },
+                   { key: "height", label: "Height", kind: "length" }, { key: "fit", label: "Fit to box", kind: "toggle" },
+                   { key: "bold", label: "Bold", kind: "toggle" }, { key: "italic", label: "Italic", kind: "toggle" },
+                   { key: "across", label: "Across", kind: "choice", choices: ["Left", "Centre", "Right"] },
+                   { key: "down", label: "Down", kind: "choice", choices: ["Top", "Middle", "Bottom"] }]
+        values: curve ? { text: curve.text, font: curve.font, height: curve.value, fit: !!(curve.flags & 4), bold: !!(curve.flags & 1),
+                          italic: !!(curve.flags & 2), across: (curve.flags >> 4) & 3, down: (curve.flags >> 6) & 3,
+                          flip: !!(curve.flags & 256) } : ({})
+        onChanged: (key, value) => {
+            if (!curve)
+                return
+            const v = Object.assign({}, values)
+            v[key] = value
+            if (key === "height")
+                v.fit = false
+            const flags = (v.bold ? 1 : 0) | (v.italic ? 2 : 0) | (v.fit && !along ? 4 : 0) | ((v.across || 0) << 4)
+                        | (along ? (v.flip ? 256 : 0) : (v.down || 0) << 6)
+            const why = doc.editSketchText(sketch.sketchId, curve.id, { text: v.text, font: v.font, flags: flags, height: v.height })
+            if (why)
+                sketch.say(why)
+        }
+        twoRows: true
+        doneLabel: "Done"
+        // Done finishes the text: it stays as written, is put down (deselected), and the tool ends.
+        onDone: textEdit.finish()
+        function finish() {
+            textEdit.leave()
+            doc.closeTextEdit()
+            selection.selected = []
+            selection.redraw()
+            if (sketchTools.tool !== "")
+                sketchTools.cancel()
+        }
+        onConfirmed: textEdit.finish()
+        onCancelled: textEdit.finish()   // Esc on a written text just puts it down; nothing is removed
+        onUndo: root.undoLast()
+        onRedo: root.redoLast()
     }
     // Project's two choices, where a tool's options go.
     Row {
@@ -1519,7 +2017,8 @@ Window {
         spacing: 8
         visible: sketchTools.tool === "project"
         Repeater {
-            model: [{ key: "model", label: "Whole Model" }, { key: "face", label: "Face" }]
+            model: [{ key: "model", label: "Whole Model" }, { key: "face", label: "Face" }, { key: "edge", label: "Edges / Points" },
+                    { key: "sketch", label: "Sketch Parts" }, { key: "wholesketch", label: "Whole Sketch" }]
             delegate: Rectangle {
                 required property var modelData
                 readonly property bool on: sketchTools.projectWhat === modelData.key
@@ -1562,10 +2061,29 @@ Window {
             }
         }
     }
+    // Picking a line or shape in the view leaves the option boxes, so Enter then finishes the tool
+    // (in the Text box Enter is a new line); owner t73u: his four picks were never turned into text.
+    Connections {
+        target: sketchTools
+        // After a path is picked the cursor jumps into the Text box, so typing never reaches the shortcuts
+        // (owner, t84u); other gathering tools keep the keys for Enter.
+        function onGatherChanged() {
+            if (sketchTools.gather.length > 0 && (sketchTools.shape === "text" || sketchTools.shape === "textpath"))
+                Qt.callLater(toolOptions.focusFirst)
+            else if (sketchTools.gather.length > 0) { toolOptions.leave(); enterKey.forceActiveFocus() }
+        }
+    }
+    // Where the keys land once the option boxes are left: Enter finishes the tool even if the
+    // window's shortcut doesn't see it.
+    Item {
+        id: enterKey
+        Keys.onReturnPressed: event => { event.accepted = sketchTools.tool === "shape" && sketchTools.confirm() }
+        Keys.onEnterPressed: event => { event.accepted = sketchTools.tool === "shape" && sketchTools.confirm() }
+    }
     // Enter: a tool gathering things (Mirror, Offset, a spline's points…) carries on.
     Shortcut {
         sequences: ["Return", "Enter"]
-        enabled: sketchTools.tool === "shape" && !search.open && !dimInput.open && !toolOptions.typing
+        enabled: sketchTools.tool === "shape" && !search.open && !dimInput.open && !toolOptions.typing && !textEdit.typing
         onActivated: sketchTools.confirm()
     }
 
@@ -1574,7 +2092,7 @@ Window {
         anchors.bottom: parent.bottom
         anchors.bottomMargin: 10
         anchors.right: parent.right
-        anchors.rightMargin: 8
+        anchors.rightMargin: 100
         visible: sketch.active
         z: 40
         theme: theme
@@ -1583,6 +2101,63 @@ Window {
             { name: "Show Dimensions", on: root.showDimensions, flip: () => root.showDimensions = !root.showDimensions },
             { name: "Show Constraints", on: root.showConstraints, flip: () => root.showConstraints = !root.showConstraints },
             { name: "Show Projected Geometries", on: root.showProjected, flip: () => { root.showProjected = !root.showProjected; root.sketchShows() } }
+        ]
+    }
+    SketchDisplay {
+        objectName: "sketchSelectable"
+        idName: "selectable"
+        title: "Selection"
+        buttonWidth: 84
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: 10
+        anchors.right: parent.right
+        anchors.rightMargin: 8
+        visible: sketch.active
+        z: 40
+        theme: theme
+        rows: [
+            { name: "Lines", on: root.selLines, flip: () => root.selLines = !root.selLines },
+            { name: "Points", on: root.selPoints, flip: () => root.selPoints = !root.selPoints },
+            { name: "Constraints", on: root.selConstraints, flip: () => root.selConstraints = !root.selConstraints },
+            { name: "Profile Areas", on: root.selProfiles, flip: () => root.selProfiles = !root.selProfiles },
+            { name: "Construction Lines", on: root.selConstruction, flip: () => root.selConstruction = !root.selConstruction },
+            { name: "Projections", on: root.selProjected, flip: () => root.selProjected = !root.selProjected },
+            { name: "Origin", on: root.selOrigin, flip: () => root.selOrigin = !root.selOrigin },
+            { name: "Components", on: false, enabled: false, flip: () => {}, children: [
+                { name: "Bodies", on: false, flip: () => {}, children: [
+                    { name: "Faces", on: root.selFaces, flip: () => root.selFaces = !root.selFaces },
+                    { name: "Edges", on: root.selEdges, flip: () => root.selEdges = !root.selEdges },
+                    { name: "Points", on: root.selBodyPoints, flip: () => root.selBodyPoints = !root.selBodyPoints }
+                ] },
+                { name: "Outside Sketches", on: root.selOutside, flip: () => root.selOutside = !root.selOutside }
+            ] },
+            { name: "Select Through", divider: true, on: root.selectThrough, flip: () => root.selectThrough = !root.selectThrough }
+        ]
+    }
+    // The same menu outside sketching: only what can be selected there (owner, 2026-11-02).
+    SketchDisplay {
+        objectName: "modelSelection"
+        idName: "modelSelect"
+        title: "Selection"
+        buttonWidth: 84
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: 10
+        anchors.right: parent.right
+        anchors.rightMargin: 8
+        visible: !sketch.active
+        z: 40
+        theme: theme
+        rows: [
+            { name: "Profile Areas", on: root.selProfiles, flip: () => root.selProfiles = !root.selProfiles },
+            { name: "Origin", on: root.selOrigin, flip: () => root.selOrigin = !root.selOrigin },
+            { name: "Components", on: false, enabled: false, flip: () => {}, children: [
+                { name: "Bodies", on: false, flip: () => {}, children: [
+                    { name: "Faces", on: root.selFaces, flip: () => root.selFaces = !root.selFaces },
+                    { name: "Edges", on: root.selEdges, flip: () => root.selEdges = !root.selEdges },
+                    { name: "Points", on: root.selBodyPoints, flip: () => root.selBodyPoints = !root.selBodyPoints }
+                ] }
+            ] },
+            { name: "Select Through", divider: true, on: root.selectThrough, flip: () => root.selectThrough = !root.selectThrough }
         ]
     }
     ViewCube {
@@ -1635,11 +2210,13 @@ Window {
         // Sketch); onlyOmarchy commands are left out on other systems. Names are Fusion's
         // exact ones wherever Fusion has the function (history/DUNE-VS-FUSION.md).
         commands: [
+            { name: "Parameters", words: "parameter variables formulas equations values fx user named expressions", hint: "Named values and formulas that dimensions can use", group: "Look", modes: both, keys: "", run: () => Qt.callLater(parametersWindow.openIt) },
             { name: theme.light ? "Dark Mode" : "Light Mode", words: "dark light theme colours", hint: "Switch the look", group: "Look", modes: both, keys: "", run: () => theme.setLight(!theme.light) },
             { name: "Follow Omarchy Theme", words: "colours", onlyOmarchy: true, hint: theme.followSystem ? "Back to OmaMake's own colours" : "Take colours from the current Omarchy theme", group: "Look", modes: both, keys: "", run: () => theme.followSystem = !theme.followSystem },
             { name: "Light Follows View", hint: root.lightFollowsView ? "On: the lamp turns with you. Turn off to keep it fixed in the room" : "Off: the lamp stays put in the room. Turn on to have it turn with you", group: "Look", modes: ["model"], keys: "", run: () => root.lightFollowsView = !root.lightFollowsView },
             { name: "Grid", hint: navigation.gridVisible ? "Hide the floor grid" : "Show the floor grid", group: "Look", modes: ["model"], keys: "", run: () => navigation.gridVisible = !navigation.gridVisible },
             { name: "Simple Look", words: "fast performance effects", hint: navigation.simpleLook ? "Back to full shading and shadows" : "Fewer effects, for slower computers", group: "Look", modes: ["model"], keys: "", run: () => navigation.simpleLook = !navigation.simpleLook },
+            { name: "Extrude", words: "extrude push pull pad boss cut join profile area face distance symmetric two sides new body", hint: "Push profiles or flat faces out into a body, a join, or a cut", group: "Create", modes: ["model"], keys: "E", letter: "e", run: () => Qt.callLater(extrudeTool.begin) },
             { name: "New Component", hint: "An empty component inside the active one, made active", group: "Assemble", modes: ["model"], keys: "", run: () => doc.newComponent() },
             { name: "Browser", hint: browserTree.shown ? "Hide the design tree" : "Show the design tree", group: "Look", modes: both, keys: "", run: () => browserTree.shown = !browserTree.shown },
             { name: "Origin Planes: Cross", hint: "All planes full size, through the centre (how OmaMake opens)", group: "Look", modes: ["model"], keys: "", run: () => root.setPlaneStyle("", "cross") },
@@ -1647,9 +2224,10 @@ Window {
             { name: "Create Sketch", hint: "Pick a flat face, or empty space for an origin plane (or triple-click one)", group: "Create", modes: ["model"], keys: "", run: () => sketch.picking = true },
             { name: "Line", letter: "l", hint: "Click the start, then each next point; Esc stops", group: "Create", modes: ["sketch"], keys: "L", run: () => sketchTools.use("line") },
             { name: "2-Point Rectangle", hint: "Click one corner, then the opposite one", group: "Create", modes: ["sketch"], keys: "", run: () => sketchTools.use("rectangle") },
-            { name: "Project", letter: "p", words: "project geometry include silhouette outline profile shadow", hint: "Choose Whole Model or Face, click the model as often as you like, then Done", group: "Create", modes: ["sketch"], keys: "", run: () => sketchTools.use("project") },
+            { name: "Project", letter: "p", words: "project geometry include silhouette outline profile shadow", hint: "Choose Whole Model, Face or Edges / Points, click the model as often as you like, then Done", group: "Create", modes: ["sketch"], keys: "", run: () => sketchTools.use("project") },
             { name: "Center Diameter Circle", hint: "Click the centre, then the edge", group: "Create", modes: ["sketch"], keys: "", run: () => sketchTools.use("circle") },
             { name: "Center Point Arc", words: "arc", hint: "Click the centre, where it starts, then where it ends", group: "Create", modes: ["sketch"], keys: "", run: () => sketchTools.use("arc") },
+            { name: "Curvature", words: "g2 smooth blend continuity spline bend match", hint: "Click a spline, then the line, arc or spline it meets at its end: they run on with the same direction and bend", group: "Constraints", modes: ["sketch"], keys: "", run: () => root.constrain("curvature") },
             { name: "Tangent", hint: "Click a line, arc or circle, then an arc or circle: they touch smoothly", group: "Constraints", modes: ["sketch"], keys: "", run: () => root.constrain("tangent") },
             { name: "Concentric", hint: "Click two arcs or circles: they share a centre", group: "Constraints", modes: ["sketch"], keys: "", run: () => root.constrain("concentric") },
             // Fillet right after the basic shapes, so "fi" finds it before Fix/UnFix (owner: easy to find).
@@ -1668,7 +2246,7 @@ Window {
             { name: "Show Constraints", words: "sketch palette display hide badges", hint: root.showConstraints ? "Hide the constraint badges" : "Show the constraint badges", group: "Look", modes: ["sketch"], keys: "", run: () => root.showConstraints = !root.showConstraints },
             { name: "Show Projected Geometries", words: "sketch palette display hide purple", hint: root.showProjected ? "Hide what's projected from the model" : "Show what's projected from the model", group: "Look", modes: ["sketch"], keys: "", run: () => { root.showProjected = !root.showProjected; root.sketchShows() } },
             { name: "Toggle Construction", letter: "x", words: "construction normal reference guide dashed", hint: "Turn the selected lines construction or back; with nothing selected or while drawing, what you draw next", group: "Sketch", modes: ["sketch"], keys: "X", keepsTool: true, run: () => root.toggleConstruction() },
-            { name: "Find Profile Gaps", words: "gap gaps break broken open leak profile closed close not closing", hint: "Rings in red, for 10 s (Esc sooner), where lines come within 1 mm without being joined", group: "Sketch", modes: ["sketch"], keys: "", keepsTool: true, run: () => root.showGaps() },
+            { name: "Find Profile Gaps", words: "gap gaps break broken open leak profile closed close not closing", hint: "Rings in red, for 10 s (Esc sooner), where lines come within 0.039 in without being joined", group: "Sketch", modes: ["sketch"], keys: "", keepsTool: true, run: () => root.showGaps() },
             { name: "Fix/UnFix", hint: "Click points or lines (or select them first) to hold them where they are, or let them go", group: "Constraints", modes: ["sketch"], keys: "", run: () => root.fixSelected() },
             // Every other Fusion sketch tool (ShapeTools.js), in Fusion's menu order.
             ...Shapes.order.filter(key => key !== "fillet").map(key => {
@@ -1762,6 +2340,18 @@ Window {
                 root.runKey(c)
         }
     }
+    // E: Extrude, as in Fusion, with whatever profile or faces are selected. Model only: in a sketch
+    // E is Ellipse (SketchKeys.js), and a model tool never runs from a sketch.
+    Shortcut {
+        id: extrudeKey
+        sequence: "E"
+        enabled: !sketch.active && !sketch.picking && !search.open && !modeMenu.open && !planeMenu.open
+                 && !dimInput.open && !toolOptions.typing && !extrudeTool.open && !doc.working
+        onActivated: {
+            noteUse("Extrude")
+            extrudeTool.begin()
+        }
+    }
     // S: the command search (Fusion's S opens its shortcuts box; Alt+Space works everywhere).
     Shortcut {
         id: searchKey
@@ -1799,16 +2389,80 @@ Window {
             crossfade(() => doc.undo())
             return
         }
-        const action = doc.undo()
-        if (action.type === "finish_sketch")
-            sketch.open(action.sketch, doc.sketchPlane(action.sketch))
-        else if (action.type === "sketch" && sketch.active && sketch.sketchId === action.id)
-            sketch.leave()
-        else if (action.type === "edit_sketch" && sketch.active && sketch.sketchId === action.sketch)
-            sketch.leave()
+        const run = () => {
+            const action = doc.undo()
+            if (action.type === "finish_sketch")
+                sketch.open(action.sketch, doc.sketchPlane(action.sketch))
+            else if (action.type === "sketch" && sketch.active && sketch.sketchId === action.id)
+                sketch.leave()
+            else if (action.type === "edit_sketch" && sketch.active && sketch.sketchId === action.sketch)
+                sketch.leave()
+        }
+        // Going back into or out of a sketch from the past fades what was made after it.
+        if (next && ((next.type === "finish_sketch" && doc.rewinds(next.sketch))
+                     || (next.type === "edit_sketch" && doc.rewinds(0))))
+            crossfade(run)
+        else
+            run()
     }
 
     // Fusion's Edit Sketch, from a double-click on a sketch in the Timeline or the Browser.
+    // A text opened for editing (double click): into its sketch if need be, picked, its words ready to type.
+    property var pendingText: null
+    function editText(sketchId, curveId) {
+        pendingText = { sketch: sketchId, curve: curveId }
+        if (!(sketch.active && sketch.sketchId === sketchId))
+            editSketch(sketchId)
+        pendingTextTimer.restart()
+    }
+    Timer {
+        id: pendingTextTimer
+        interval: 60
+        repeat: true
+        property int tries: 0
+        onTriggered: {
+            const w = root.pendingText
+            if (!w || ++tries > 40) {
+                stop()
+                tries = 0
+                root.pendingText = null
+                return
+            }
+            if (!(sketch.active && sketch.sketchId === w.sketch))
+                return
+            stop()
+            tries = 0
+            root.pendingText = null
+            sketchTools.cancel()
+            selection.selected = [{ kind: "sketch_curve", index: w.curve, sketch: w.sketch }]
+            selection.redraw()
+            Qt.callLater(() => textEdit.focusFirst())
+        }
+    }
+    // Ctrl+Y (owner, 2026-11-07): put back the newest action Ctrl+Z took back, exactly as it was.
+    // The window follows, the other way round from undo: redoing a sketch's start or an Edit Sketch
+    // goes into it, redoing a finish leaves it.
+    function redoLast() {
+        sketch.picking = false
+        sketchTools.reset()
+        const next = doc.redoNext()
+        if (!next.type)
+            return
+        const run = () => {
+            const action = doc.redo()
+            if (action.type === "finish_sketch" && sketch.active)
+                sketch.leave()
+            else if (action.type === "sketch")
+                sketch.open(action.id, doc.sketchPlane(action.id))
+            else if (action.type === "edit_sketch")
+                sketch.open(action.sketch, doc.sketchPlane(action.sketch))
+        }
+        // Into or out of a sketch, or showing or hiding something: faded, as undo does.
+        if (next.type === "visibility" || next.type === "finish_sketch" || next.type === "edit_sketch")
+            crossfade(run)
+        else
+            run()
+    }
     function editSketch(id) {
         sketchTools.cancel()
         dimInput.close()
@@ -1820,6 +2474,12 @@ Window {
         sequence: "Ctrl+Z"
         enabled: !search.open && !modeMenu.open && !planeMenu.open && !dimInput.open && !toolOptions.typing
         onActivated: root.undoLast()
+    }
+    Shortcut {
+        id: redoKey
+        sequence: "Ctrl+Y"
+        enabled: undoKey.enabled
+        onActivated: root.redoLast()
     }
     Shortcut {
         sequence: "Ctrl+Q"
@@ -1871,6 +2531,7 @@ Window {
                         kind: modelData.kind
                         label: modelData.label
                         picked: modelData.picked
+                        enabled: root.selConstraints || !!sketchTools.tool
                         onClicked: sketchTools.pickConstraint(modelData.id, modelData.label)
                     }
                 }
@@ -1937,6 +2598,72 @@ Window {
             font.pixelSize: 12
         }
     }
+    ExtrudeTool {
+        id: extrudeTool
+        anchors.fill: parent
+        theme: theme
+        selection: selection
+        previewA: extrudePreviewA
+        previewB: extrudePreviewB
+        wireA: extrudeWireA
+        wireB: extrudeWireB
+        cutA: extrudeCutA
+        cutB: extrudeCutB
+        project: p => root.toScreen(p)
+        fadeMs: root.fadeMs
+        z: 35
+        onSay: (text, ms) => sketch.say(text, ms)
+    }
+    ParametersWindow {
+        id: parametersWindow
+        theme: theme
+        fadeMs: root.fadeMs
+        z: 40
+        onSay: text => sketch.say(text)
+        onImportRequested: {
+            parameterImportDialog.currentFolder = doc.filePath ? "file://" + doc.filePath.substring(0, doc.filePath.lastIndexOf("/")) : saveFolder
+            dialogLook.setDark(!theme.light)
+            parameterImportDialog.open()
+        }
+        onExportRequested: {
+            parameterExportDialog.currentFolder = doc.filePath ? "file://" + doc.filePath.substring(0, doc.filePath.lastIndexOf("/")) : saveFolder
+            parameterExportDialog.selectedFile = parameterExportDialog.currentFolder + "/Parameters.ods"
+            dialogLook.setDark(!theme.light)
+            parameterExportDialog.open()
+        }
+    }
+    // Parameters as spreadsheets (owner, t95u/t96u): OpenDocument first, CSV for Fusion 360.
+    FileDialog {
+        id: parameterImportDialog
+        title: "Import Parameters"
+        fileMode: FileDialog.OpenFile
+        nameFilters: ["Spreadsheets (*.ods *.csv *.xlsx)", "OpenDocument spreadsheet (*.ods)", "CSV (Fusion 360) (*.csv)", "Excel (*.xlsx)"]
+        onAccepted: parametersWindow.importFrom(selectedFile.toString())
+    }
+    // Picking the other file type in the dialog changes the ending of the name shown.
+    Connections {
+        target: parameterExportDialog.selectedNameFilter
+        function onIndexChanged() {
+            const name = parameterExportDialog.selectedFile.toString()
+            const want = parameterExportDialog.selectedNameFilter.index === 1 ? ".csv" : ".ods"
+            if (/\.(ods|csv)$/i.test(name) && !name.toLowerCase().endsWith(want))
+                parameterExportDialog.selectedFile = name.replace(/\.(ods|csv)$/i, want)
+        }
+    }
+    FileDialog {
+        id: parameterExportDialog
+        title: "Export Parameters"
+        fileMode: FileDialog.SaveFile
+        nameFilters: ["OpenDocument spreadsheet (*.ods)", "CSV for Fusion 360 (*.csv)"]
+        defaultSuffix: "ods"
+        onAccepted: {
+            let path = selectedFile.toString()
+            if (!/\.(ods|csv)$/i.test(path))
+                path += selectedNameFilter.index === 1 ? ".csv" : ".ods"
+            parametersWindow.exportTo(path)
+        }
+    }
+
     DimensionInput {
         id: dimInput
         theme: theme
@@ -1951,8 +2678,354 @@ Window {
         width: parent.width - 160
         theme: theme
         history: doc.history
+        future: doc.future
+        totalSteps: doc.presentCount + doc.future.length
+        presentCount: doc.presentCount
+        // What can be scrubbed to (owner, 2026-11-07: a translucent fill, newest to oldest, while it's worked out):
+        // in a sketch, the history from doc.sketchReadyFrom on (and this opening's own steps, always).
+        readyCount: sketch.active ? doc.sketchReadyFrom : doc.modelReadyFrom
+        readyDone: sketch.active ? doc.sketchWalkDone : doc.modelBuildDone
+        builtCount: sketch.active ? -1 : doc.modelBuiltTo
+        marker: rewind.pos
+        markerEnabled: !extrudeTool.open && !sketchTools.tool && !doc.working
+        frozen: markerHeld || settling.running
+        onMarkerDragged: position => rewind.goTo(position)
+        onMarkerDropped: rewind.settle()
         sketchId: sketch.active ? sketch.sketchId : 0
         onSketchEditRequested: id => root.editSketch(id)
+        onBreakLinkRequested: (sketchId, link) => { breakAsk.sketchId = sketchId; breakAsk.link = link; breakAsk.shown = true }
+    }
+
+    // The Timeline's marker (owner, 2026-11-07; history/2026-11-07_timeline-rewind.md): where it is (in the
+    // design row's items, in between while dragged), and the design following it. Going over an item
+    // takes it back (or puts it back) at once, as Ctrl+Z / Ctrl+Y do, with nothing built again.
+    QtObject {
+        id: rewind
+        property real pos: 0
+        property bool moving: false      // the design is being moved by the marker (not Ctrl+Z, a new step...)
+        property real glide: 0           // where the settle animation has got to
+        // Part way across an extrude: how far it is built (0 none, 1 all), and the split's place in the
+        // scene (Y up): the extrude's plane and direction, and how far from it the split is.
+        property real built: 0
+        property var step: null          // doc.rewindStep for item `stepItem`
+        property int stepItem: -1
+        property vector3d origin: Qt.vector3d(0, 0, 0)
+        property vector3d axis: Qt.vector3d(0, 1, 0)
+        property vector3d xDir: Qt.vector3d(1, 0, 0)
+        property vector3d yDir: Qt.vector3d(0, 0, -1)
+        property vector4d box: Qt.vector4d(-1e9, 1e9, -1e9, 1e9)
+        property real spanLow: 0          // the extrude's span along its axis, mm (negative: below its plane)
+        property real spanHigh: 0
+        readonly property real reach: spanHigh - spanLow
+        readonly property real low: built * spanLow
+        readonly property real high: built * spanHigh
+        readonly property real glowWidth: Math.max(0.3, reach * 0.04)
+        readonly property bool showing: built > 0 && built < 1 && stepItem >= 0 && reach > 0
+        function prepare(k) {
+            if (stepItem === k)
+                return
+            stepItem = k
+            const n = historyTimeline.countAt(k + 1) - historyTimeline.countAt(k)
+            const st = doc.rewindStep(n)
+            step = st
+            if (!st.axis) {
+                spanLow = 0
+                spanHigh = 0
+                return
+            }
+            const toScene = v => Qt.vector3d(v.x, v.z, -v.y)      // engine (Z up) to the scene (Y up)
+            origin = toScene(st.origin)
+            axis = toScene(st.axis)
+            if (st.box) {
+                xDir = toScene(st.xAxis)
+                yDir = toScene(st.yAxis)
+                box = Qt.vector4d(st.box[0], st.box[1], st.box[2], st.box[3])
+            } else {
+                box = Qt.vector4d(-1e9, 1e9, -1e9, 1e9)
+            }
+            spanLow = st.low
+            spanHigh = st.high
+            doc.fillBodies(afterFaces, afterEdges, st.after)
+        }
+        Component.onCompleted: Qt.callLater(() => pos = historyTimeline.presentItems)
+        onGlideChanged: if (settling.running) goTo(glide)
+        // In a sketch (its own row): part way across a step, the sketch is drawn part way to how that step
+        // leaves it (Document::setSketchTween), eased so it starts and lands gently.
+        readonly property bool inSketch: historyTimeline.sketchId !== 0
+        property bool sketchBetween: false
+        function drawBetween(k, f) {
+            const n = k >= 0 ? historyTimeline.countAt(k + 1) - historyTimeline.countAt(k) : 0
+            const e = f * f * (3 - 2 * f)
+            const was = sketchBetween
+            sketchBetween = k >= 0 && doc.setSketchTween(historyTimeline.sketchId, n, e)
+            if (sketchBetween || was) {
+                root.drawSketches()
+                root.drawProfiles()
+                root.refreshDimensions()
+            }
+        }
+        // A sketch opened again (owner, 2026-11-07: the marker moves over all its steps): before this
+        // opening the document stays where it is and the sketch is only drawn as it was
+        // (Document::prepareSketchPast, worked out once per opening and history).
+        property int pastFor: 0
+        property int pastAt: -1
+        property int pastReady: -1        // doc.sketchReadyFrom when it was worked out
+        property int pastCount: 0         // how many of the newest gaps before this opening are known
+        property bool pastShowing: false
+        // The first gap the marker can go to: before this opening, as far back as the background walk has got.
+        readonly property int firstReady: inSketch ? historyTimeline.firstMovable + 1 - Math.max(1, pastCount) : 0
+        function preparePast() {
+            const live = historyTimeline.firstMovable
+            if (!inSketch || live === 0) {
+                pastCount = 0
+                return
+            }
+            if (pastFor === historyTimeline.sketchId && pastAt === historyTimeline.countAt(live) && pastReady === doc.sketchReadyFrom)
+                return
+            const counts = []
+            for (let k = 0; k <= live; ++k)
+                counts.push(historyTimeline.countAt(k))
+            pastFor = historyTimeline.sketchId
+            pastAt = historyTimeline.countAt(live)
+            pastReady = doc.sketchReadyFrom
+            pastCount = doc.prepareSketchPast(pastFor, counts)
+        }
+        function clearPast() {
+            pastFor = 0
+            pastAt = -1
+            pastReady = -1
+            pastCount = 0
+            if (pastShowing) {
+                pastShowing = false
+                doc.showSketchPast(0, -1, 0)
+                root.drawSketches()
+                root.drawProfiles()
+                root.refreshDimensions()
+            }
+        }
+        // Leaving the sketch: its steps behind the marker come back first.
+        function sketchToEnd() {
+            if (!inSketch)
+                return
+            settling.stop()
+            clearPast()
+            const end = historyTimeline.countAt(historyTimeline.items.length)
+            if (doc.presentCount < end) {
+                moving = true
+                doc.rewindTo(end, true)
+                moving = false
+            }
+            drawBetween(-1, 0)
+            pos = historyTimeline.presentItems
+        }
+        function goTo(p) {
+            const n = historyTimeline.items.length
+            const live = historyTimeline.firstMovable
+            if (inSketch && p < live)
+                preparePast()
+            p = Math.max(inSketch ? Math.min(live, firstReady) : historyTimeline.readyItem, Math.min(n, p))
+            if (inSketch && p < live) {
+                // Before this opening: the document at its start, the sketch drawn as it was.
+                const start = historyTimeline.countAt(live)
+                if (doc.presentCount !== start) {
+                    moving = true
+                    doc.rewindTo(start, true)
+                    moving = false
+                }
+                pos = p
+                const j = Math.floor(p), f = p - j
+                sketchBetween = false
+                doc.setSketchTween(0, 0, 0)
+                pastShowing = doc.showSketchPast(historyTimeline.sketchId, j, f * f * (3 - 2 * f))
+                root.drawSketches()
+                root.drawProfiles()
+                root.refreshDimensions()
+                return
+            }
+            if (pastShowing) {
+                pastShowing = false
+                doc.showSketchPast(0, -1, 0)
+                root.drawSketches()
+                root.drawProfiles()
+                root.refreshDimensions()
+            }
+            const k = Math.min(n, Math.floor(p))
+            const want = historyTimeline.countAt(k)
+            if (doc.presentCount !== want) {
+                moving = true
+                const got = doc.rewindTo(want, inSketch)
+                moving = false
+                if (got !== want) {
+                    // Stopped at a step that can't be taken back or put back: the marker stays there.
+                    let at = 0
+                    while (at < n && historyTimeline.countAt(at) < got)
+                        ++at
+                    p = at
+                }
+                stepItem = -1            // the design moved: the next step's shapes are another's
+            }
+            pos = p
+            const f = p - Math.floor(p)
+            if (inSketch) {
+                drawBetween(f > 0 && Math.floor(p) < n && doc.presentCount === historyTimeline.countAt(Math.floor(p)) ? Math.floor(p) : -1, f)
+                return
+            }
+            if (f > 0 && Math.floor(p) < n && doc.presentCount === historyTimeline.countAt(Math.floor(p))) {
+                prepare(Math.floor(p))
+                built = f
+            } else {
+                built = 0
+            }
+        }
+        function settle() {
+            settling.stop()
+            glide = pos
+            settling.to = Math.round(pos)
+            settling.start()
+        }
+    }
+    NumberAnimation {
+        id: settling
+        target: rewind
+        property: "glide"
+        duration: 140
+        easing.type: Easing.OutCubic
+    }
+    // Ctrl+Z, Ctrl+Y, a new step, a file opened: the marker goes to where the design now is. So it does
+    // when the row changes under it (a sketch opened or left, a run of moves opened out or folded).
+    Connections {
+        target: doc
+        function onHistoryChanged() {
+            if (!rewind.moving && !historyTimeline.markerHeld && !settling.running) {
+                rewind.stepItem = -1
+                rewind.built = 0
+                rewind.clearPast()
+                Qt.callLater(() => rewind.pos = historyTimeline.presentItems)   // once the Timeline has the new history
+            }
+        }
+    }
+    Connections {
+        target: historyTimeline
+        function onItemsChanged() {
+            // Resting on a sketch's earlier steps (only drawn as they were) it stays where it is.
+            if (!rewind.moving && !historyTimeline.frozen && !rewind.pastShowing)
+                Qt.callLater(() => { if (!historyTimeline.frozen && !rewind.pastShowing) rewind.pos = historyTimeline.presentItems })
+        }
+        function onFrozenChanged() { doc.holdLive(historyTimeline.frozen && rewind.inSketch) }
+    }
+    Connections {
+        target: sketch
+        function onLeaving() { rewind.sketchToEnd() }
+    }
+    // While sketching, what a constraint, a dimension or Ctrl+Z moves glides there (owner, 2026-11-07: "not
+    // taking more than 250 ms"): Document::liveTween, drawn each frame of this.
+    property real liveT: 1
+    NumberAnimation {
+        id: liveGlide
+        target: root
+        property: "liveT"
+        from: 0
+        to: 1
+        duration: 220
+        easing.type: Easing.OutCubic
+    }
+    onLiveTChanged: {
+        if (!liveGlide.running && liveT < 1)
+            return
+        doc.liveTween(liveT)
+        drawSketches()
+        drawProfiles()
+        refreshDimensions()
+    }
+
+    // "Break the link?" (owner, 2026-11-01): the app's own yes / no, in the theme. Asked after
+    // Break Link in the timeline is clicked; Yes adds a step to the sketch's history.
+    Item {
+        id: breakAsk
+        property int sketchId: 0
+        property int link: 0
+        property bool shown: false
+        anchors.fill: parent
+        z: 90
+        opacity: shown ? 1 : 0
+        visible: opacity > 0
+        focus: shown
+        Behavior on opacity { NumberAnimation { duration: 150 } }
+        Keys.onEscapePressed: shown = false
+        function answer(yes) {
+            shown = false
+            if (!yes)
+                return
+            const r = doc.breakLink(sketchId, link)
+            sketch.say(r.summary || r.why)
+        }
+        Rectangle {
+            anchors.fill: parent
+            color: Qt.rgba(0, 0, 0, 0.35)
+            MouseArea { anchors.fill: parent }          // nothing behind it can be clicked
+        }
+        Rectangle {
+            anchors.centerIn: parent
+            width: 360
+            height: askText.implicitHeight + askSub.implicitHeight + 98
+            radius: 12
+            color: theme.panelBg
+            border.color: theme.borderStrong
+            Text {
+                id: askText
+                x: 22
+                y: 20
+                width: parent.width - 44
+                text: "Do you want to break the link for this projected geometry?"
+                color: theme.textPrimary
+                font.pixelSize: 14
+                font.bold: true
+                wrapMode: Text.WordWrap
+            }
+            Text {
+                id: askSub
+                x: 22
+                y: askText.y + askText.implicitHeight + 8
+                width: parent.width - 44
+                text: "It stays on the sketch as ordinary geometry and stops following where it came from. Ctrl+Z puts the link back."
+                color: theme.textSecondary
+                font.pixelSize: 12
+                wrapMode: Text.WordWrap
+            }
+            Row {
+                anchors.right: parent.right
+                anchors.rightMargin: 18
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: 16
+                spacing: 10
+                Repeater {
+                    model: [{ label: "No", yes: false }, { label: "Yes, break it", yes: true }]
+                    delegate: Rectangle {
+                        required property var modelData
+                        width: modelData.yes ? 120 : 70
+                        height: 32
+                        radius: 8
+                        color: area.containsMouse ? theme.controlHover : Qt.rgba(theme.panelRaised.r, theme.panelRaised.g, theme.panelRaised.b, 1)
+                        border.width: 1.5
+                        border.color: modelData.yes ? theme.danger : theme.border
+                        Text {
+                            anchors.centerIn: parent
+                            text: parent.modelData.label
+                            color: parent.modelData.yes ? theme.danger : theme.textPrimary
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+                        MouseArea {
+                            id: area
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: breakAsk.answer(parent.modelData.yes)
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // A faint hint at the top until the search has been opened 3 times (owner, 2026-10-29:
@@ -1967,7 +3040,7 @@ Window {
         radius: height / 2
         color: Qt.rgba(theme.panelBg.r, theme.panelBg.g, theme.panelBg.b, 0.6)
         border.color: Qt.rgba(theme.border.r, theme.border.g, theme.border.b, 0.6)
-        opacity: search.timesOpened >= 3 || search.open || sketch.active || sketch.picking ? 0 : 0.85
+        opacity: search.timesOpened >= 3 || search.open || sketch.active || sketch.picking || extrudeTool.open ? 0 : 0.85
         visible: opacity > 0
         Behavior on opacity { NumberAnimation { duration: 400 } }
 

@@ -35,6 +35,7 @@ var keys = {
     "Horizontal/Vertical": { keys: "Shift H", letter: "h" },
     "Coincident": { keys: "Shift C", letter: "" },
     "Tangent": { keys: "Shift T", letter: "" },
+    "Curvature": { keys: "Shift U", letter: "" },       // a bend that carries on
     "Equal": { keys: "Shift E", letter: "" },
     "Parallel": { keys: "Shift P", letter: "" },
     "Perpendicular": { keys: "Shift R", letter: "" },     // a Right angle

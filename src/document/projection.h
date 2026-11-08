@@ -22,4 +22,9 @@ struct Piece {
 // `tol` of the triangles' points.
 std::vector<std::vector<Piece>> outline(const std::vector<std::array<Flat, 3>> &triangles, double tol);
 
+// The same area as plain closed polygons, the outside and any holes: where the true outline lies, give
+// or take how far the triangles stray, plus tol. (Exact Project uses it only to tell which of the
+// model's exact edges can be on the outline at all.)
+std::vector<std::vector<Flat>> covering(const std::vector<std::array<Flat, 3>> &triangles, double tol);
+
 } // namespace projection

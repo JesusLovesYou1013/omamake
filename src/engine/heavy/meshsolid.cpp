@@ -1,4 +1,5 @@
 #include "engine/heavy/meshsolid.h"
+#include "engine/heavy/refine.h"
 
 #include <BRepBndLib.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
@@ -293,6 +294,100 @@ double distanceTo(const Surface &s, const V &p) {
     return 0;
 }
 
+// How far p is off the surface, signed, and which way that grows; false for a screw (no formula).
+bool offBy(const Surface &s, const V &p, double &off, V &way) {
+    const V d = p - s.origin;
+    const double h = d.Dot(s.axis);
+    V radial = d - s.axis * h;
+    const double rho = radial.Modulus();
+    radial = rho > 1e-12 ? radial / rho : V(0, 0, 0);
+    switch (s.kind) {
+    case Surface::Flat: off = h; way = s.axis; return true;
+    case Surface::Cylinder: off = rho - s.radius; way = radial; return rho > 1e-12;
+    case Surface::Cone: {
+        const double scale = std::sqrt(1 + s.slope * s.slope);
+        off = (rho - s.radius - s.slope * h) / scale;
+        way = (radial - s.axis * s.slope) / scale;
+        return rho > 1e-12;
+    }
+    case Surface::Sphere: off = d.Modulus() - s.radius; way = d / std::max(d.Modulus(), 1e-12); return d.Modulus() > 1e-12;
+    case Surface::Torus: {
+        const V tube = radial * (rho - s.radius) + s.axis * h;
+        off = tube.Modulus() - s.tube;
+        way = tube / std::max(tube.Modulus(), 1e-12);
+        return tube.Modulus() > 1e-12 && rho > 1e-12;
+    }
+    case Surface::Screw: return false;
+    }
+    return false;
+}
+
+// The point nearest p that lies on every one of the surfaces: where they truly meet, as a CAD
+// program's corner is (FreeCAD and every B-rep modeller keep corners on all their faces; ours sat on
+// mesh points up to 0.003 mm off, so anything cut through them came out tilted). Gauss-Newton on the
+// signed distances, the step held to the smallest that does it. False if they don't meet near p.
+bool meetingPoint(const std::vector<const Surface *> &given, const V &p, double reach, V &at) {
+    // A round wall touching a flat meets it along a line, where distances only grow as the square
+    // of the miss and the solve would stop short: there it stands for the plane through its axis
+    // square to the flat, which holds that line exactly.
+    std::vector<Surface> stand;
+    stand.reserve(given.size());
+    std::vector<const Surface *> on;
+    for (const Surface *s : given) {
+        const Surface *use = s;
+        if (s->kind == Surface::Cylinder)
+            for (const Surface *f : given)
+                if (f->kind == Surface::Flat && std::abs(f->axis.Dot(s->axis)) < 1e-12
+                    && std::abs(std::abs((s->origin - f->origin).Dot(f->axis)) - s->radius) < 1e-9) {
+                    Surface across;
+                    across.kind = Surface::Flat;
+                    across.origin = s->origin;
+                    across.axis = f->axis.Crossed(s->axis);
+                    across.axis /= across.axis.Modulus();
+                    stand.push_back(across);
+                    use = &stand.back();
+                    break;
+                }
+        on.push_back(use);
+    }
+    at = p;
+    for (int pass = 0; pass < 100; ++pass) {
+        math_Matrix a(1, 3, 1, 3, 0.0);
+        math_Vector b(1, 3, 0.0);
+        double worst = 0;
+        for (const Surface *s : on) {
+            double off;
+            V way;
+            if (!offBy(*s, at, off, way))
+                return false;
+            worst = std::max(worst, std::abs(off));
+            const double g[3] = {way.X(), way.Y(), way.Z()};
+            for (int i = 0; i < 3; ++i) {
+                b(i + 1) -= g[i] * off;
+                for (int k = 0; k < 3; ++k)
+                    a(i + 1, k + 1) += g[i] * g[k];
+            }
+        }
+        if (worst < 1e-12)
+            return (at - p).Modulus() <= reach;
+        // Fewer than three ways to go (two planes meet in a line): the shortest step along it.
+        for (int i = 1; i <= 3; ++i)
+            a(i, i) += 1e-12;
+        math_Gauss solve(a);
+        if (!solve.IsDone())
+            return false;
+        math_Vector step(1, 3);
+        solve.Solve(b, step);
+        at += V(step(1), step(2), step(3));
+        if ((at - p).Modulus() > reach)
+            return false;
+    }
+    for (const Surface *s : given)
+        if (distanceTo(*s, at) > 1e-9)
+            return false;
+    return (at - p).Modulus() <= reach;
+}
+
 // The surface's outward normal at p.
 V normalAt(const Surface &s, const V &p) {
     const V d = p - s.origin;
@@ -434,10 +529,133 @@ TopoDS_Edge splineThrough(const Mesh &m, const std::vector<int> &pts, const Topo
     return make.IsDone() ? make.Edge() : direct();
 }
 
-// The curve for a chain beside a round surface: a circle where its points make one, else a
-// smooth curve through them.
-TopoDS_Edge curved(const Mesh &m, const std::vector<int> &pts, const TopoDS_Vertex &vs, const TopoDS_Vertex &ve, double tol) {
+// Where two surfaces turned about one axis line meet (a plane square to it counts): the very circle
+// they share, worked out from the surfaces alone, as a CAD program's edge is the meeting of its two
+// faces. False if they aren't on one axis, don't meet in a circle, or the chain's points (near is how
+// far they may lie) aren't on it. Traced through mesh points instead, the two halves of one rim came
+// out with centres 0.0000002 mm apart and could never merge again (the speaker mount's 9 mm hole).
+bool sharedCircle(const Surface &a, const Surface &b, const Mesh &m, const std::vector<int> &pts, double near, gp_Circ &circle) {
+    const auto turned = [](const Surface &s) { return s.kind == Surface::Cylinder || s.kind == Surface::Cone || s.kind == Surface::Torus; };
+    if (!turned(a) && !turned(b))
+        return false;
+    const Surface &r = turned(a) ? a : b, &o = turned(a) ? b : a;
+    if (o.kind != Surface::Flat && !turned(o))
+        return false;
+    if (std::abs(std::abs(o.axis.Dot(r.axis)) - 1) > 1e-12)
+        return false;
+    // The chain's middle, across and along the axis.
+    double hm = 0, rm = 0;
+    for (const int p : pts) {
+        const V d = pointOf(m, p) - r.origin;
+        const double h = d.Dot(r.axis);
+        hm += h;
+        rm += (d - r.axis * h).Modulus();
+    }
+    hm /= double(pts.size());
+    rm /= double(pts.size());
+    // Each surface as the rings it holds: radius at a height, or height at a radius.
+    const auto radiusAt = [&](const Surface &s, double h, double &rho) {
+        if (s.kind == Surface::Cylinder)
+            rho = s.radius;
+        else if (s.kind == Surface::Cone)
+            rho = s.radius + s.slope * h;
+        else {
+            const double across = s.tube * s.tube - h * h;
+            if (across < 0)
+                return false;
+            const double one = s.radius + std::sqrt(across), two = s.radius - std::sqrt(across);
+            rho = std::abs(one - rm) < std::abs(two - rm) ? one : two;
+        }
+        return rho > 0;
+    };
+    double h = 0, rho = 0;
+    if (o.kind == Surface::Flat) {
+        h = (o.origin - r.origin).Dot(r.axis);
+        if (!radiusAt(r, h, rho))
+            return false;
+    } else {
+        const V d = o.origin - r.origin;
+        if ((d - r.axis * d.Dot(r.axis)).Modulus() > 1e-9)
+            return false;
+        // Heights measured from r's origin along r's axis; o's own run from its origin, its way.
+        const double shift = d.Dot(r.axis), sense = o.axis.Dot(r.axis) > 0 ? 1 : -1;
+        const Surface *fixed = r.kind == Surface::Cylinder ? &r : o.kind == Surface::Cylinder ? &o : nullptr;
+        const Surface *other = fixed == &r ? &o : &r;
+        if (fixed) {
+            if (other->kind == Surface::Cylinder)
+                return false;
+            rho = fixed->radius;
+            const double off = other == &o ? shift : 0, way = other == &o ? sense : 1;
+            double local;
+            if (other->kind == Surface::Cone) {
+                if (std::abs(other->slope) < 1e-12)
+                    return false;
+                local = (rho - other->radius) / other->slope;
+            } else {
+                const double along = other->tube * other->tube - (rho - other->radius) * (rho - other->radius);
+                if (along < -1e-12)
+                    return false;
+                const double s = std::sqrt(std::max(along, 0.0)), mine = (hm - off) * way;
+                local = std::abs(s - mine) < std::abs(-s - mine) ? s : -s;
+            }
+            h = off + local * way;
+        } else if (r.kind == Surface::Cone && o.kind == Surface::Cone) {
+            // r.radius + r.slope h = o.radius + o.slope (h - shift) sense
+            const double k = r.slope - o.slope * sense;
+            if (std::abs(k) < 1e-12)
+                return false;
+            h = (o.radius - o.slope * shift * sense - r.radius) / k;
+            rho = r.radius + r.slope * h;
+        } else {
+            return false;
+        }
+    }
+    if (rho <= 0)
+        return false;
+    circle = gp_Circ(gp_Ax2(gp_Pnt(r.origin + r.axis * h), gp_Dir(r.axis)), rho);
+    for (const int p : pts) {
+        const V d = pointOf(m, p) - r.origin;
+        const double along = d.Dot(r.axis);
+        if (std::abs(along - h) > near || std::abs((d - r.axis * along).Modulus() - rho) > near)
+            return false;
+    }
+    return true;
+}
+
+// The curve for a chain beside a round surface: the circle its two surfaces share if known, a circle
+// where its points make one, else a smooth curve through them.
+TopoDS_Edge curved(const Mesh &m, const std::vector<int> &pts, const TopoDS_Vertex &vs, const TopoDS_Vertex &ve, double tol,
+                   const gp_Circ *known = nullptr) {
     const V first = pointOf(m, pts.front()), last = pointOf(m, pts.back()), middle = pointOf(m, pts[pts.size() / 2]);
+    if (known) {
+        // The short way or the long way round: whichever passes the chain's middle.
+        const Handle(Geom_Circle) circle = new Geom_Circle(*known);
+        double u0 = ElCLib::Parameter(*known, BRep_Tool::Pnt(vs)), u1 = ElCLib::Parameter(*known, BRep_Tool::Pnt(ve));
+        // Two points: the chord's middle, on the short arc's side.
+        double mid = ElCLib::Parameter(*known, gp_Pnt(pts.size() == 2 ? (first + last) / 2 : middle));
+        if (pts.front() == pts.back() || vs.IsSame(ve))
+            u1 = u0 + 2 * M_PI;
+        while (u1 <= u0 + 1e-12)
+            u1 += 2 * M_PI;
+        while (mid < u0)
+            mid += 2 * M_PI;
+        if (mid <= u1) {
+            BRepBuilderAPI_MakeEdge make(circle, vs, ve, u0, u1);
+            if (make.IsDone())
+                return make.Edge();
+        } else {
+            // the other way round: the circle turned over
+            gp_Circ flipped = *known;
+            flipped.SetAxis(known->Axis().Reversed());
+            const Handle(Geom_Circle) other = new Geom_Circle(flipped);
+            double w0 = ElCLib::Parameter(flipped, BRep_Tool::Pnt(vs)), w1 = ElCLib::Parameter(flipped, BRep_Tool::Pnt(ve));
+            while (w1 <= w0 + 1e-12)
+                w1 += 2 * M_PI;
+            BRepBuilderAPI_MakeEdge make(other, vs, ve, w0, w1);
+            if (make.IsDone())
+                return make.Edge();
+        }
+    }
     if (pts.size() == 2)
         return BRepBuilderAPI_MakeEdge(vs, ve).Edge();
     double sag = 0;
@@ -779,13 +997,110 @@ TopoDS_Shape build(const Mesh &m, const std::vector<int> &labels, const std::vec
                               distanceTo(surfaces[std::size_t(pair.second)], pointOf(m, p))});
         }
     }
-    constexpr double kMargin = 1.5, kFloor = 1e-6;
+    constexpr double kMargin = 1.5, kFloor = 1e-6, kExact = 1e-7;
+    // Each corner where its surfaces truly meet, when they do near it.
+    std::unordered_map<int, V> meets;
+    std::unordered_map<int, double> moved;
+    std::unordered_map<int, std::set<int>> honoured;   // the surfaces a corner is truly on
+    std::vector<double> areaOf(surfaces.size(), 0);
+    for (std::size_t t = 0; t < m.triangles.size(); ++t)
+        if (labels[t] >= 0) {
+            const auto &tri = m.triangles[t];
+            areaOf[std::size_t(labels[t])] += (pointOf(m, tri[1]) - pointOf(m, tri[0])).Crossed(pointOf(m, tri[2]) - pointOf(m, tri[0])).Modulus() / 2;
+        }
+    auto surfacesAt = [&](int p) {
+        std::set<int> at;
+        for (const int side : atPoint.at(p)) {
+            const Key pair = pairOf.at(edgeSides[std::size_t(side)]);
+            at.insert(pair.first);
+            at.insert(pair.second);
+        }
+        return std::vector<int>(at.begin(), at.end());
+    };
+    for (const Chain &c : pieces)
+        for (const int p : {c.points.front(), c.points.back()}) {
+            if (moved.count(p))
+                continue;
+            moved[p] = -1;
+            // The biggest surfaces first: where small facets crowd a corner and don't all meet, the
+            // corner stays on the walls they edge, the facets taking up the difference.
+            std::vector<int> on = surfacesAt(p);
+            std::sort(on.begin(), on.end(), [&](int a, int b) { return areaOf[std::size_t(a)] > areaOf[std::size_t(b)]; });
+            for (; on.size() >= 2; on.pop_back()) {
+                std::vector<const Surface *> these;
+                double widest = 0;
+                for (const int l : on) {
+                    const Surface &s = surfaces[std::size_t(l)];
+                    these.push_back(&s);
+                    if (s.kind != Surface::Flat && s.kind != Surface::Screw)
+                        widest = std::max(widest, s.kind == Surface::Torus ? s.tube : s.radius);
+                }
+                // A round meeting a flat it touches does so along a line: a gap off it slides the
+                // corner sqrt(2 r gap) along, not gap.
+                const double reach = std::max({10 * gapAt[p], 3 * std::sqrt(2 * widest * gapAt[p]), 1e-6});
+                V at;
+                if (!meetingPoint(these, pointOf(m, p), std::min(0.1, reach), at))
+                    continue;
+                meets[p] = at;
+                honoured[p] = {on.begin(), on.end()};
+                double off = (at - pointOf(m, p)).Modulus();
+                for (const int l : surfacesAt(p))
+                    if (!honoured[p].count(l))
+                        off = std::max(off, gapAt[p] + distanceTo(surfaces[std::size_t(l)], at));
+                moved[p] = off;
+                break;
+            }
+        }
+    const auto onBoth = [&](int p, const Chain &c) {
+        const auto it = honoured.find(p);
+        return it != honoured.end() && it->second.count(c.a) && it->second.count(c.b);
+    };
+    // An edge is exact when it is where its two surfaces meet, end to end: a straight one between two
+    // flats, or the circle two turned surfaces share.
+    std::vector<char> exactPiece(pieces.size(), 0);
+    std::vector<gp_Circ> circles(pieces.size());
+    std::vector<double> worstOf(pieces.size(), 0);
+    for (std::size_t i = 0; i < pieces.size(); ++i) {
+        const Chain &c = pieces[i];
+        for (const int p : c.points)
+            worstOf[i] = std::max(worstOf[i], gapAt[p]);
+        const bool ends = onBoth(c.points.front(), c) && onBoth(c.points.back(), c);
+        if (!roundBeside(c))
+            exactPiece[i] = ends;
+        else if (sharedCircle(surfaces[std::size_t(c.a)], surfaces[std::size_t(c.b)], m, c.points, std::max(worstOf[i] * kMargin, kFloor), circles[i]))
+            exactPiece[i] = ends ? 1 : 2;
+        else if (ends) {
+            // A flat along a round wall, or two side by side, meet in a straight line: exact when
+            // all of it lies on both and the chain follows it.
+            const V from = meets.at(c.points.front()), to = meets.at(c.points.back());
+            bool on = (to - from).Modulus() > 1e-9;
+            for (int k = 1; on && k < 8; ++k)
+                on = distanceTo(surfaces[std::size_t(c.a)], from + (to - from) * (k / 8.0)) < 1e-9
+                     && distanceTo(surfaces[std::size_t(c.b)], from + (to - from) * (k / 8.0)) < 1e-9;
+            const V along = (to - from) / std::max((to - from).Modulus(), 1e-12);
+            for (const int p : c.points) {
+                const V d = pointOf(m, p) - from;
+                on = on && (d - along * d.Dot(along)).Modulus() <= std::max(worstOf[i] * kMargin, kFloor);
+            }
+            if (on)
+                exactPiece[i] = 3;
+        }
+    }
+    // A corner all of whose edges are exact is exact; one with a traced curve keeps room for it.
+    std::unordered_map<int, char> allExact;
+    for (std::size_t i = 0; i < pieces.size(); ++i)
+        for (const int p : {pieces[i].points.front(), pieces[i].points.back()}) {
+            auto it = allExact.emplace(p, 1).first;
+            it->second = it->second && (exactPiece[i] == 1 || exactPiece[i] == 3);
+        }
     std::unordered_map<int, TopoDS_Vertex> vertices;
     auto vertexOf = [&](int p) -> const TopoDS_Vertex & {
         auto it = vertices.find(p);
         if (it == vertices.end()) {
-            it = vertices.emplace(p, BRepBuilderAPI_MakeVertex(gp_Pnt(pointOf(m, p))).Vertex()).first;
-            builder.UpdateVertex(it->second, std::max(gapAt[p] * kMargin, kFloor));
+            const bool exact = meets.count(p) > 0;
+            it = vertices.emplace(p, BRepBuilderAPI_MakeVertex(gp_Pnt(exact ? meets.at(p) : pointOf(m, p))).Vertex()).first;
+            builder.UpdateVertex(it->second, exact && allExact[p] ? kExact
+                                             : std::max((gapAt[p] + std::max(0.0, moved[p])) * kMargin, kFloor));
         }
         return it->second;
     };
@@ -802,11 +1117,10 @@ TopoDS_Shape build(const Mesh &m, const std::vector<int> &labels, const std::vec
         const bool round = roundBeside(c);
         const TopoDS_Vertex &vs = vertexOf(c.points.front()), &ve = vertexOf(c.points.back());
         // Tight, however loose the surfaces are: a thin face's sides would wobble across each other.
-        edges[i] = round ? curved(m, c.points, vs, ve, std::min(tol, 0.003)) : BRepBuilderAPI_MakeEdge(vs, ve).Edge();
-        double worst = 0;
-        for (const int p : c.points)
-            worst = std::max(worst, gapAt[p]);
-        builder.UpdateEdge(edges[i], std::max(worst * kMargin, kFloor));
+        const double worst = worstOf[i];
+        edges[i] = round && exactPiece[i] != 3 ? curved(m, c.points, vs, ve, std::min(tol, 0.003), exactPiece[i] ? &circles[i] : nullptr)
+                                               : BRepBuilderAPI_MakeEdge(vs, ve).Edge();
+        builder.UpdateEdge(edges[i], exactPiece[i] == 1 || exactPiece[i] == 3 ? kExact : std::max(worst * kMargin, kFloor));
         const auto &on = directed.at(sideKey(c.points[0], c.points[1]));
         std::set<std::pair<int, bool>> added;
         for (const Side &s : on) {
@@ -2539,6 +2853,300 @@ TopoDS_Shape solid(const Mesh &mesh, const Stage &stage) {
     return assemble(mesh, labels, surfaces, 1e-3, stage);
 }
 
+// One surface and the mesh points it was fitted to, for regularize().
+struct Fitted { Surface *surface; std::vector<int> points; double area; };
+
+// The surface read again with its direction held at `way`: a plane through the points' middle, a
+// cylinder or cone by Gauss-Newton on its axis line, radius and (cone) slope. False if it won't settle.
+bool refit(const Mesh &mesh, const std::vector<int> &points, const V &way, bool slope, Surface &s) {
+    if (s.kind == Surface::Flat) {
+        double sum = 0;
+        for (const int p : points)
+            sum += (pointOf(mesh, p) - s.origin).Dot(way);
+        s.origin += way * (sum / double(points.size()));
+        s.axis = way;
+        return true;
+    }
+    if (s.kind != Surface::Cylinder && s.kind != Surface::Cone)
+        return false;
+    const gp_Ax3 frame(gp_Pnt(s.origin), gp_Dir(way));
+    const V e1 = frame.XDirection().XYZ(), e2 = frame.YDirection().XYZ();
+    double q[4] = {0, 0, s.radius, slope ? s.slope : 0};      // centre across, radius at origin, slope
+    const int unknowns = slope ? 4 : 3;
+    for (int pass = 0; pass < 20; ++pass) {
+        math_Matrix a(1, unknowns, 1, unknowns, 0.0);
+        math_Vector b(1, unknowns, 0.0);
+        for (const int p : points) {
+            const V d = pointOf(mesh, p) - s.origin;
+            const double x = d.Dot(e1) - q[0], y = d.Dot(e2) - q[1], h = d.Dot(way), rho = std::max(std::hypot(x, y), 1e-12);
+            const double r = rho - q[2] - q[3] * h;
+            const double j[4] = {-x / rho, -y / rho, -1, -h};
+            for (int i = 0; i < unknowns; ++i) {
+                b(i + 1) -= j[i] * r;
+                for (int k = 0; k < unknowns; ++k)
+                    a(i + 1, k + 1) += j[i] * j[k];
+            }
+        }
+        math_Gauss solve(a);
+        if (!solve.IsDone())
+            return false;
+        math_Vector step(1, unknowns);
+        solve.Solve(b, step);
+        double moved = 0;
+        for (int i = 0; i < unknowns; ++i) {
+            q[i] += step(i + 1);
+            moved = std::max(moved, std::abs(step(i + 1)));
+        }
+        if (moved < 1e-13)
+            break;
+    }
+    s.origin += e1 * q[0] + e2 * q[1];
+    s.axis = way;
+    s.radius = q[2];
+    s.slope = slope ? q[3] : 0;
+    s.kind = slope ? Surface::Cone : Surface::Cylinder;
+    return s.radius > 0;
+}
+
+// Fitted surfaces put back on the directions the part was drawn along, as CGAL's regularize_planes
+// (Shape_regularization) does for planes after shape detection. A fit takes the mesh's float noise
+// up as a tilt or a slope: the speaker mount's base walls, straight up in its STL (lean 0.000000°),
+// came out as cylinders and cones leaning up to 0.06°, so nothing extruded beside them could ever be
+// the same surface. Biggest first, each plane, cylinder or cone tries the world axes and the
+// directions already settled, within a degree (a fillet ring is only turned upright), or else square
+// to one of them, as CGAL also snaps orthogonality; a cone tries being a cylinder; and a round wall
+// tries the axis line of a bigger one on the same direction. A try is kept only if every point of the
+// surface still lies within `allowed` of it, as when it was first fitted.
+// Returns how far any point ended up from a wall straightened by the short-wall rule (0 if none), so
+// the build allows for it.
+double regularize(const Mesh &mesh, std::vector<Fitted> &all, double allowed) {
+    const auto holds = [&](const Surface &s, const std::vector<int> &points) {
+        for (const int p : points)
+            if (distanceTo(s, pointOf(mesh, p)) > allowed)
+                return false;
+        return true;
+    };
+    // A short wall under half a degree off is taken as meant upright (or square, or a plain
+    // cylinder), even if its triangles lean: on a part that size the lean is the mesh, not the
+    // design (owner, 2026-11-05: under 25 mm and 0.5 degrees, "make them solid and coplanar").
+    // Taller walls keep a lean their points show, such as the speaker mount's 64 mm plug, drawn
+    // with a 0.4 degree draft for a push fit.
+    const double shortWall = 25, smallLean = std::sin(0.5 * M_PI / 180);
+    const auto tall = [&](const std::vector<int> &points, const V &way) {
+        double lo = 1e300, hi = -1e300;
+        for (const int p : points) {
+            const double h = pointOf(mesh, p).Dot(way);
+            lo = std::min(lo, h);
+            hi = std::max(hi, h);
+        }
+        return hi - lo;
+    };
+    // Along the wall: its axis for a round one, the steepest way across a flat one's points.
+    const auto meant = [&](const Surface &s, const std::vector<int> &points, const V &way) {
+        if (s.kind == Surface::Flat) {
+            const V up = way - s.axis * way.Dot(s.axis);     // the way the flat tilts off `way`
+            return tall(points, up.Modulus() > 1e-9 ? up / up.Modulus() : way) < shortWall;
+        }
+        return tall(points, way) < shortWall;
+    };
+    double forcedOff = 0;
+    const auto worst = [&](const Surface &s, const std::vector<int> &points) {
+        for (const int p : points)
+            forcedOff = std::max(forcedOff, distanceTo(s, pointOf(mesh, p)));
+        return true;
+    };
+    std::sort(all.begin(), all.end(), [](const Fitted &a, const Fitted &b) { return a.area > b.area; });
+    // A surface that meets a thread stays as fitted: the mesh was cut along the thread against it,
+    // so moved even a hair it no longer meets the thread's edge (the speaker mount's 45° lead-in cone
+    // at the bore, turned upright, left the solid open with a 15 mm gap at its seam).
+    std::set<int> threaded;
+    for (const Fitted &one : all)
+        if (one.surface->kind == Surface::Screw)
+            threaded.insert(one.points.begin(), one.points.end());
+    std::set<const Surface *> keep;
+    for (const Fitted &one : all) {
+        int shared = 0;
+        for (const int p : one.points)
+            shared += threaded.count(p) ? 1 : 0;
+        if (one.surface->kind != Surface::Screw && shared >= 2)
+            keep.insert(one.surface);
+    }
+    std::vector<V> ways = {V(1, 0, 0), V(0, 1, 0), V(0, 0, 1)};
+    const double near = std::cos(1.0 * M_PI / 180);
+    std::vector<const Surface *> rounds;
+    for (Fitted &one : all) {
+        Surface &s = *one.surface;
+        const bool round = s.kind == Surface::Cylinder || s.kind == Surface::Cone;
+        if ((s.kind != Surface::Flat && s.kind != Surface::Torus && !round) || one.points.size() < 3 || keep.count(&s))
+            continue;
+        bool settled = false;
+        for (const V &w : ways) {
+            const double c = s.axis.Dot(w);
+            if (std::abs(c) < near)
+                continue;
+            const V way = c < 0 ? w * -1 : w;
+            if (std::abs(c) >= 1 - 1e-15) {
+                s.axis = way;
+                settled = true;
+                break;
+            }
+            Surface tried = s;
+            if (s.kind == Surface::Torus)       // a fillet ring: only turned upright, about its centre
+                tried.axis = way;
+            const bool forced = std::sqrt(std::max(0.0, 1 - c * c)) < smallLean && s.kind != Surface::Torus && meant(s, one.points, way);
+            if ((s.kind == Surface::Torus || refit(mesh, one.points, way, s.kind == Surface::Cone && !(forced && std::abs(s.slope) < smallLean), tried))
+                && (holds(tried, one.points) || (forced && worst(tried, one.points)))) {
+                s = tried;
+                settled = true;
+                break;
+            }
+        }
+        // Square to a settled direction instead (a groove's side wall standing on the base).
+        const double square = std::sin(1.0 * M_PI / 180);
+        for (std::size_t k = 0; k < ways.size() && !settled && s.kind != Surface::Torus; ++k) {
+            const double c = s.axis.Dot(ways[k]);
+            if (std::abs(c) > square)
+                continue;
+            if (c == 0) {
+                settled = true;
+                break;
+            }
+            V way = s.axis - ways[k] * c;
+            way /= way.Modulus();
+            Surface tried = s;
+            const bool forced = std::abs(c) < smallLean && meant(s, one.points, way);
+            if (refit(mesh, one.points, way, s.kind == Surface::Cone && !(forced && std::abs(s.slope) < smallLean), tried) && (holds(tried, one.points) || (forced && worst(tried, one.points)))) {
+                s = tried;
+                settled = true;
+            }
+        }
+        if (!settled || std::none_of(ways.begin(), ways.end(), [&](const V &w) { return std::abs(std::abs(w.Dot(s.axis)) - 1) < 1e-15; }))
+            ways.push_back(s.axis);
+        if (s.kind == Surface::Cone) {
+            Surface tried = s;
+            const bool forced = std::abs(s.slope) < smallLean && tall(one.points, s.axis) < shortWall;
+            if (refit(mesh, one.points, s.axis, false, tried) && (holds(tried, one.points) || (forced && worst(tried, one.points))))
+                s = tried;
+        }
+        if (!round)
+            continue;
+        // On a bigger round wall's axis line, if it fits there.
+        for (const Surface *big : rounds) {
+            if (std::abs(big->axis.Dot(s.axis)) < 1 - 1e-15)
+                continue;
+            const V d = s.origin - big->origin;
+            if ((d - big->axis * d.Dot(big->axis)).Modulus() > allowed || (d - big->axis * d.Dot(big->axis)).Modulus() == 0)
+                continue;
+            Surface tried = s;
+            tried.origin = big->origin + big->axis * d.Dot(big->axis);
+            tried.axis = big->axis;
+            // Radius (and slope) again with the centre held: a straight line through (h, rho).
+            double n = 0, sh = 0, sr = 0, shh = 0, shr = 0;
+            for (const int p : one.points) {
+                const V e = pointOf(mesh, p) - tried.origin;
+                const double h = e.Dot(tried.axis), rho = (e - tried.axis * h).Modulus();
+                n += 1; sh += h; sr += rho; shh += h * h; shr += h * rho;
+            }
+            if (tried.kind == Surface::Cone && n * shh - sh * sh > 1e-12) {
+                tried.slope = (n * shr - sh * sr) / (n * shh - sh * sh);
+                tried.radius = (sr - tried.slope * sh) / n;
+            } else {
+                tried.radius = sr / n;
+            }
+            if (holds(tried, one.points)) {
+                s = tried;
+                break;
+            }
+        }
+        rounds.push_back(&s);
+    }
+    // Then two surfaces that are one: a plane level with a bigger one, or a round wall on a bigger
+    // one's axis with its radius, becomes that very surface, as CGAL's regularize_planes also snaps
+    // coplanarity. Fitted apart they lie a hair off each other (the speaker mount's base had two side
+    // faces 0.00007 mm apart), so the line between them stays and merging them breaks the solid.
+    for (std::size_t i = 1; i < all.size(); ++i) {
+        Surface &s = *all[i].surface;
+        if ((s.kind != Surface::Flat && s.kind != Surface::Cylinder && s.kind != Surface::Cone) || all[i].points.size() < 3 || keep.count(&s))
+            continue;
+        for (std::size_t j = 0; j < i; ++j) {
+            const Surface &big = *all[j].surface;
+            const double c = big.axis.Dot(s.axis);
+            if (big.kind != s.kind || std::abs(c) < 1 - 1e-15)
+                continue;
+            const V d = s.origin - big.origin;
+            if (s.kind == Surface::Flat ? std::abs(d.Dot(big.axis)) > allowed
+                                        : (d - big.axis * d.Dot(big.axis)).Modulus() > allowed)
+                continue;
+            Surface tried = s;
+            tried.origin = big.origin;
+            tried.axis = s.kind == Surface::Flat && c < 0 ? big.axis * -1 : big.axis;
+            tried.radius = big.radius;
+            tried.slope = big.slope;
+            if (s.kind != Surface::Flat && std::abs(s.radius + s.slope * d.Dot(big.axis) - big.radius - big.slope * d.Dot(big.axis)) > allowed)
+                continue;
+            if (holds(tried, all[i].points)) {
+                s = tried;
+                break;
+            }
+        }
+    }
+    // And a round wall that blends into a flat one touches it exactly, as a CAD fillet does by being
+    // one: the cylinder's axis moved, square to itself, until it sits its radius off each flat it runs
+    // along (one or two). Fitted, a 0.3 mm round on the speaker mount's base stood a hair off its wall,
+    // so the corner where it, the wall and the bottom met was on no single point of all three, and
+    // everything cut through that corner came out tilted.
+    for (Fitted &one : all) {
+        Surface &s = *one.surface;
+        if (s.kind != Surface::Cylinder || one.points.size() < 3 || keep.count(&s))
+            continue;
+        std::vector<const Fitted *> flats;
+        for (const Fitted &other : all) {
+            const Surface &f = *other.surface;
+            if (f.kind != Surface::Flat || std::abs(f.axis.Dot(s.axis)) > 1e-12 || flats.size() == 2)
+                continue;
+            const double off = std::abs((s.origin - f.origin).Dot(f.axis));
+            if (std::abs(off - s.radius) > allowed || off == s.radius
+                || (flats.size() == 1 && std::abs(flats[0]->surface->axis.Dot(f.axis)) > 1 - 1e-9))
+                continue;
+            // It must blend into this very flat: they share mesh points (both lists are sorted), and
+            // at one of them the round faces the flat's way, within a facet's turn.
+            int blends = 0, shared = 0;
+            for (const int p : other.points) {
+                if (!std::binary_search(one.points.begin(), one.points.end(), p))
+                    continue;
+                ++shared;
+                V e = pointOf(mesh, p) - s.origin;
+                e -= s.axis * e.Dot(s.axis);
+                if (e.Modulus() > 0 && std::abs(e.Dot(f.axis)) / e.Modulus() > std::cos(30 * M_PI / 180))
+                    ++blends;
+            }
+            if (shared >= 2 && blends > 0)
+                flats.push_back(&other);
+        }
+        if (flats.empty())
+            continue;
+        // Each flat: n.(origin + shift) - level = side * radius; the shift square to the axis.
+        V shift(0, 0, 0);
+        const auto miss = [&](const Surface &f) {
+            const double off = (s.origin - f.origin).Dot(f.axis);
+            return (off < 0 ? -s.radius : s.radius) - off;
+        };
+        const Surface &f0 = *flats[0]->surface;
+        if (flats.size() == 1) {
+            shift = f0.axis * miss(f0);
+        } else {
+            const Surface &f1 = *flats[1]->surface;
+            const double c = f0.axis.Dot(f1.axis), m0 = miss(f0), m1 = miss(f1), det = 1 - c * c;
+            shift = f0.axis * ((m0 - c * m1) / det) + f1.axis * ((m1 - c * m0) / det);
+        }
+        Surface tried = s;
+        tried.origin = s.origin + shift;
+        if (shift.Modulus() <= allowed && holds(tried, one.points))
+            s = tried;
+    }
+    return forcedOff;
+}
+
 static TopoDS_Shape fitMesh(const Mesh &mesh, double share, const Stage &stage, FitReport &report, const std::vector<Surface> *threads) {
     stage("Finding the flat areas");
     const Facets f(mesh);
@@ -2558,6 +3166,7 @@ static TopoDS_Shape fitMesh(const Mesh &mesh, double share, const Stage &stage, 
     std::sort(order.begin(), order.end(), [&](int a, int b) { return f.area[std::size_t(a)] < f.area[std::size_t(b)]; });
 
     std::vector<double> offBy;
+    double forcedOff = 0;          // how far a wall straightened by the short-wall rule sits off its points
     const auto keep = [&](Surface surface, const std::vector<int> &group, double off) {
         const int id = int(fitted.size());
         double facing = 0;
@@ -3040,8 +3649,29 @@ static TopoDS_Shape fitMesh(const Mesh &mesh, double share, const Stage &stage, 
                 break;
         }
     }
+    {
+        std::vector<Fitted> all;
+        std::vector<std::set<int>> fittedPoints(fitted.size()), flatPoints(surfaces.size());
+        std::vector<double> fittedArea(fitted.size(), 0), flatArea(surfaces.size(), 0);
+        for (std::size_t t = 0; t < owner.size(); ++t) {
+            const auto &tri = mesh.triangles[t];
+            if (owner[t] >= 0) {
+                fittedPoints[std::size_t(owner[t])].insert(tri.begin(), tri.end());
+                fittedArea[std::size_t(owner[t])] += f.area[t];
+            } else if (labels[t] >= 0) {
+                flatPoints[std::size_t(labels[t])].insert(tri.begin(), tri.end());
+                flatArea[std::size_t(labels[t])] += f.area[t];
+            }
+        }
+        for (std::size_t i = 0; i < fitted.size(); ++i)
+            all.push_back({&fitted[i], {fittedPoints[i].begin(), fittedPoints[i].end()}, fittedArea[i]});
+        for (std::size_t i = 0; i < surfaces.size(); ++i)
+            if (surfaces[i].kind == Surface::Flat)
+                all.push_back({&surfaces[i], {flatPoints[i].begin(), flatPoints[i].end()}, flatArea[i]});
+        forcedOff = regularize(mesh, all, std::max(0.02, size * 2e-4) * 1.5);
+    }
     // A surface whose faces won't hold goes back to facets, and the build runs again without it.
-    double tolerance = 1e-3;
+    double tolerance = std::max(1e-3, forcedOff * 1.5);
     for (const double off : offBy)
         tolerance = std::max(tolerance, off * 1.5);
     for (int round = 0; round < 12; ++round) {
@@ -3202,6 +3832,9 @@ static TopoDS_Shape fitMesh(const Mesh &mesh, double share, const Stage &stage, 
         try {
             if (made.size() <= kMergeFaces) {
                 stage("Merging the halves");
+                // FreeCAD's way first (refine.h), then OpenCascade's for what it leaves.
+                if (const TopoDS_Shape refined = refine::sameSurfaces(shape); !refined.IsNull())
+                    shape = refined;
                 ShapeUpgrade_UnifySameDomain unify(shape, true, true, false);
                 unify.Build();
                 if (BRepCheck_Analyzer(unify.Shape()).IsValid())

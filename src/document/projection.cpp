@@ -211,7 +211,7 @@ manifold::CrossSection covered(manifold::Polygons &triangles) {
 
 } // namespace
 
-std::vector<std::vector<Piece>> outline(const std::vector<std::array<Flat, 3>> &triangles, double tol) {
+std::vector<std::vector<Flat>> covering(const std::vector<std::array<Flat, 3>> &triangles, double tol) {
     manifold::Polygons input;
     input.reserve(triangles.size());
     for (const auto &t : triangles) {
@@ -222,7 +222,7 @@ std::vector<std::vector<Piece>> outline(const std::vector<std::array<Flat, 3>> &
         input.push_back(area > 0 ? manifold::SimplePolygon{point(t[0]), point(t[1]), point(t[2])}
                                  : manifold::SimplePolygon{point(t[0]), point(t[2]), point(t[1])});
     }
-    std::vector<std::vector<Piece>> out;
+    std::vector<std::vector<Flat>> out;
     if (input.empty())
         return out;
     // Neighbouring triangles can leave a crack of no width running in from the edge, which would
@@ -240,8 +240,15 @@ std::vector<std::vector<Piece>> outline(const std::vector<std::array<Flat, 3>> &
                 p.push_back({a.x, a.y});
         }
         if (p.size() >= 3 && std::abs(area) / 2 > tol * tol * 4)   // specks between triangles aren't holes
-            out.push_back(pieces(std::move(p), tol));
+            out.push_back(std::move(p));
     }
+    return out;
+}
+
+std::vector<std::vector<Piece>> outline(const std::vector<std::array<Flat, 3>> &triangles, double tol) {
+    std::vector<std::vector<Piece>> out;
+    for (std::vector<Flat> &p : covering(triangles, tol))
+        out.push_back(pieces(std::move(p), tol));
     return out;
 }
 

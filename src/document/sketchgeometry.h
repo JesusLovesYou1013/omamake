@@ -9,6 +9,7 @@
 
 #include <utility>
 
+#include <functional>
 #include <map>
 #include <set>
 #include <vector>
@@ -37,13 +38,32 @@ struct SketchGeometry {
     //                    solver keeps the two axes square to each other)
     //   "conic"          start, end, and the corner its two end directions meet at; `value` is
     //                    Fusion's Rho (0 to 1: flat to sharp; 0.5 is a parabola)
-    //   "text"           `text` written from point 0 (its bottom left), `value` mm tall
+    //   "text"           `text` written from point 0 (its bottom left), `value` mm tall (an old,
+    //                    one-point text); or, with two points, written in the box those two
+    //                    corners make (owner, 2026-11-02): `font` the family ("" = the default),
+    //                    `flags` below, `value` the capitals' height in mm unless the Fit flag
+    //                    sizes the text to the box. The words wrap at the box's width.
     struct Curve {
         QString type;
         std::vector<int> points;
         double value = 0;
         QString text;
+        QString font;
+        int flags = 0;
+        // Text on a path (owner, 2026-11-02): the lines, arcs and curves the words follow, each as
+        // kind * 1000000 + id (1 line, 2 arc or circle, 3 other curve), the first picked first.
+        // `points` is then just the first part's start. Empty: not on a path.
+        std::vector<int> path;
+        // Where on that path the text is anchored (mm along it, after Flip), once the owner has
+        // dragged it there (flag TextAnchored). The justify then sits about it: left starts there,
+        // centre is centred on it, right ends there. Unset: left at the start, centre in the
+        // middle of the path, right at its end.
+        double anchor = 0;
     };
+    // Text flags: bit 0 bold, bit 1 italic, bit 2 fit to the box, bits 4-5 across (0 left,
+    // 1 centre, 2 right), bits 6-7 down (0 top, 1 middle, 2 bottom).
+    // On a path, bits 4-5 are the justify (left, centre, right along it) and bit 8 runs it backwards.
+    enum TextFlag { TextBold = 1, TextItalic = 2, TextFit = 4, TextFlip = 256, TextAnchored = 512 };
     // type: "parallel" or "perpendicular", between two lines. first stays put where it
     // can; second turns to meet it (the order they were selected, as in Fusion).
     // "fix" (Fusion's Fix/UnFix): point `first` held at (u, v); second unused.
@@ -101,6 +121,13 @@ struct SketchGeometry {
         // A dimension's value where it was dragged to: mm from the middle of what it measures.
         bool labelPlaced = false;
         double labelU = 0, labelV = 0;
+        // A driven dimension (owner, t88u): the other constraints already decide this measurement, so it
+        // only shows what it is now; the solver never holds it and nothing can type its value.
+        bool driven = false;
+        // A dimension that follows a formula or parameter (owner, t91u): the text typed, and whether an angle's
+        // shown side is the other one (stored value is then the rest of pi).
+        QString expr;
+        bool exprFlip = false;
 
         Constraint() = default;
         Constraint(QString type, int first, int second = 0, double u = 0, double v = 0)
@@ -133,6 +160,7 @@ struct SketchGeometry {
     std::map<int, Curve> curves;
     std::map<int, Constraint> constraints;
     int nextPoint = 1, nextLine = 1, nextConstraint = 1, nextArc = 1, nextCurve = 1;
+    bool directOnly = false;          // solve without the short-step retry, which can bend a shape
     // Helpers: what a tool draws only to hold its shape (Fusion draws them as construction
     // lines): a polygon's circle, a chamfer's lost corner. Never drawn, picked or snapped to.
     std::set<int> helperPoints, helperLines, helperArcs;
@@ -143,6 +171,27 @@ struct SketchGeometry {
     // Projected from the model (Fusion's Project, owner 2026-10-31): these points are held where
     // the model put them, like the origin, so nothing solves for them or drags them.
     std::set<int> projectedPoints;
+
+    // A link (owner, 2026-11-01): geometry projected onto this sketch that stays tied to where it
+    // came from. `source` is the sketch it came from (0: the model, whose link only records
+    // that, as the model can't change yet). `whole`: all of that sketch was projected, so what
+    // is added to it later comes in too. Otherwise only the `lines`, `arcs` and `points` picked.
+    // The maps go from the source's id to ours: 0 not made yet, -1 taken off by the user (never
+    // put back). `broken`: the user broke the link; the geometry stays, as plain geometry.
+    // `level` is "" (fine), "yellow" (still follows its source, but the constraints on it can't
+    // hold) or "red" (something it follows is gone); `issue` says why.
+    struct Link {
+        int id = 0;
+        int source = 0;
+        bool whole = false;
+        bool broken = false;
+        std::map<int, int> points, lines, arcs;
+        std::set<int> wantPoints;      // source points picked by themselves
+        std::set<int> owned;           // every point of ours the link made
+        QString level, issue;
+    };
+    std::vector<Link> links;
+    int nextLink = 1;
 
     // Whether a point is a circle's hidden rim point.
     bool isRim(int point) const;
@@ -160,6 +209,24 @@ struct SketchGeometry {
     std::vector<std::vector<Point>> curvePath(int curve) const;
     // Text's outlines, `height` mm tall, its bottom left at (0, 0).
     static std::vector<std::vector<Point>> textOutline(const QString &text, double height);
+    // Text laid out in a w by h mm box (its bottom left at (0, 0)): wrapped, aligned, and, with
+    // the Fit flag, as large as fits. `height` is the capitals' height when not fitting.
+    static std::vector<std::vector<Point>> textInBox(const QString &text, const QString &family, int flags, double height,
+                                                     double w, double h);
+    // The parts of a text's path joined end to end, in the order the words run (empty if none):
+    // starts at the first part picked, going from a line's A to B and clockwise round an arc.
+    std::vector<Point> pathChain(const Curve &k, bool &closed) const;
+    // Words laid along a chain (shapes: the letters; frame: a bracket round where they sit).
+    struct Along {
+        std::vector<std::vector<Point>> shapes;
+        std::vector<Point> frame;
+    };
+    static Along textAlong(const QString &text, const QString &family, int flags, double height,
+                           const std::vector<Point> &chain, bool closed, double anchor = 0);
+    // How far along the path's chain the point nearest `at` is (and the chain's length, whether it closes).
+    double textPathPosition(const Curve &k, const Point &at, double &total, bool &closed) const;
+    // The box a two-point text sits in, as a closed outline (empty for any other curve).
+    std::vector<Point> textFrame(int curve) const;
 
     // How far off the constraints are, all together (0: all hold).
     double error() const;
@@ -188,6 +255,15 @@ struct SketchGeometry {
     // only `seeds` may move, then their neighbours, ring by ring, until it works.
     bool solveNear(const std::set<int> &seeds);
 
+    // Curvature (G2, owner 2026-11-02): a line, arc or spline leaving a join: the point, the unit
+    // direction heading away from the join, the curvature vector (towards the bend's centre, 1/radius long).
+    struct Leave {
+        double px = 0, py = 0, tx = 0, ty = 0, kx = 0, ky = 0;
+        bool ok = false;
+    };
+    bool curvatureLeaves(const Constraint &c, const std::function<void(int, double &, double &)> &at, Leave &s1, Leave &s2) const;
+    double leaveDot(const Constraint &c) const;   // -1: they run straight on, 1: they fold back
+
     // The points a constraint ties together.
     std::vector<int> pointsOf(const Constraint &c) const;
 
@@ -205,6 +281,12 @@ struct SketchGeometry {
     // for "pointline" the second place is the foot of the square on the line; for "lineline"
     // the places are the second line's middle and the foot of the square from it on the first.
     bool measure(const QString &type, int first, int second, double &value, Point &from, Point &to) const;
+
+    // Would this constraint add nothing to what the others (not driven ones) already hold? Then a
+    // dimension like it is driven: its value is a result, not a wish.
+    bool redundant(const Constraint &c) const;
+    // How many independent ways of moving the points the constraints take away.
+    std::size_t jacobianRank() const;
 
     // The points that can't move at all any more: every way of moving them would break a
     // constraint (Fusion's "fully constrained"). A line is fully constrained when both its

@@ -62,22 +62,36 @@ Engines are created by a factory: `makeLiteEngine()` (Heavy will get `makeHeavyE
 - Changes: 2026-10-29: added.
 
 #### Extrude                                [BUILT-IN]   [OURS]
-- What it does: pushes a flat profile up into a solid.
-- UI: not wired yet. Planned: search "extrude", floating panel "Extrude": Distance, Direction (One side / Symmetric / Two sides), Result (Join / Cut / Intersect / New).
-- Interface hook: `extrude(profile, height)`
-- Heavy (exact surfaces): `HeavyEngine::extrude` in `src/engine/heavy/heavyengine.cpp` (`BRepPrimAPI_MakePrism`; straight-sided loops for now, as the interface hands it points)
-- Lite (triangles): `LiteEngine::extrude` in `src/engine/lite/liteengine.cpp` (Manifold `Manifold::Extrude`, even-odd holes)
-- Engine differences: Lite turns curved profile edges into straight segments.
-- Changes: 2026-10-29: added.
+- What it does: pushes sketch profiles, or flat faces on one plane, into a solid along the plane's normal. Fusion's extrude: one side, symmetric or two sides; each side's extent is a distance, up to an object, or through all; each side can taper; each side is Auto, Join, Cut, Intersect, New Body or New Component.
+- UI: E in Model mode (in a sketch E stays Ellipse), or search: "extrude", "push", "pull", "pad", "boss", "cut"; its icon (a solid face with a box pushed up from it) shows in the search list and the history. Profiles or faces selected first are what it starts with. No side panel: rows of chips centred at the top of the view, a distance box on the profile and a drag arrow (`qml/ExtrudeTool.qml`).
+- Popup: none. Rows: (1) Profiles: N selected ✕ (Faces / Areas when faces are in it; the chip lights while clicks go to it, clicking it sends them back there, ✕ clears them) / One Side / Symmetric / Two Sides / Distance per area / Done. (2) per side: Distance / To Object / All, then a Taper box (degrees, positive widens like Fusion). (3) per side: Auto / Join / Cut / Intersect / New Body / New Component. Clicks in the view: the first profile or flat face needs a plain click; after that Ctrl or Shift adds one or takes it away (Fusion), and a plain click on anything else (a point, edge, face, another sketch's profile, line or point, an origin part) makes it the one object to extrude up to, replacing any before it, and that side goes To Object; a click on nothing changes nothing. Ctrl or Shift on something that can't be extruded (an edge, a point, a curved face, a face off the first area's plane) is turned away with a hint. The To Object chip also waits for one click in the view (a face, edge, corner point, sketch point or line, a sketch area or an origin part); the distance box then holds the offset past it ("±"); the chip names it (To Face, To Edge…) with a ✕ that clears it and waits for another click. All shows the length it came to; clicking All again goes the other way if a body lies there. Dragging the arrow goes back to Distance from where it was. Esc while picking the object goes back to Distance. A cut or intersect reaching several bodies lists them as checkboxes in the browser.
+- Interface hook: `extrudeOn(profile, placement, from, to, taper)`, `extrudeFace(body, face, placement, from, to, taper)` (a body's own face, exactly), `combine(a, b, op)`, `mesh(body)`
+- Heavy (exact surfaces): `HeavyEngine::extrudeOn` in `src/engine/heavy/heavyengine.cpp`: `BRepPrimAPI_MakePrism`, or `LocOpe_DPrism` with a taper (`pushed`). A picked face of a body goes through `HeavyEngine::extrudeFace`: the face itself, copied and moved to the start, pushed the same way, so every edge and curve is the body's own (no sampling); its traced outline (`faceProfile`, within 0.001 mm) is only for the mesh estimates and the edges-moved try. Runs of sketch points on one circle (`Profile::centres`) are built as true arcs (`GC_MakeArcOfCircle`).
+- Lite (triangles): `LiteEngine::extrudeOn` in `src/engine/lite/liteengine.cpp` (Manifold `Manifold::Extrude`, even-odd holes). No taper: the Document refuses a taper on Lite with a message.
+- Engine differences: Lite turns arcs into straight segments and can't taper; it has no faces, so a picked face is pushed as its outline.
+- Document side (ours): `readExtrude` (areas, sides, extents, taper), `extrudeReach` (To Object), `planExtrude` (Auto: points of the extrude tested against each body's mesh), `computeExtrude` (the solid work, off the main thread through `extrudeInBackground`), `applyExtrude` (bodies, history).
+- Fusion differences: a plain click picks the object to extrude up to without choosing To Object first, and edges and points can be picked (Fusion: faces, planes and bodies only; owner's wish). To Object ends flat where the object lies (a face where the line through the areas' middle meets it, else its middle; an edge or sketch line at its point farthest from the profile's plane, so a slanted edge is reached all along, and the offset brings it back). Following the object when an earlier step is edited needs the history to be re-run, which OmaMake doesn't do yet; the object is kept in the step's spec for when it does. Fusion follows a slanted or curved face. An origin plane must be parallel and an axis must lie across. Symmetric with To Object goes the object's distance both ways. Start (Profile Plane / Offset / Object) and Thin aren't there yet.
+- Changes (newest first):
+  - 2026-11-07: Fuzzy profile is automatic: tried only when the exact extrude failed at a Boolean; the tick box removed; a note gives the accuracy when it was needed. See "Extrude: Fuzzy profile, tried automatically when the exact one fails".
+  - 2026-11-03: a picked face is pushed exactly (`extrudeFace`); the outline is never moved as a whole any more (that changed the size); see "Extrude: a join back onto a face left a step".
+  - 2026-11-03: a plain click picks the object (To Object), Ctrl or Shift the areas; an edge or sketch line is reached at its farthest point (was: where it passes nearest the middle). See "Extrude: a plain click picks the object".
+  - 2026-11-03: the Profiles chip with its count and ✕, the To Object ✕, clicks that add instead of replace, and E working after an Extrude. See "Extrude: a click swapped the profile".
+  - 2026-11-03: E key and icon; a selected profile is easy to click on a body's face, so selecting then pressing E works. See "Profile shading flickered and was hard to pick".
+  - 2026-11-03: outline edges lying on the body's walls are moved 0.05 mm off them before the boolean (into empty space for a cut or intersect, into the body for a join), which leaves the same shape; faces left in one plane after a boolean are merged; a sketch on a flat face sits on the engine's exact plane. See "Extrude: a filled hole left a circle".
+  - 2026-11-03: every untapered join, cut and intersect checked against an overlap worked out from the body's mesh; a result far off is redone with the outline moved 0.01 mm (then 0.05 mm) off the body's walls, and the note says so. See "Extrude: a cut of a projected outline did nothing".
+  - 2026-11-03: Extent (Distance, To Object, All), Taper and Intersect added. A curved face clicked during Extrude is passed over instead of becoming an area that can't be pushed.
+  - 2026-11-03: true arcs in the tool; booleans in parallel with oriented boxes; the solid work moved off the main thread; Auto worked out from meshes. See the entries under Plugin features.
+  - 2026-11-02: Extrude tool, multi-body documents, `extrudeOn`.
+  - 2026-10-29: `extrude(profile, height)` added.
 
 #### Combine                                [BUILT-IN]   [OURS]
 - What it does: joins, cuts or intersects two bodies.
-- UI: not wired yet. Planned: the Result choice in other panels, and search "join", "cut", "intersect".
-- Interface hook: `combine(a, b, op)`
-- Heavy (exact surfaces): `HeavyEngine::combine` in `src/engine/heavy/heavyengine.cpp` (`BRepAlgoAPI_Fuse`, `_Cut`, `_Common`)
+- UI: Extrude's operation row (Join, Cut, Intersect). No combine command of its own yet.
+- Interface hook: `combine(a, with, op, fuzzy)`, `looseness(body)`
+- Heavy (exact surfaces): `HeavyEngine::combine` in `src/engine/heavy/heavyengine.cpp` (`BRepAlgoAPI_Fuse`, `_Cut`, `_Common`; changed: first run in parallel with oriented bounding boxes and non-destructive; every result checked for a valid solid and a volume that fits the operation; a bad one redone plainly on copies; faces in one plane merged within 0.01 mm, kept only if still valid; each attempt logged as an `engine:` line)
 - Lite (triangles): `LiteEngine::combine` in `src/engine/lite/liteengine.cpp` (Manifold `+`, `-`, `^`)
-- Engine differences: none known yet.
-- Changes: 2026-10-29: added.
+- Engine differences: Heavy merges faces left lying in one plane after each boolean (`ShapeUpgrade_UnifySameDomain`, within 0.01 mm), and a result of the right volume that OpenCascade's check calls broken only because a few edges lie a hair further off their faces than their tolerance says is repaired (`BOPTools_AlgoTools::CorrectCurveOnSurface`, never past the loosest tolerance either input already has); Lite has no faces to merge or repair.
+- Changes: 2026-11-07: `combine` takes a fuzzy value, used only on Extrude's automatic second try and only after the exact Boolean failed (see "Extrude: Fuzzy profile, tried automatically when the exact one fails"); `looseness(body)` added. 2026-11-03: edges just outside their tolerance repaired instead of the whole result thrown away (see "Extrude: a join back onto a face left a step"). 2026-11-03: faces in one plane merged after each boolean; the third try (one thread) dropped. 2026-10-29: added.
 
 #### Move                                   [BUILT-IN]   [OURS]
 - What it does: a moved copy of a body.
@@ -132,10 +146,10 @@ Engines are created by a factory: `makeLiteEngine()` (Heavy will get `makeHeavyE
 - What it does: turns a body into triangles with flat face normals, plus outline edges wherever neighbouring triangles bend more than 20°.
 - UI: every model on screen.
 - Interface hook: `mesh(body)`
-- Heavy (exact surfaces): `HeavyEngine::mesh` in `src/engine/heavy/heavyengine.cpp` (`BRepMesh_IncrementalMesh`, Delabella mesher; within the model's size / 50000, kept to 0.01-0.5 mm, and 0.2 rad; smooth normals from each true surface)
+- Heavy (exact surfaces): `HeavyEngine::mesh` in `src/engine/heavy/heavyengine.cpp` (`BRepMesh_IncrementalMesh`, Delabella mesher, then the standard Watson mesher for any face Delabella left bare; within the model's size / 50000, kept to 0.01-0.5 mm, and 0.2 rad; smooth normals from each true surface)
 - Lite (triangles): `LiteEngine::mesh` in `src/engine/lite/liteengine.cpp`
 - Engine differences: Heavy will tessellate exact surfaces to a chosen accuracy; Lite already is triangles.
-- Changes: 2026-10-29: added. Flat shading only for now (curved faces will need smooth normals).
+- Changes: 2026-10-29: added. Flat shading only for now (curved faces will need smooth normals). 2026-11-03: faces Delabella leaves without triangles are meshed again with Watson (see "A pushed face's walls didn't show").
 
 #### Topology (faces, edges, points)       [BUILT-IN]   [OURS]
 - What it does: tells which triangles make up each face, which outline segments make up each edge, and where the corner points are, so a user can hover and select a whole face, edge or point the way CAD users expect (a cube: 6 faces, 12 edges, 8 points).
@@ -193,7 +207,7 @@ is undone with Ctrl+Z.
 - What it does: every closed profile of every shown sketch is filled with a light see-through wash, so a closed shape can be told from an open one at a glance: the area between two overlapping circles, a ring round a circle, each letter of text with its holes left clear. It changes as you draw, drag and delete (about 2 ms for a dozen profiles with text), and only then: never on a pan or zoom. It shows in Sketch mode and in Model mode alike, as in Fusion, and goes with the sketch's eye. Lines, points and the model show through it; a body in front hides it. Fusion shades closed profiles pale orange; here the wash is the sketch-line colour (white in dark themes, dark in light ones), because the origin planes are already orange and the two looked the same.
 - UI: in the view, on the sketch's plane.
 - Popup: none.
-- Interface hook: `Document::fillProfiles(target, sketches)`; Main.qml `drawProfiles()` (on `sketchesChanged` and the eyes), Model `objectName: "profileShading"` (blended, both sides, no depth writes, depthBias -20 so lines stay on top); `Theme.sketchProfile`.
+- Interface hook: `Document::fillProfiles(target, sketches)`; Main.qml `drawProfiles()` (on `sketchesChanged` and the eyes), Model `objectName: "profileShading"` (blended, both sides, no depth writes, drawn with `qml/ProfileMaterial.qml`: each point pulled 0.1 mm plus 0.2 % of its distance toward the camera, so a profile on a face never fights the face); `Theme.sketchProfile`.
 - Heavy / Lite: engine-independent (triangles from Manifold's triangulator, see Profile finder)
 - Changes: 2026-10-30: added. Not yet: a different tint for the open sketch. Fusion's Show Profile switch is left out on purpose (owner: no use for it). Hovering and picking: see Selecting profiles. 2026-11-01: the wash could lag the sketch by one change (Toggle Construction left it shaded, then bare; a first Project left it bare), while picking was right. QML handlers run before C++ connections to a signal, so `drawProfiles()` read the old `m_profiles`; every sketch change now goes through `Document::sketchesEdited()`, which clears them before `sketchesChanged`.
 
@@ -201,9 +215,9 @@ is undone with Ctrl+Z.
 - What it does: resting the mouse inside a closed area lights just that area (the hover colour), and a click selects it (the selection colour); Ctrl-click or Shift-click adds it to or takes it from the selection, as with lines and faces. It is what Extrude will work on. Lines, points and dimensions come first: near a line the line is picked, near a point (a small circle's centre too) the point; inside an area away from them, the area. A body in front hides the profiles behind it; a profile drawn on a body's face wins over that face. In Sketch mode only the open sketch's profiles can be picked (only its lines can be, too); in Model mode every shown sketch's can. A selected profile stays selected while the sketch changes as long as there is still a profile at the spot it was picked (an area split in two keeps the half that was clicked); it goes when the area is opened up, or when its sketch is hidden. Dragging inside an area moves nothing. Esc in a sketch still finishes the sketch, as before. Fusion's tints are its own blue; here they are the theme's hover and selection colours.
 - UI: in the view, on the sketch's plane.
 - Popup: none.
-- Interface hook: `Document::pickProfile(sketches, origin, direction)` (nearest along the ray, gives `{kind: "profile", sketch, index, u, v, depth}`), `Document::profileAt(sketch, u, v)` (find it again after a change), `Document::fillProfileParts(target, parts)`; `profiles::contains`; `Selection.profileSketches` (set by Main.qml `drawProfiles()`), `Selection.partAt` (profile after lines and points, before the origin planes), `keepIn`; Models `objectName: "profileHover"` / `"profileSelected"` (depthBias -25). Profiles are found once per sketch change and kept (`Document::profilesOf`).
+- Interface hook: `Document::pickProfile(sketches, origin, direction)` (nearest along the ray, gives `{kind: "profile", sketch, index, u, v, depth}`), `Document::profileAt(sketch, u, v)` (find it again after a change), `Document::fillProfileParts(target, parts)`; `profiles::contains`; `Selection.profileSketches` (set by Main.qml `drawProfiles()`), `Selection.partAt` (a profile in front, or on a face within ProfileMaterial's pull, wins unless a point, edge or origin axis lies within 3 px of the cursor and no deeper than the profile; it beats the origin planes), `keepIn`; Models `objectName: "profileHover"` / `"profileSelected"` (ProfileMaterial). Profiles are found once per sketch change and kept (`Document::profilesOf`).
 - Heavy / Lite: engine-independent
-- Changes: 2026-10-30: added. Not yet: Extrude, a box drag (window select) taking profiles, a profile's area in the info line.
+- Changes: 2026-11-03: picking a profile on a body's face no longer loses to the face's edges and corners or the origin planes (see "Profile shading flickered and was hard to pick"). 2026-10-30: added. Not yet: a box drag (window select) taking profiles, a profile's area in the info line.
 
 #### Find Profile Gaps                      [BUILT-IN]   [OURS]
 - What it does: one click rings in red, for 10 seconds, every place two lines, arcs, circles or curves come within 1 mm of each other without being joined: the breaks that keep the profile you are drawing from closing. Any two count: a line end short of a corner or of a circle, two circles 0.3 mm apart, two parallel lines, an arc short of a line. Where two lines run close for a while (two arcs side by side) that's one ring, at the narrowest place. A loose line end near another line is always one, even where its line meets that one further off (a V whose tips nearly touch); two parallel lines get a ring at each open end. Not counted: lines that cross, touch or are joined right there (tangent circles, a line tangent to a circle, a line crossing a curve at a shallow angle, two circles with a short line between them, including the close stretch either side of where they meet; so a thin closed slot isn't ringed), a curve's own next stretch, the far side of a tiny circle, one piece of text's own letters, and anything 1 mm or more apart. It guesses nothing about what you meant to draw. The rings follow the view (never smaller than 28 px, bigger when zoomed in close enough to see the gap) and keep up with drawing for the 10 s, a ring going as soon as its gap is closed, with a note of how many closed profiles there are. While gaps are ringed, the guide's place under the sketch bar holds the gap stepper: ‹ [ 5 ] › "gaps under 1 mm, not joined · 3 closed profiles". The box only shows the count (it isn't typed in); the arrows fly the view, keeping its direction, to each gap in turn (left to right across the sketch, round and round), zoomed so the gap shows clearly inside its ring, which is drawn thicker; the box then reads "2 of 5". Once stepping, the 10 s stops: the rings stay until Esc (or until every gap is closed, then 10 s as usual). The stepper never changes size. With no gaps, the guide says "No gaps under 1 mm · 3 closed profiles". Esc takes the rings away at once (that Esc does only that); clicking again starts the 10 s again (not while stepping); leaving the sketch ends it. It is a momentary check, not a switch (owner). Fusion has no such tool (its only hint is a profile that doesn't shade).
@@ -232,7 +246,7 @@ is undone with Ctrl+Z.
 
 #### Selecting in a sketch                  [BUILT-IN]   [OURS]
 - What it does: the open sketch's own points and lines are found before anything else under the mouse, then the origin, then the model. A point counts from 11 px away, a line from 7 px; points win over lines.
-- UI: hovering lights a point or line; click selects it; Ctrl- or Shift-click adds or removes; click empty space to clear. Double-click a line, arc, curve or point selects its whole chain: everything joined end to end through a shared point, a Coincident, or a point held on it (Point On, Midpoint), normal and construction each only along their own kind. Lines that only cross are not joined, though they can still close a profile. Circles and ellipses have no ends, so they select alone unless something is held on them. In Fusion a double-click selects a loop and stops at branches; here a branch is followed. Drag from empty space for a box (Fusion's window select): left to right, a solid box takes what is wholly inside; right to left, a dashed box takes anything it touches; Ctrl or Shift adds; Esc drops it. The end points of what is taken stay out of the selection (Fusion takes them too), so two boxed lines still count as two lines for Parallel and Equal; a point on its own is taken. Fusion also boxes profile areas; not here yet. While a drawing tool is on, the mouse snaps instead (see Snapping while drawing) and nothing is selected.
+- UI: hovering lights a point or line; click selects it; Ctrl- or Shift-click adds or removes; click empty space to clear. Double-click a line, arc, curve or point selects its whole chain: everything joined end to end through a shared point, a Coincident, or a point held on it (Point On, Midpoint), normal and construction each only along their own kind. Lines that only cross are not joined, though they can still close a profile. Circles and ellipses have no ends, so they select alone unless something is held on them. In Fusion a double-click selects a loop and stops at branches; here a branch is followed. Drag from empty space for a box (Fusion's window select): left to right, a dashed box takes what is wholly inside; right to left, a solid box takes anything it touches; Ctrl or Shift adds; Esc drops it. The end points of what is taken stay out of the selection (Fusion takes them too), so two boxed lines still count as two lines for Parallel and Equal; a point on its own is taken. Fusion also boxes profile areas; not here yet. While a drawing tool is on, the mouse snaps instead (see Snapping while drawing) and nothing is selected.
 - Popup: none.
 - Interface hook: `Document::pickSketch(sketch, origin, direction, pointReach, edgeReach)`; QML `Selection.partAt` / `clickAt` (`sketchPointPixels` 11, `edgePixels` 7); parts `{kind: "sketch_point" | "sketch_line", sketch, index}`
 - Heavy / Lite: engine-independent
@@ -247,7 +261,23 @@ is undone with Ctrl+Z.
 - Fusion divergences: Fusion's palette has more rows (Sketch Grid, Snap, Slice, Show Profile, 3D Sketch, Look At); ours has these four. Not saved with the design. Hidden projected lines still close profiles and still snap; hidden points still snap. Show Profile left out on purpose (owner).
 - Changes: 2026-11-01: added.
 
+#### Selection: what a click may pick (sketch mode and model mode)  [BUILT-IN]   [OURS]
+- What it does: a second tick-box list beside Display. Each row switches one kind of thing on or off for plain hovering, clicking, double-click chains and box select while sketching. A kind that's off is skipped, so what's behind it is found instead (switch Body Faces off and a click lands on the sketch's own lines, or the other way round, which makes picking a body's edge or point to project easier). Turning a row off also drops anything of that kind already selected. Every row is on by default and kept for the run.
+- Rows: Lines (lines, arcs, circles, curves, text), Points, Constraints (the badges), Profile Areas (closed areas, for Extrude and the like later), Construction Lines, Projections (anything projected from the model), Origin (its point, axes and planes), a nest Components (not real yet, so its name is greyed) holding the nest Bodies (Faces, Edges and Points, the model's corner points) and Outside Sketches (greyed out: for projecting from an earlier sketch, later). Nests start folded; a bare arrow (no box: bright white in dark mode, very dark black in light mode) opens one. The Selectable menu sits at the bottom, so a nest's rows appear above it (`SketchDisplay.unfoldUp`, the default); a menu at the side would unfold downward. A nest's box shows a tick when everything switchable inside is on, a dot when only some, and clicking it switches all inside on, or all off if all were on. With Faces, Edges and Points all off the model is ignored altogether and hides nothing behind it.
+- The sketch rows apply only when no sketch tool is running, so Trim, Extend, Dimension and the rest can still pick what they need; the Bodies, Faces, Edges and Points rows also apply while Project runs (`Selection.bodyFiltered`). A line, arc or curve counts as a Projection if it's held from the model, else a Construction Line if it's construction, else a Line.
+- UI: the Selection button (was Selectable), bottom right while sketching; Display moved left of it (`qml/SketchDisplay.qml` is used for both, with a `title`, and rows with `enabled: false` greyed out). No search rows yet.
+- Model mode (2026-11-02): the same menu, titled Selection, shows outside a sketch with Profile Areas, Origin, Components > Bodies > Faces / Edges / Points (the sketch-only rows are not shown and never block picking there). The switches are shared with the sketch menu.
+- Select Through (2026-11-02): the last row in both menus, under a separating line (a row with `divider: true`). Off (default): hover, click and box select take only what the camera can see. On: hidden edges, points and faces can be hovered, clicked and boxed (`Document::pick(..., through)`, `SketchTools.selectThrough`).
+- Interface hook: Main.qml `selLines`, `selPoints`, `selConstraints`, `selProfiles`, `selConstruction`, `selProjected`, `selOrigin`, `selFaces`, `selEdges`, `selBodyPoints`; `Selection.allow`, `Selection.filtered`, `Selection.sketchAllow()`; `Document::pickSketch(..., allow)`, `Document::sketchOutlines(sketch, allow)`, `Document::sketchPartClass(sketch, kind, index)` (1 line, 2 point, 4 construction, 8 projected).
+- Heavy / Lite: engine-independent
+- Fusion divergences: Fusion's Selection Filter is a separate panel with different names and works outside sketches; ours is sketch-only for now. Dimensions aren't a row yet.
+- Changes: 2026-11-01: added. 2026-11-01: Body Faces, Body Edges and Body Points became Faces, Edges and Points under Bodies, and those the model-only switches that apply while Project runs. 2026-11-01: nests (SketchDisplay rows take `children`; folded, arrow, dot for some, parent sets all); Components > Bodies, Outside Sketches added. 2026-11-01: the row reads Points (was Vertices), to match Project's Edges / Points.
+
+#### Click again to unselect
+- Anywhere the selection is used (Selection.clickAt), a plain click on something already selected takes just that one off the selection, without Ctrl or Shift; a click on empty space still clears all. The constraint tools (Parallel and the rest) do the same with their picks. Not yet: the Dimension tool's own steps, and Model mode tools that don't exist yet will need to follow this rule. 2026-11-01.
+
 #### Box select: what it leaves out
+- Drawing: the dragged box is a plain tinted rectangle (dashed edge for a window, solid for a crossing). It was a Shape before, which did not show on screen; the logic was fine. 2026-11-01.
 - End points of taken pieces: a boxed line, arc or curve does not select its own end points, and an arc or circle does not select its centre. Fusion selects them too. Why: Parallel, Equal and the like read the selection, so two boxed lines must stay two lines. Candidate option: a switch to take points as well.
 - Spline and conic points: same rule, the points of a taken curve stay out.
 - Profile areas: a box takes only lines, arcs, curves and points, never a closed area. Fusion's can take them. Needed once Extrude exists, so a box can pick several profiles.
@@ -775,7 +805,7 @@ How every constraint tool is picked (`SketchTools.ruleFor` says what each list o
 - Changes: 2026-10-30: a hidden sketch shows as it's edited. 2026-10-29: added.
 
 #### Drag in a sketch                       [BUILT-IN]   [OURS]
-- What it does: left-drag a point (its lines turn and stretch; a circle's centre carries the circle at its size; the edge resizes it, unless its size can't change (a radius or diameter dimension, Equal to a dimensioned one, anything else): then the edge carries the whole circle, so grabbing anything always does something), a line (it moves whole), or anything selected (it all moves together). Drags snap the way drawing does (see Snapping while drawing): the dragged point, or for a line or a selection whichever of its points comes nearest something, snaps onto another point (a line's end, a rectangle's corner), the Origin, a line's middle, or anywhere along a line or axis. Let go there and it's held by Coincident (a point, the Origin, along a line) or Midpoint, in the same history step as the move ("Moved Point2 (Coincident)"), so one Ctrl+Z takes back both. A drag never snaps onto itself: its own points, the lines that move with them, those lines' other ends, and points already Coincident with a dragged one are left out. A snap only counts if the constraints really let the point get there; a constraint that's already there isn't made twice. Double-click a line, arc, curve or point selects its whole chain: everything joined end to end through a shared point, a Coincident, or a point held on it (Point On, Midpoint), normal and construction each only along their own kind. Lines that only cross are not joined, though they can still close a profile. Circles and ellipses have no ends, so they select alone unless something is held on them. In Fusion a double-click selects a loop and stops at branches; here a branch is followed. Drag from empty space for a box (Fusion's window select): left to right, a solid box takes what is wholly inside; right to left, a dashed box takes anything it touches; Ctrl or Shift adds; Esc drops it. The end points of what is taken stay out of the selection (Fusion takes them too), so two boxed lines still count as two lines for Parallel and Equal; a point on its own is taken. Fusion also boxes profile areas; not here yet. A drag changes size first, then angles and shape, and moves things last: a free circle's edge resizes it (`SketchGeometry::resize`: a passing radius hold, the rim alone first, then its neighbours); for points, first only the dragged points, the ends of their lines and the arcs they touch may move, with every other line holding its heading (so a rectangle's corner drag stretches its sides and keeps its turn; once its sizes are held, it turns), then the same without the headings, then the ring grows one step at a time (with headings first, then without). Fixed points never move. One history step per drag.
+- What it does: left-drag a point (its lines turn and stretch; a circle's centre carries the circle at its size; the edge resizes it, unless its size can't change (a radius or diameter dimension, Equal to a dimensioned one, anything else): then the edge carries the whole circle, so grabbing anything always does something), a line (it moves whole), or anything selected (it all moves together). Drags snap the way drawing does (see Snapping while drawing): the dragged point, or for a line or a selection whichever of its points comes nearest something, snaps onto another point (a line's end, a rectangle's corner), the Origin, a line's middle, or anywhere along a line or axis. Let go there and it's held by Coincident (a point, the Origin, along a line) or Midpoint, in the same history step as the move ("Moved Point2 (Coincident)"), so one Ctrl+Z takes back both. A drag never snaps onto itself: its own points, the lines that move with them, those lines' other ends, and points already Coincident with a dragged one are left out. A snap only counts if the constraints really let the point get there; a constraint that's already there isn't made twice. Double-click a line, arc, curve or point selects its whole chain: everything joined end to end through a shared point, a Coincident, or a point held on it (Point On, Midpoint), normal and construction each only along their own kind. Lines that only cross are not joined, though they can still close a profile. Circles and ellipses have no ends, so they select alone unless something is held on them. In Fusion a double-click selects a loop and stops at branches; here a branch is followed. Drag from empty space for a box (Fusion's window select): left to right, a dashed box takes what is wholly inside; right to left, a solid box takes anything it touches; Ctrl or Shift adds; Esc drops it. The end points of what is taken stay out of the selection (Fusion takes them too), so two boxed lines still count as two lines for Parallel and Equal; a point on its own is taken. Fusion also boxes profile areas; not here yet. A drag changes size first, then angles and shape, and moves things last: a free circle's edge resizes it (`SketchGeometry::resize`: a passing radius hold, the rim alone first, then its neighbours); for points, first only the dragged points, the ends of their lines and the arcs they touch may move, with every other line holding its heading (so a rectangle's corner drag stretches its sides and keeps its turn; once its sizes are held, it turns), then the same without the headings, then the ring grows one step at a time (with headings first, then without). Fixed points never move. One history step per drag.
 - UI: mouse, Sketch mode, no tool active. While snapped, the same marks and tag as drawing show: the target point lights up, a line's middle shows ▲, a spot along a line ○, and the tag by the mouse names it ("Point3", "Midpoint of Line1", "On Line4", "Origin", "On the X axis"). After the drop, the bar at the top says what holds it ("Moved Point2, held by Coincident").
 - Interface hook: `Document::beginSketchDrag`, `dragSketch(sketch, moves)`, `dragSketchSize(sketch, arc, radius)`, `endSketchDrag(sketch, summary, hold)` (hold = {point, on: "point" | "origin" | "midpoint" | "line", target}; returns the constraint's name or ""); `SketchGeometry::drag`; QML `SketchTools.dragBegin` / `dragMove` / `dragEnd`, `snapNear(at, reach, geometry, skip)`, `dragSkip`, `dragSnap`
 - Heavy / Lite: engine-independent
@@ -783,15 +813,30 @@ How every constraint tool is picked (`SketchTools.ruleFor` says what each list o
 
 #### Project                                [BUILT-IN]   [OURS]
 - What it does: Fusion's Project. Throws the model's shadow straight onto the sketch's plane as lines, arcs and circles, in a violet no other line uses. Whole Model: the outline and anything open right through it. Face: that one face's outline, flat or curved. A flat face seen edge on gives one line. Stays on for more clicks; the Done button or Esc stops. Projecting the same thing again says so and adds nothing, and corners shared with an earlier projection are one point.
-- UI: search "Project" (Sketch mode; also "project geometry", "silhouette", "outline"), or P. Whole Model and Face sit under the sketch bar; then click the model. In Face, hovering lights the face.
+- UI: search "Project" (Sketch mode; also "project geometry", "silhouette", "outline"), or P. Whole Model, Face and Edges / Points sit under the sketch bar; then click the model. In Face, hovering lights the face; in Edges / Points it lights the edge or corner under the pointer. The Selectable menu's Bodies, Faces, Edges and Points rows apply while Project runs (Bodies off ignores the model entirely; Faces off stops Face mode and lets Edges / Points reach through to edges and corners).
 - Popup: none; the two choices above, and the guide reports what was made.
 - Interface hook: `Document::projectIntoSketch(sketch, face)` (face -1: whole model), `Document::faceAt`; `projection::outline` in `src/document/projection.cpp`; `SketchGeometry::projectedPoints`, `tiedToBoth`; `SketchTools.projectWhat`; `Theme.sketchProjected`. History: a "shape" step, undone by snapshot. Saved as a `projected` flag on points.
 - Heavy / Lite: engine-independent: it works from the drawn triangles (`Mesh`), joined by Manifold's `CrossSection` (Clipper2), in 64 x 64 cells then group by group: 16 s as one union on a threaded part, 0.2 s this way. A whole model takes only triangles facing one way.
 - Reading the outline: a loop that stays on one circle is a Circle; otherwise, from its sharpest corner, the longest straight run or arc wins. An arc needs five points, one bend direction and no corner over 40 degrees. Tolerance 0.012 mm or size / 25000, twice how far drawn triangles may stray. An ellipse comes out as a chain of arcs within that tolerance. Arc centres sit exactly midway between their ends. Only a circle's centre shows; an arc's stays hidden, as a shallow one's floats outside the outline.
 - Held: projected points act like the origin: nothing solves for them, dragging, resizing and Fix/UnFix don't apply. They count as fully constrained and form closed profiles.
 - Fusion divergences: Fusion's choices are Specified Entities and Bodies, and it projects a face's edges; ours are Whole Model and Face and use the shadow, so a curved face gets a true outline. Holes that don't go through are not drawn. The link isn't live: a projection stays where it was made, as nothing can move a body yet; nothing is linked or re-linked. No choice to break the link; delete and project again.
-- Not yet: a body picker for several bodies (the app holds one model). Projecting single edges and points. A line drawn directly between an existing point tied to the origin and an existing projected point isn't refused.
-- Changes: 2026-11-01: Done button. The shadow is grown and shrunk by half the tolerance to seal zero-width cracks between triangles, which read as lines inside the outline. 2026-10-31: added. 2026-11-01: no one step may take over 40% of an arc: a long straight with short bends at both ends passed as a bulging arc, on Speaker Mount.step an 11 mm edge bowed out 1 mm.
+- Edges / Points (2026-11-01): one edge or one corner of the model. A straight edge is a line, an edge on one circle an arc (counter-clockwise from a to b) or a full circle, any other curve a fit-point spline through up to 24 of its points (ends included); an edge seen end-on, or a corner, is a point. Same tolerance as above. Same dedupe as Whole Model: a corner already projected is reused, and projecting the same thing again says "That's already projected." `Document::projectPartIntoSketch(sketch, "edge"|"point", index)`, index into the model's edges / corner points (what `Document::pick` returns); `Selection.bodyEdgeOrPointAt`. Round edges are tested against a circle through three points, within twice the tolerance, so an oblique circle (really an ellipse) becomes a spline.
+- Edge-on and huge circles (2026-11-01): a circle seen exactly edge-on lands flat as a line drawn out and back. A closed edge whose points all lie on one line is now a plain line between its two farthest-apart points. A circle is also refused (it becomes a spline) when its radius is over 4 times the model's size, or when a closed one doesn't span about its own diameter. Before this, such an edge came out as a circle with a radius over a million mm, drawn as a line to infinity.
+- Not yet: a body picker for several bodies (the app holds one model). A line drawn directly between an existing point tied to the origin and an existing projected point isn't refused.
+- Count (2026-11-01): while Project runs, a small badge to the right of the tool name counts what this run has put on the sketch: a whole-model or face projection is 1, so is each edge or point picked by hand (so a body projected line by line counts every line). A click that projects nothing new ("already projected") does not count. It restarts at 0 each time Project starts. `SketchTools.projectCount`, `SketchBar.toolCount`.
+- Take back (2026-11-01): clicking something already projected in this run takes it off again (Whole Model, a face, an edge or a point), and the x beside the count takes everything of this run off. Each click or box is one step in the document's history, so taking one off is: undo all of the run's steps, then put the others back in order (`SketchTools.projectRetake`).
+- Box (2026-11-01): with Edges / Points chosen, dragging a box projects every edge and corner point of the model it takes (window, dashed box: wholly inside, left to right; crossing, solid box: any touch, right to left), as one history step, honouring the Selectable Edges and Points rows. It does not look at what hides what: edges behind the model are taken too. Whole Model and Face say a box takes edges and points. `Document::bodyOutlines`, `Document::projectPartsIntoSketch`.
+- Exact (Heavy, 2026-11-06 to 2026-11-07): `Engine::shadow` and `Engine::flatPart`; Heavy: `projectexact::shadow`, `projectexact::edge`, `projectexact::corner` in `src/engine/heavy/projectexact.cpp`; Lite: MISSING (keeps the triangle way above). Everything comes from the model's own edges and surfaces, never its triangles; target accuracy 0.00001 in (0.000254 mm), spline fits within `kProjectFit` (1e-5 mm).
+  - Edge / corner: the edge's own curve laid flat. A line stays a line, a circle parallel to the sketch stays that circle, one at a slant is its exact ellipse, one edge-on is a line, anything else a spline within `kProjectFit`.
+  - One flat face seen square on: its own wires laid flat in wire order (outer anticlockwise, holes the other way). Exact by construction.
+  - Whole model / curved face: (1) every edge laid flat; (2) the outline of each curved face that folds over as seen from the sketch (OpenCascade hidden-line outlines, `HLRBRep`, ShowAll); (3) all of them cut wherever they meet; (4) each piece judged by stepping just to each side of its middle: outline when a line straight down meets the model on one side only; (5) pieces lying along one another count once; (6) the kept pieces chained into closed loops, each piece the exact curve it came from.
+  - Side test (step 4): looked at from 10 x the local looseness down to `kSideStep` (1e-4 mm), never farther out than half the piece's length (or twice the looseness): a longer step could reach round a corner. Model on both sides at a step no finer than the looseness puts the piece inside. A side point in a crack narrower than the looseness (model nearer the piece and farther out, same side) counts as covered: a loosely made model only meets that well.
+  - Copies (step 5): piece i is a copy of piece j when i lies along j's length (foot inside j, both ends along j), runs the same way (within 30 degrees), and either sits on j's shadow side with model between them, or is within the two pieces' looseness added together (then whichever side the hair puts it). Coincident, partly overlapping pieces are judged the same way (no "too close to tell" skip).
+  - Does the model meet a line straight down (`meetsModel`): flat faces analytically (the height from the plane's equation, then the face's own (u, v)); other surfaces by `GeomAPI_IntCS`; then `FaceInside`. Faces that stand straight up (a flat face edge-on, an upright cylinder, a profile extruded straight up) are skipped: from above they are only a curve and cover nothing, and a line running along such a wall made `IntCS` crawl (a body with 9 upright spline walls: 759 s of side tests, now 0.25 s).
+  - `FaceInside` (OURS, replaces OpenCascade's face classifiers here): each face's boundary curves on its surface cut into chords within 1e-7 mm on the model (`GCPnts_TangentialDeflection`, no finer than 2 x `Precision::Confusion`), each boundary loop walked in wire order (`BRepTools_WireExplorer`) with the gap between one edge's end and the next edge's start closed straight across; inside = an odd count of chord crossings along u, with v-bins for speed; within the fit of a chord = "on the boundary, can't tell". The counting line is moved by a fraction of the fit (never enough to change the answer) so it never passes through a chord's end: a circle's start and end differ by a rounding hair, and a line through them miscounts that loop (two such loops on one line cancel, so an even total can't catch it). Why ours: `IntCurvesFace_Intersector`, `BRepClass_FaceClassifier`, `IntTools_FClass2d` and `BRepTopAdaptor_FClass2d` all answered wrongly up to about 0.0027 mm from a long spline edge, ten times the accuracy asked for.
+  - Tried and set aside (2026-11-07): building each face's flat shadow and merging them with OpenCascade's fuzzy General Fuse / pairwise `BRepAlgoAPI_Fuse` + `ShapeUpgrade_UnifySameDomain`, taking the rim as the edges with one face. On a loosely made model it left slivers lying over their neighbours, took over 60 s where the side test takes 2 to 25 s, and once threw from `gp_Vec::Normalize`. Removed from the code.
+  - Checked by a probe over 274 test bodies (parts, threads, fillets, loose STEP imports) in several directions each, plus a loosely made speaker mount (452 faces, 1070 edges, edges loose by up to 0.05 mm) in 9 directions, 100 of its faces one by one and 600 of its edges: no piece with model on both sides or neither, no open end, the enclosed area matching a dense grid of straight-down lines. On a loose model, points closer to the outline than the face's own edge tolerance are not judged (its edge in space and its edge on its surface are only that close; both describe the face).
+- Changes: 2026-11-07: Heavy Project made exact (see Exact above): `FaceInside` (own face classifier, gaps between edges closed, counting line kept off chord ends), upright walls skipped, copy rule (looseness of both pieces, no skip for coincident pieces), crack rule in the side test; the fuzzy-fuse trial removed. 2026-11-01: Edges / Points choice added. 2026-11-01: count badge beside the tool name. 2026-11-01: Done button. The shadow is grown and shrunk by half the tolerance to seal zero-width cracks between triangles, which read as lines inside the outline. 2026-10-31: added. 2026-11-01: no one step may take over 40% of an arc: a long straight with short bends at both ends passed as a bulging arc, on Speaker Mount.step an 11 mm edge bowed out 1 mm.
 
 #### Constraint solver                      [BUILT-IN]   [OURS]
 - What it does: moves points as little as possible (weighted, measured from where they started) until every constraint holds: Gauss–Newton, each step x = x0 + W Jᵀ (J W Jᵀ)⁻¹ (J (x − x0) − r), Jacobian by central differences, tolerance 1e-8; a solve that has stopped improving with under 1e-6 left also counts as done (repeated constraints leave a hair). The damping on the diagonal is scaled to the matrix. Residuals: an arc's end-to-centre distances differing (every arc and circle), sine of the angle between lines (Parallel), its cosine (Perpendicular), sine to the axis (Horizontal/Vertical), distance in mm (Fix), mm off (dimensions, Equal). Ring-by-ring solving (`SketchGeometry::solveRings`) is shared by dragging and dimensions. `SketchGeometry::solveOnly(ring, steady)` lets only the given points move and gives up (putting everything back) if anything else would. Passing holds used only while dragging: "heading" (a line keeps its direction (u, v): residual its cross product with the line, over the length) and a radius hold on one arc (id INT_MAX), never saved.
@@ -824,13 +869,39 @@ How every constraint tool is picked (`SketchTools.ruleFor` says what each list o
 - Heavy / Lite: engine-independent
 - Changes: 2026-10-30: added; renamed Open → Load.
 
-#### Undo and the Timeline                  [BUILT-IN]   [OURS]
-- What it does: one history for the whole design. Every action (a sketch, a line, a constraint, a drag, a deleted constraint, showing or hiding something) is a step; Ctrl+Z takes back the newest, one at a time, in Model and Sketch mode alike. Steps done inside a sketch belong to that sketch. No Redo yet.
-- UI: Ctrl+Z. The Timeline along the bottom shows one dot per step (hover for its name): the design's steps outside a sketch, only that sketch's own steps inside one. Double-click a sketch's dot to edit it. The tab in the middle of the bottom edge hides it.
-- Popup: none.
-- Interface hook: `Document::undo()`, `Document::record(action, summary)`, `Document::history`; `qml/HistoryTimeline.qml`
+#### Linked sketch projection, Break Link, sketch rewind   [BUILT-IN]   [OURS]
+- What it does: a sketch can project the lines, arcs, circles and points of an EARLIER sketch (Project, "Sketch Parts" or "Whole Sketch"; "Outside Sketches" in the selection menu switches picking them on or off). The projection stays linked: when the source sketch changes the projected geometry follows. Only some parts projected: new source geometry is NOT added. Whole sketch projected: new source lines, arcs and points are added, and a fillet or chamfer on a mapped corner comes in (the sync re-points a mapped line to the source line's current ends). Helper and construction flags are mirrored. Arcs project only between parallel planes; splines, ellipses and text are skipped. Projecting from the model body records a link too (source 0), but nothing syncs it yet (no Extrude).
+- Sync rules: derived and repeatable (`Document::syncLink` from `sketchesEdited`), so undo and redo of either sketch converge. A projected item the user deleted stays deleted. Moved geometry is re-solved. Link data lives inside `SketchGeometry` (`Link` struct), so undo restores it with the sketch snapshot.
+- Broken links (shown in the timeline, nothing is deleted): yellow = the geometry moved but the constraints can't all hold; red = a source line, arc or point the link follows is gone, or the source sketch is gone (red wins). The sketch row shows the worst issue of its links; hover shows the text. Better handling is planned after the owner's production testing.
+- Break Link: only in the sketch history. Hover a linked projection step for 1.5 s: a button rises above it and can be clicked after 450 ms more; it hides 0.5 s after the mouse leaves. A themed yes/no card asks; yes adds a new undoable history step "Broke the link to ..." and keeps the geometry as ordinary geometry.
+- Project runs and box select (2026-11-02): a Project run (start to Done) is ONE history step: `Document::beginProjectRun` / `endProjectRun` join the run's projection steps, keeping the first step's snapshot, with `links` and `parts` on the step; Break Link on it breaks all its links ("Broke N links"). A box drag now works in every Project kind (Edges / Points, Faces, Whole Model, Sketch Parts, Whole Sketch; left to right = wholly inside, right to left = touching) and, in the model with no sketch open, selects faces, edges and corners. `Document::faceOutlines()` gives each face's rim for the test. Select-through (hidden parts count).
+- Box select modifiers (2026-11-02): Shift-drag adds the box's take to the selection as one batch; Ctrl-drag removes whatever the box takes from the selection (it never selects anything new); a plain drag replaces. Direction rules as before (left to right = wholly inside, right to left = touching). Ctrl-drag in Project un-projects the matching items. The box turns red for Ctrl. A Shift/Ctrl drag that starts on a sketch part draws a box instead of moving the part. `SketchTools.applyBox`, `boxMode`.
+- Visible only (2026-11-02): box select (edges, points, faces, whole model) takes only what the camera can see; things hidden behind the model (an internal thread seen from outside) are not taken. `Document::hiddenFrom(points, eye, ortho)` casts a ray from each point to the camera against a lazily built bounding-volume tree of the mesh (cleared whenever the mesh changes); `SketchTools.seenOutlines` / `seenFaces` filter box hits with it (an edge is sampled at 9 points: a crossing box needs one seen sample in the box, a window box at least half). `SketchTools.selectThrough` (default false) is the plug-in point for a later Select Through switch. A box over the whole view costs about 0.3 s.
+- Project run is one item (2026-11-02, supersedes the end-of-run merge above): `Document::record()` adds a Project run's later projections into the run's first history item (no separate steps, nothing merged afterwards); `foldProjectRun` words it, `endProjectRun` closes the run, `undoProjectRun` takes it back for a retake. The same thing is never projected twice into one sketch (quietly skipped, fitted curves included). The Ctrl-drag box colour avoids the accent's hue (`boxOverlay.removeTint`).
+- Project run item appears at Done (2026-11-02): the run's item is stored with a `pending` flag and `history()` hides it until `endProjectRun` (Done, Esc, another tool, leaving the sketch) or any other recorded action commits it; saving strips the flag. Picks left out as already projected are counted in a second bubble beside the count. History entries for hiding and showing use the Browser's eye icon, and hiding then showing the same item with nothing between them (or the reverse) is removed from the history instead of added (`Document::setShown`).
+- Icons: projection steps show a chain-link icon (faded once broken); Break Link steps show the same chain broken apart.
+- Rewind: opening an earlier sketch (timeline or Browser) takes the document back to when that sketch was made. What was made later fades out over 250 ms (the same as the eye) and back in on finish; the camera waits until the fade ends, so the turn stays smooth. Model projection is refused while the body is from the future; later sketches can't be projected into an earlier one. Eyes of future rows are disabled.
+- Timeline: a folded run of moves opens after a 1.5 s hover (folds 3 s after leaving).
+- UI: Project popup choices: Whole Model, Face, Edges / Points, Sketch Parts, Whole Sketch.
+- Interface hook: `Document::projectSketchIntoSketch(sketch, source, parts)`, `breakLink(sketch, link)`, `earlierSketches(sketch)`, `rewinds(sketch)`, `futureKeys`; history entries carry `link`, `break_link`, `link_broken`, `issue`, `issue_text`.
 - Heavy / Lite: engine-independent
-- Changes: 2026-10-30: deleting constraints is undoable. 2026-10-29: added.
+- Fix 2026-11-01: edge arcs projected with Edges / Points ran the long way round (a fillet showed as 270 degrees, like a full circle); the direction now comes from the edge's own points, and an edge that folds back on itself becomes a curve instead of an arc.
+- Changes: 2026-11-01: added. Tested pass the same day: a whole projection after a parts projection shares the existing items instead of duplicating them; a link with every point fixed is judged by its worst residual (< 1e-3) so single-precision noise doesn't show a false yellow; the Outside Sketches switch now also works while Project is active.
+
+#### Undo and the Timeline                  [BUILT-IN]   [OURS]
+- What it does: one history for the whole design. Every action (a sketch, a line, a constraint, a drag, a deleted constraint, showing or hiding something) is a step; Ctrl+Z takes back the newest, one at a time, in Model and Sketch mode alike. Steps done inside a sketch belong to that sketch. Ctrl+Y redoes (owner, 2026-11-07): it puts back the newest step Ctrl+Z took back, exactly as it was, and any number can be redone in turn; doing anything new after an undo ends what can be redone (as in Fusion).
+- UI: Ctrl+Z, Ctrl+Y (also from inside a tool's typing box: it leaves the box first, as Ctrl+Z does). The Timeline along the bottom shows one dot per step (hover for its name): the design's steps outside a sketch, only that sketch's own steps inside one. Double-click a sketch's dot to edit it. The tab in the middle of the bottom edge hides it.
+- Icons and runs of moves (2026-11-01): a step can have an icon of its own instead of a dot. So far only a move (dragging a point, line, arc or curve): a cross with an arrow head at each end, drawn in the sketch's green. Later the same for the other steps and for the design's row. Moves done one after another would swamp the row (a drag is one step), so two or more in a row fold into ONE move icon with a count badge. Hovering it opens the run out into its separate moves (hover each for its name); the run folds again 3 seconds after the mouse has left it. A single move stays a single icon. Nothing is removed from the history: Ctrl+Z still takes the moves back one at a time. Not yet: clicking a step to go back to it.
+- Popup: none.
+- Redo, how (2026-11-07): each undo first keeps the whole document as it is (`Document::Redo`: components, bodies, sketches, hidden rows, open sketch, parameters, the kept solids of extrudes and fits, the imported file). The solids and meshes the undo lets go of are parked in it instead of released, so a redo puts everything back at once: nothing is built or meshed again, an extrude included. Redo restores that state and the step's history entry; the step can be undone again afterwards. `record` (anything new), cancelling a Project run and opening a file end what can be redone and release the parked solids (`clearRedo`). Window: redoing a sketch's start or Edit Sketch goes into it, redoing a finish leaves it; sketch changes and showing or hiding fade, as undo does (`Main.qml` `redoLast`). Test: `history/tools/probes/suiteredo` (13 checks: sketch start, rectangle, circle, finish, extrude new/cut/join, hide, edit, finish again, each undone and redone twice and compared whole; 6 back then 6 forward; a new step ends redo; Ctrl+Y bound).
+- Interface hook: `Document::undo()`, `Document::redo()`, `Document::redoNext()`, `canRedo`, `Document::record(action, summary)`, `Document::history`; `qml/HistoryTimeline.qml` (`items` folds the runs, `openRun`, `foldDelay`, the `Canvas` move icon)
+- Heavy / Lite: engine-independent
+- The marker (2026-11-07): a line with a ball on top between the Timeline's items. Drag it left and right to move the design back and forward through its history; let go and it settles on the nearest gap (140 ms). Items behind it are greyed and kept; moving it forward puts them back as Ctrl+Y does (nothing built again: every body's mesh stays cached while any step can show it). Part way across an extrude, the extrude is drawn part done in 3D from any view (`RewindMaterial`: the before and after shapes split along the extrude's direction over its areas' box, a glowing band where they meet). A step made while the marker is back blocks moving forward and saving until it is taken back with Ctrl+Z (inserting it with a rebuild is not there yet). Not yet: saving the steps behind the marker in the file.
+- The marker inside a sketch (2026-11-07): on the open sketch's own row, in the sketch's green, over the steps of this time in the sketch only (going further back would leave it). The sketch stays open. Part way across a step the sketch is drawn part way to how that step leaves it (`Document::setSketchTween`, eased): new lines, rectangles, circles and curves grow from where they were started (a shape drawn on from an existing point grows from that point, else from its own first point); what a constraint or dimension moved glides there, its dimension and the shading following; what a step took away shrinks back. Text simply appears. Finish Sketch or Edit Sketch with the marker back brings every step behind it back first. A sketch opened again (Edit Sketch): the marker still moves over all its steps. The design can't go back past that opening without leaving the sketch, so before it the sketch is only drawn as it was (`Document::prepareSketchPast`, `showSketchPast`), lines, dimensions and shading alike; the document stays at the start of this opening.
+- Sketch states in the background (2026-11-07): what the marker needs inside a sketch is worked out from the history's own records, never saved in the file and never waited for. A walk starts from the sketches as they are and takes the steps back one by one, newest first, from each record's undo data (no engine, no document undo), in slices of at most 4 ms between frames (`Document::walkSome`, a 12 ms timer), so drawing, sketching and extruding carry on meanwhile. Each step keeps the sketches it changed as they were just before it; that depends only on the steps before it, so a new step on top only adds its own and nothing already known is worked out again. It works the same for a sketch made this session, a file just opened and a sketch opened again. Shape tools (Trim, Offset, Mirror, deleting, and the other tools that change many things at once) keep a small `before` diff in their record (what they changed, as it was), so they too can be taken back after opening a file; a file saved before this stops the walk at the oldest such step. The open sketch's Timeline row shows a translucent fill from the newest item back as far as the walk has got; the marker goes only where it is filled; faint while it grows, stronger when it covers the whole row. - The design's steps of an opened file, built again in the background (2026-11-07): a file keeps only each body as it is now and each step's record, so the marker couldn't go back over a step made before the file was opened. Now, once the sketches' states are known, a second document with its own engine, on a low-priority thread, makes every step again from its record, oldest first (sketches as they were from the walk above; components, hiding and showing, extrudes by their spec), and keeps the bodies after each step that changed them. The bodies it ends with must be the file's own (matched by name and component), else nothing is used and the reason goes to the log. The earlier solids come back to the window's engine a few at a time (each slice at most a few ms, never while an extrude or import is running) with their meshes, so nothing is meshed again. From then on the marker and Ctrl+Z go back over the file's steps as over this session's: a step that changed bodies goes back to the rebuilt design before it, any other step by its own record. Nothing is saved. The design's row shows a faint fill growing from the oldest end while it builds; the marker can go back only over this session's steps until the whole row is filled. Extrude records now also keep which body became which solid (`swaps`), so a later step that names a body (Skip, hiding it) can be followed. Imports are built again from the imported solid: the body itself when nothing has changed it since (it's in the file), the file's last import (`body_file`), or, only when neither holds it, a copy kept in the import's own record (`solid`, written at save). Fit Curved Surfaces works from the triangles a mesh came in as, which a file doesn't keep, so the rebuild takes the fitted body as it was made, found the same way (its record now has `body`). Every new kind of step must be built again here too, with a reopened-file test (owner, 2026-11-07: "as we add more features, the ability to scrub needs to be part of that build"). Opening a file now also carries every body id in the records (made, swapped, skipped, hidden) over to this window's ids; a body gone before the save gets its id negated, so it never stands for one of this window's.
+- Gliding while sketching (2026-11-07): whatever moves the open sketch other than the mouse (a constraint, a dimension, Ctrl+Z, Ctrl+Y) glides to its new place in 220 ms (at most 250 ms) instead of jumping (`Document::takeLiveTween` / `liveTween`, `Main.qml` `liveGlide`). Dragging is followed at once. A new change during a glide starts from where the glide is.
+- Interface hook (marker): `Document::rewindTo(count, inSketch)`, `future`, `presentCount`, `futureStale`, `rewindStep`, `fillBodies`, `setSketchTween`, `prepareSketchPast`, `showSketchPast`, `takeLiveTween`, `liveTween`, `holdLive`; `qml/HistoryTimeline.qml` (`markerItem`, `countAt`, `firstMovable`, `slotX`), `Main.qml` `rewind`, `qml/RewindMaterial.qml`, `qml/shaders/rewind*.{frag,vert}`. `sketchReadyFrom`, `sketchWalkDone`, `modelBuiltTo`, `modelReadyFrom`, `modelBuildDone`, `buildWhy`, `startBuild` / `loadSome` / `builtAt` / `applyBuilt`, `walkedSketchPoints` / `shownSketchPoints` (tests); `HistoryTimeline.qml` `readyCount`, `readyDone`, `readyItem`, `timelineReady`. Tests: `history/tools/probes/suitetimeline`, `suitesketchscrub` (19 checks, moves at most 5 ms), `suitemarkermouse` (real mouse drags, a sketch opened again), `suitesketchwalk` (a saved file opened again: the walk while the app keeps drawing, every state checked, the marker dragged back; an older file saved again unchanged), `suitemodelbuild` (an opened file's design row: rebuilt, every step back and forward checked, a mouse drag), `suitedemoreopen` (three models, 19 extrudes, opened again), `suiteimportbuild` (STEP and STL imports, a cut, Fit Curved Surfaces: opened again, scrubbed, Ctrl+Z / Ctrl+Y all the way).
+- Changes: 2026-11-07: an opened file's design steps built again in the background (the marker goes back over them). 2026-11-07: sketch states worked out in the background (opened files too) with the Timeline fill. 2026-11-07: the Timeline marker, in the design and in a sketch; sketch glides. 2026-11-07: Redo (Ctrl+Y). 2026-10-30: deleting constraints is undoable. 2026-10-29: added.
 
 ### Interface
 
@@ -931,6 +1002,9 @@ Stock OpenCascade has no mesh-to-surface recognition; all of this is in `meshsol
 - Heavy keeps an imported mesh's own triangles for its body (`m_imported`), used by Fit; a saved, reopened or moved body falls back to meshing the solid, with poorer results.
 - Screw surfaces space their rows evenly by length along the outline (`outlineAt`, `outlineShare`); unevenly spaced rows overshot and folded the surface, drawn as grey back faces.
 - Heavy's drawing mesh sets DeflectionInterior and MinSize to 5x Deflection: 2.6 million triangles to about 100k on a threaded part, no open edges.
+- Upright walls (`regularize`, 2026-11-05): a fit reads the mesh's float noise and uneven top and bottom triangle rows as a lean. On the test speaker mount, every round base wall came out leaning 0.0025 to 0.40 degrees, though its STL corners sit on one upright circle (r 15.825 to 0.000001 mm). Then a cut and a pull back left a line where the walls met. After fitting, biggest first, each plane, cylinder and cone tries the world axes and directions already settled, within 1 degree (or square to one of them). A cone tries to be a cylinder, and a round wall tries a bigger wall's axis line. Then side-by-side surfaces that are one become the very same surface, and a round touches the flat it blends into exactly. Each try is kept only if every mesh point of the surface still lies within the fit tolerance, so a real draft stays: the test part's prongs keep their 0.4000-degree taper, which their long triangles show exactly. A surface that touches a thread is left as fitted, because the mesh was cut along the thread against it. Turned upright, the 45-degree lead-in cone at the test part's bore no longer met the thread, and the solid came out open with a 15 mm gap. Result on the test part: one valid solid, all 46 cylinders exactly upright, outer wall r 15.825000, volume 35461 mm3 (Fusion 35444.5; before this fix 33636). Cut to 1.27 mm under the top and pulled back: no edge at the cut height, and 451 of 498 faces identical; the rest are the thread bore, which the profile fills.
+- Short-wall rule (owner, 2026-11-05): a wall under 25 mm (1 in) long that is under 0.5 degrees off upright, square, or a plain cylinder is made exactly that, even when its triangles show the lean. The length is measured the way the wall leans: up a round wall's axis, or along a flat in the direction it tilts. The build tolerance grows to cover how far such a wall then sits off its points. Walls 25 mm and longer keep a lean their points show. Tested on drafted blocks (30 mm square): 20 mm tall at 0.3 degrees comes out upright; 20 mm at 0.7 degrees, and 40 mm at 0.3 or 0.7 degrees, keep their draft. The speaker mount is unchanged (base walls already upright, the 64 mm plug keeps 0.4 degrees).
+- Known limit, found while testing the rule (older than it): `sectionSurfaces` slices only along the mesh's longest spread. A squat round part (a 30 mm post under about 21 mm tall) is sliced across instead, so a slightly drafted one (0.2 to 0.5 degrees) is never found and stays 96 facets; the patch fitter misses it too. An undrafted one is found. Not fixed yet: slicing along each of the three main directions would find it, at up to three times the cost of that stage.
 
 #### Body look
 - Location: every body in the view.
@@ -952,3 +1026,472 @@ Stock OpenCascade has no mesh-to-surface recognition; all of this is in `meshsol
 
 **Resolution:** When the solve fails, `SketchGeometry::slideTogether` slides the whole shape so the point lands, then solves again. It moves the second pick's shape, or the first's if that one can't move. It applies only to a shape that isn't tied to the other point, the origin, a Fix or projected points. Stock: none, ours. UI: Sketch > Coincident, no popup or options.
 
+#### Circumscribed Polygon: even side counts stay regular
+
+**Problem:** An even polygon held by Equal sides and Tangent to its helper circle could still swap long and short corners, as a square leans into a rhombus. Horizontal on one side of a 10-sided polygon left corners at 40.07 and 22.90 mm from the centre.
+
+**Resolution:** A new even polygon gets one Rotation constraint between two neighbouring corners about the centre (`polygonSpec`). Polygons already drawn don't get it, so redraw them. UI: Sketch > Circumscribed Polygon, no new options.
+
+#### Solver: short-step retry
+
+**Problem:** The solver heads straight for the nearest answer. A big turn of a shape whose constraints repeat each other wandered until it gave up, so Horizontal on a 10- or 12-sided polygon was refused.
+
+**Resolution:** `solveWeighted` tries again in steps of at most 2 mm, each from where it has got to. Refusals take about twice as long. Coincident skips this at first (`directOnly`), because it can bend an older polygon: it solves directly, then slides a free shape, and uses the retry last. Stock: none, ours.
+- Project highlight (2026-11-02): while the Project tool runs, picked edges and corner points are drawn thick and in front (large negative depth bias), picked faces and the whole model are shaded translucent purple, so what will be projected is clear before Done. `Selection.projectPicks`.
+- Project highlight size (2026-11-02): the thick edge highlight keeps a pixel thickness that follows the square root of the zoom (0.3x to 1.2x of the base), so zoomed out it stays in proportion to the model; it is rebuilt shortly after zooming or turning (at most every 40 ms).
+- Coincident picks (2026-11-02): a pick whose outline lands on lines this Project run already made (far and near edges seen end-on) is still taken, highlighted and counted; it adds no new line. Only a pick an earlier run of the same sketch already put on it is left out, and only those count in the skipped bubble.
+- Edge picking (2026-11-02): among edges about equally near the pointer, the one nearer the camera wins (matters with Select Through).
+
+- Performance with many Project picks (2026-11-02): the highlight is built when the picks change and once after a zoom stops (not on hover, pan or orbit); highlight edges use lean 5-sided tubes with small balls only at the ends (`fillParts(..., lean)`); sketch-line redraw on zoom is throttled to 50 ms.
+
+- Faster Project picking (2026-11-02): faces are projected in one pass (`projectFacesIntoSketch`: one scan, one history entry, one redraw) instead of one by one; choosing Project again ends the open run so each run is its own history item; selected parts are rebuilt only when the selection changes, and, for big selections, shortly after a zoom or turn stops.
+- Whole-body selection (2026-11-02): double-clicking the model in the 3D view selects that body only (never its component); double-clicking a body row in the tree selects that body, and a component row selects every body inside it and its nested components. Not while sketching.
+- Tree underline (2026-11-02): rows holding something selected (a body, or its face, edge or point; a sketch or profile) get a dotted underline under the name, and so do the components above them, but not the top design.
+
+- Constraints from the search menu now work on whatever is already picked: parallel, collinear and concentric follow the first pick; perpendicular and tangent take exactly two; equal follows an already dimensioned item, else the first pick; horizontal/vertical uses the majority orientation; coincident joins points to the first (or origin) or puts them on one curve; midpoint takes a point and a line; symmetry takes three picks.
+- Sketch Dimension on two circles or arcs gives a centre distance; double-clicking a model face or edge while sketching selects the whole body.
+
+- Every constraint has a small symbol (one shared icon file): on its badge in the sketch, left of its name in the function search, and as its step in the sketch history timeline. Dimensions, angles, Fix and Unfix have symbols too.
+
+- The constraint symbols in the function search are drawn half again as large.
+
+- Every sketch tool has its own small icon (and its own for each kind: centre rectangle, 3-point circle, tangent arc, the slots, the chamfers and so on) in the function search and on its step in the sketch history timeline. The search always leaves room for the icon so names never shift. Steps made by a shape tool now record which tool made them.
+
+- Text is placed with two clicks that make a box; it wraps to the box, can be fit to it, and has font, height, bold, italic and left/centre/right and top/middle/bottom alignment. The font choice lists the families installed on the system, each shown in its own face. A selected text can be edited afterward with the same fields; each edit is one undoable history step.
+- Text on Path writes the words along the lines, arcs, circles and curves picked, end to end (a square's four sides, for example), with left, centre or right justification and a Flip option. The text follows its path when the path is moved or edited.
+
+- The font list scrolls on its own without zooming the view behind it, and Text on Path takes a whole joined shape from a single click (its first-clicked side is where the text starts).
+
+- Text on a path can be dragged along its path (also around a closed shape); the justify (left, centre, right) is then measured about where it was let go, and Flip keeps it in place. Letters that fall across a sharp corner are placed whole on the side their middle is nearer to, instead of being stretched.
+- Text can have several lines: Enter in the text field starts a new line (Ctrl+Enter finishes), and double-clicking a text, in an open or a finished sketch, opens it for editing.
+
+- Dragging a text on a path works while the Text on Path tool is still on, not only after leaving the tool.
+
+- A text on a path slides when any of its letters is pressed and dragged, with the tool on or off and whatever else is picked; a press within a third of the letter height of a letter counts as on the text.
+
+- The text option box holds real lines: Enter starts a new line in the box, Ctrl+Enter finishes, and the box grows with its lines.
+
+- Text on Path: the words can be dragged along the path before they are finished (the first drag writes them); several lines stack on the path, each justified on its own.
+- Text on Path: additional lines stack away from the path on the text's up side (last line on the baseline); Flip mirrors this automatically.
+- Text edit panel (all text properties) also shows while a text tool is active with nothing gathered and one text selected; the tool options panel hides then. Shortcut Enter-to-confirm is disabled while typing in that panel.
+- History rule: an edit session of one item (e.g. typing a text) is one history item. `Document::editSketchText` updates the newest item while the same text stays selected (`closeTextEdit()` ends the session); any other recorded action also ends it. One undo takes the whole session back. New live-editing panels must follow this.
+- Text edit session: edits and slides of the same selected text share ONE history item (`Document::recordTextEdit`), ended by selecting another item or any other recorded action.
+- With Text / Text on Path active, clicking a written text selects it (it is never a path to follow), so its edit panel stays.
+- Text edit session is owned by the document only (same sketch + same text + newest history item); UI visibility changes of the text panel never end it.
+- Text tools' option panels are two centered rows (words/font/size; then switches and choices) with a Done button; Done writes or puts down the text. Clicking away puts a picked text down.
+- Text tools are one-shot: confirming writes the text, ends the tool and selects the new text for editing. Each start has an empty Text box, and after a path is picked the cursor moves into it so typing never triggers shortcuts. A written text is never a path for another text.
+- Finishing a text (Done or confirm) leaves it deselected, in its normal finished look; double-click re-opens it for editing.
+- LOCKED (owner-approved): the text-tool finish logic above (one-shot, empty start, cursor in the Text box after a pick, Done = finished and deselected, double-click to reopen). Keep it unchanged and reuse the same pattern for similar tools.
+- Driven dimensions: a new dimension whose measurement the existing constraints already fix (no extra rank in the constraint Jacobian) is stored driven: the solver ignores it, it shows the live measured value in brackets, cannot be edited, and is saved/loaded with a driven flag.
+- A newly added driven dimension shows a short fading toast beneath it explaining it is driven and cannot be set by hand; driven dimensions use a dotted border and a distinct text colour.
+- Curvature (G2) constraint: joins a spline to a line, arc or another spline where their ends meet, so they leave the join in opposite directions (same tangent line) with the same curvature vector; the spline moves and the other part stays. Refused when the ends do not meet, the parts fold back over each other, or the constraints already forbid it. It is saved, undoable, shown as a badge on the joint, and removed when either part is deleted.
+- Parameters: a document-wide list of named values (name, unit, expression, comment). Expressions support numbers, units, + - * / ^, parentheses, functions, constants and other parameters; they are evaluated in base units with length/angle tracking, so unit mismatches, unknown names, cycles and non-positive dimensions are refused with a plain reason. Names may start with a digit or contain unit text, but not be a bare unit word or look like a value. A dimension can hold a formula; it re-evaluates whenever a parameter changes, on load and on undo. Applying a list is one history item.
+- The dimension value box takes formulas, and once the text stops being a plain number it suggests matching parameters; a formula dimension shows "Fx" before its value with a hover tip.
+
+- Parameters can be exported to and imported from spreadsheets: Import and Export buttons sit left of the Automatic Compute checkbox. Export defaults to OpenDocument (.ods) and can write CSV (Fusion 360 layout: Name, Unit, Expression, Value, Comments, Favorite). Import reads .ods, .csv and .xlsx and merges by name in one undoable step.
+- The delete X in the Parameters table is larger and red.
+- Parameter import detects the file type from its contents (a spreadsheet saved with the wrong ending still reads), and refuses binary files without adding anything.
+- Parameters use a drawn "fx" icon in the function search and on parameter steps in the model history.
+- A Parameters window session is one history item however many edits are made; no item if nothing changed or everything was reverted.
+
+- A document holds several bodies. Each body keeps its own solid and name and belongs to a component; the view mesh is the merge of every shown body, with maps from merged faces, edges and points back to their body. Each body is saved as its own solid.
+- Engine interface additions: a placement (origin and two axes) and `extrudeOn(profile, placement, from, to)` that builds a prism on any plane; `volume(body)`; `gap(a, b, search)` (zero when bodies overlap or touch); `faceProfile(body, face, placement, profile)` for planar faces (heavy engine only).
+- Extrude: picks sketch profiles or coplanar faces; per side (One Side, Symmetric, Two Sides) the operation is Auto (new body, join or cut by overlap and contact tests), Join, Cut, New Body or New Component, chosen independently per side. A cut can be limited to chosen bodies. The whole extrude is one history item; undo restores the replaced solids while the session lasts (not after reopening the file).
+- The extrude preview is drawn in front of everything with a flat-colour material: blue for additions, red for cuts, with the exact removed region computed after a short pause so dragging and orbiting stay smooth.
+
+- Extrude tool: with nothing picked it shows a prompt and auto-picks a lone closed profile; a preselected profile or face is used; the drag arrow has a minimum on-screen length.
+
+#### Extrude: froze on start
+
+**Problem:** Starting Extrude on a sketch projected from a threaded body froze the app. Picking the only profile went through `sketchProfiles`, which also hunts for gaps in the outline.
+
+**Resolution:** `Document::profileSpots` gives each cached profile's middle, with no gap search. Extrude now starts in about 4 ms. Stock: none, ours.
+
+#### Extrude: Auto worked out from meshes
+
+**Problem:** Auto (new body, join or cut) intersected the extrude with every body to decide. On a threaded body this took 3.4 s, and over a minute at times, every time the distance changed.
+
+**Resolution:** `planExtrude` tests points inside the profile at five depths against each body's mesh (a ray's crossings, odd means inside). A point inside means Cut; a point just behind the start inside means Join. It takes about 3 ms. The red cut shape is the extrude itself, no longer the exact removed part. Stock: none, ours.
+
+#### Extrude: the arrow wouldn't drag
+
+**Problem:** The arrow list was rebuilt on every view move and every distance change, so the arrow being dragged was destroyed under the mouse. A drag also measured from the profile, so a short distance jumped on the first move.
+
+**Resolution:** The arrows are counted, not listed, so they stay put. A drag counts from where it was grabbed. About 10 ms per move. Stock: none, ours.
+
+#### Extrude: true arcs in the tool
+
+**Problem:** A cut through the threaded base took 42 s. Sketch arcs reach the engine as points, so the extrude's round sides were hundreds of flat faces, each cut against the thread.
+
+**Resolution:** `Document::arcCentres` marks each profile point with the centre of the arc it lies on. `HeavyEngine::extrudeOn` turns each run on one centre into one true arc (a whole circle as two halves). The booleans also run in parallel with oriented bounding boxes. The same cut now takes 0.5 s. Stock-changed: `BRepAlgoAPI_BooleanOperation` settings.
+
+#### Extrude: the window stays live
+
+**Problem:** The solid work ran on the main thread, so the window stood still until it was done. After it, the new body was meshed a second time on the main thread, because swapping the body redrew it before the mesh made off the thread was stored. That was 5.6 s for a tapered cut.
+
+**Resolution:** `Document::extrudeInBackground` runs `computeExtrude` (solids and meshes) on a thread, with a working card at the bottom. `applyExtrude` stores the meshes before swapping bodies. Undo, save, open and another extrude wait for it. Stock: none, ours.
+
+#### Extrude: Extent, Taper and Intersect
+
+**Problem:** Extrude had only a typed distance. Fusion also extrudes up to a picked object or through everything, tapers, and intersects.
+
+**Resolution:** See the Extrude entry above. Taper uses OpenCascade's `LocOpe_DPrism`, which measures height along the slanted side (we pass height / cos(angle)) and narrows for a positive angle (we flip the sign to Fusion's). A tapered symmetric extrude is two prisms, each tapering away from the profile. Timings on the threaded base, with the checks below: To Object 0.8 s, All 0.8 s, Intersect 1.5 s, Join 1.3 to 1.8 s, Join with taper 1.5 s, widening taper cut 1.6 s. A narrowing taper cut through the thread comes back as a broken solid and is refused (see KNOWN-ISSUES.md). Stock: `LocOpe_DPrism` (links TKFeat). The rest is ours.
+
+#### Extrude: Join made the body vanish
+
+**Problem:** Joining an extrude of the whole projected outline (outer wall with finger notches) up to a face left the body in the browser with nothing to draw, and hiding and showing it did nothing. The fast boolean (parallel, oriented boxes, non-destructive) reported success and returned an empty solid, which replaced the body. The same join could come back whole on another run. A narrowing taper cut, earlier reported as working, was also returning a broken solid.
+
+**Resolution:** `HeavyEngine::combine` checks every result: a valid solid (`BRepCheck_Analyzer`), with a volume that fits the operation. A bad result is redone plainly on copies, with threads, then on one thread. Copies are needed because plain mode may adjust tolerances in its inputs, and the old solid is kept for undo. If nothing passes, `computeExtrude` leaves the body as it was and says so. Each attempt is logged as an `engine:` line in the window's log. The failing join now takes 2 s (quick try refused, plain one used). Stock-changed: `BRepAlgoAPI_BooleanOperation` settings and checks.
+
+#### Extrude: a cut of a projected outline did nothing
+
+**Problem:** Cutting an extrude of the whole projected outline (the body's own outer wall, notches and all) up to a face removed 18 mm³ of the 13,000 it should have, and reported success. Every try passed the volume check, because a cut that removes almost nothing still "fits" a cut. Plain and one-thread runs gave the same, and an intersect of the same shapes gave nothing. Moving the extrude's sides off the body's walls fixed it; moving only its end off the base face did not. OpenCascade can't settle sides that lie right on sides, on a body with loose (0.063 mm) edge tolerances.
+
+**Resolution:** Before the solid work, `Document::estimateExtrude` works out how much of each body every straight area overlaps, from the body's mesh: columns along the extrude through a 48 × 48 grid inside the profile, each adding up its lengths inside the body (`overlapEstimate`, 0 to 60 ms). `computeExtrude` checks each join, cut and single-area intersect against it, within a tenth of the extrude's volume. A result far off is redone with the outline moved 0.01 mm, then 0.05 mm, off the walls (`offsetProfile`: out into the air for a cut or intersect, in into material already there for a join; arc points move along their radius). The note says how far it was moved. If neither comes right, the body is left as it was and the note says so. Each step is logged as an `extrude:` line. The outline cut now removes 13,115 mm³ in 2.2 s (1.5 s wrong try, 0.7 s moved one). Tapered extrudes aren't checked this way yet. Ours.
+
+#### Extrude: a filled hole left a circle
+
+**Problem:** Joining the projected outline to fill the speaker mount's thread worked, but the base kept a circle where the hole had been, plus a dozen hairline faces along its rim. The sketch had been placed from the face's triangles, whose average sat 0.0001 mm above the real face, so the extrude's bottom was a separate face 0.0001 mm off the base. OpenCascade's own face merge after a boolean only joins faces that match exactly. With the sketch on the exact plane, the plain boolean came back broken instead, and moving the whole outline 0.01 mm off the walls still failed; it took 0.05 mm, after 6 s of failed tries.
+
+**Resolution:**
+- `GeometryEngine::planeOfFace` (Heavy: the face's `gp_Pln`; Lite: none). `Document::facePlane` uses it for a face that is a true plane: the sketch sits exactly on the face, and a merged face whose edge triangles tip slightly still counts as flat.
+- `HeavyEngine::combine` merges faces left in one plane after a boolean (`ShapeUpgrade_UnifySameDomain`, 0.01 mm, 1e-4 rad) and keeps the merge only if the result is still a valid solid of fitting volume. 0.15 to 0.6 s per boolean. The third try (plain, one thread) was dropped: it never came out different and cost up to 5 s.
+- `SheetView` files the body's triangles under a grid over the profile; `overlapEstimate` and `wallEdges` both use it. `wallEdges` marks each outline edge whose middle, half way up, has the body on one side and nothing on the other, and which side is empty (0.03 mm either side). `moveWallEdges` moves only those edges 0.05 mm toward the empty side (cut, intersect) or the body (join); the other edges stay exact, so the shape is the same and no note is needed. Points between a moved and an unmoved edge slide along the unmoved one.
+- Order in `computeExtrude`: with edges on walls, moved edges first, then as drawn, then the whole outline 0.05 mm (which does change the size, and the note says so). Without, as drawn, then the whole outline 0.01 mm and 0.05 mm.
+
+The fill now leaves one flat base face: join 1.4 s, the outline cut 0.95 s, 0.03 to 0.04 s of mesh work before them. Stock: `ShapeUpgrade_UnifySameDomain`, `BRepAdaptor_Surface`. The rest is ours.
+
+#### Profile shading flickered and was hard to pick
+
+**Problem:** A sketch drawn on a body's face (the projected outline on the speaker mount's base) had its shading flicker against the face as the view turned: triangles of wash and face showing through each other. `depthBias` on a Qt Quick 3D Model only changes the drawing order, not the depth test, so it never stopped this. The same profile was hard to click: the face's many edges and corners, which lie in the profile's own plane, were picked within the usual pixel reach first, and so were the origin planes. Across 48 spots on the base, viewed from three angles, the profile won 1 to 12.
+
+**Resolution:**
+- `qml/ProfileMaterial.qml` with `qml/shaders/profile.vert`: the profile's shading, hover and selection are drawn with every point pulled toward the camera by 0.1 mm plus 0.2 % of its distance (never more than half the way), so they always pass the depth test over the face they lie on, and a body really in front still hides them.
+- `Selection.partAt`: when the pointer is over a profile (in front, or on a face within that same margin, `profileMargin`), a point or edge wins only within 3 px (`onProfilePixels`) and only if it isn't behind the profile; an origin axis or point likewise within 3 px; an origin plane never. Otherwise the profile.
+- E opens Extrude in Model mode (`Shortcut extrudeKey`, off in sketches, menus, typing and while a solid job runs), and the command has an icon (`SketchIcon` kind `extrude`, used by the search list and the history).
+
+The profile now wins 44 to 47 of the 48 spots; the misses are right on an origin axis in front of it. Ours.
+
+#### Extrude: a click swapped the profile
+
+**Problem:** With a profile picked in Extrude, clicking a face (meant as the face to extrude up to, without first choosing To Object) dropped the profile and made the face the area instead: a plain click replaced the selection, as it does outside any tool. Nothing showed how many areas were picked or gave a way to clear them, or the object. Separately, E did nothing after an Extrude had been used once: the hidden distance box kept the keyboard and took the letter.
+
+**Resolution:**
+- `Selection.clicksAdd` and `Selection.clickFilter`, set by `ExtrudeTool` while its areas are being picked (`takingAreas`): a plain click adds or takes away, a click on nothing keeps the list, and `takesArea` turns away anything but a profile or flat face with a hint. `areasPicked` turns away a new area off the first one's plane (checked with `extrudeFrame`) and puts the selection back.
+- A Profiles chip (`extrudeAreas`) at the start of the first row with the count (`areasLabel`) and a ✕ (`clearAreas`); the To Object chip gets a ✕ (`clearTarget`) once an object is picked. `Chip.clearSlot` keeps room for the ✕ so the label never moves.
+- `ExtrudeTool.onOpenChanged` drops the keyboard focus from its boxes on close. `pickOnlyProfile` gives the profile's index, so clicking the profile it picked takes it away instead of adding it twice.
+
+Ours. Fusion shows these as rows in its Extrude window; here they stay chips over the view.
+
+#### Extrude: a plain click picks the object
+
+**Problem:** Picking what to extrude up to took two steps (the To Object chip, then a click), and a plain click on a face or edge meant something else (it changed the areas). The owner's wish: Ctrl or Shift for more areas, as in Fusion, and any plain click on a point, edge, face or profile is the object to extrude up to, one object per extrude. An edge at a slant should be reached at its far end, with the offset to come back from it.
+
+**Resolution:**
+- `Selection.clickHook` replaces `clicksAdd` and `clickFilter`: while Extrude is open every click in the view goes to `ExtrudeTool.viewClicked(part, adding)`. With Ctrl or Shift, or when nothing is picked yet, it adds or takes away a profile or flat face; otherwise it calls `setTarget`, which sets the side (the one whose To Object chip is waiting, else side 1) To Object, checks the reach with `extrudeFrame`, and puts the old object back with the reason if it can't be reached. A plain click on an area already picked says how to take it away.
+- `Document::extrudeReach`: edges, sketch lines and arcs use `farthestOf` (the point farthest from the profile's plane, either side) instead of the nearest to the line through the middle.
+
+A side edge of the speaker mount is now reached at 86.0 mm, its top end. Ours.
+
+#### Extrude: a join back onto a face left a step
+
+**Problem:** The owner cut the speaker mount's base away to 1 mm under the base's top face, then picked the new bottom face and extruded it back down to the original sketch as a join. The base came back 0.05 mm smaller all round (outline area 773.1 mm² against 777.8, all the way down), a step at the seam, and sliver faces along it. Two causes:
+- A picked face was pushed as an outline traced from its edges (`faceProfile`, a point every 0.01 mm of curve error): every curve became flats, up to 0.01 mm (0.0004 in) off, in the exact model and so in any export.
+- OpenCascade's join of that tool came back the right volume, but its check called it broken: 7 new edges at the seam, most 0.04 mm long, lay up to 0.0101 mm off their faces against 0.0091 allowed. Neither input had a loose edge. The whole result was thrown away, and the fallback that moved the whole outline 0.05 mm inward was used, with a note.
+
+**Resolution:**
+- `extrudeFace` (engine interface; Heavy: the face itself, copied, moved to the start and pushed; Lite: none, the outline is used) and `Document::extrudeArea`, which every extrude tool now goes through. `ExtrudeJob::faces` says which areas are a body's face. A body's face is tried as drawn first, then with edges moved off walls.
+- `HeavyEngine::combine`: a result of the right volume that fails only the check is repaired with `BOPTools_AlgoTools::CorrectCurveOnSurface` (the edges' tolerance widened to fit, never past the loosest tolerance either input already has), checked again, and used.
+- The whole-outline fallbacks (0.01 and 0.05 mm) and `offsetProfile` are gone: a wrong size is never right. When nothing else works, the extrude fails and says so.
+- `faceProfile` traces within 0.001 mm (0.00004 in).
+
+The owner's join now builds as drawn and valid with no repair, 1.2 s (was about 7 s), 37,945.694 mm³; the new base's outline is 777.811 mm² all the way down, against the body's 777.78 to 777.83 at the seam; no sliver faces at the seam (were 415 with the traced outline). Still open: cutting from a body's own face straight through the body fails (18.6 s), because the converted base's walls flare 0.017 mm toward the bottom and the exact cut leaves skins thinner than that; before, it only worked with the outline grown 0.05 mm. Stock: `BRepPrimAPI_MakePrism`, `LocOpe_DPrism`, `BOPTools_AlgoTools::CorrectCurveOnSurface`. The rest is ours.
+
+#### A pushed face's walls didn't show
+
+**Problem:** The owner cut the speaker mount's base away to 1 mm under its top face, then extruded the new bottom face back down as a join. On screen the base looked removed: only its edges showed, like a cage. The model itself was right (valid, one solid, 37,945.696 mm³, outline 777.811 mm² all the way down). The base's 46 new side walls are surfaces swept from ellipse arcs (the converted body's face edges are ellipses), and OpenCascade's Delabella mesher left every one of them with no triangles, without any error. `HeavyEngine::mesh` skips a face with no triangles, so they weren't drawn, and the overlap and wall checks that read the meshes didn't see them either.
+
+**Resolution:** After meshing, `HeavyEngine::mesh` meshes each face still without triangles again with OpenCascade's standard (Watson) mesher, at the same accuracy. Delabella stays for the rest (ten times quicker on a face full of holes); the extra pass only runs when a face was left bare, and handles all 46 of these. Stock: `BRepMesh_IncrementalMesh`, Delabella and Watson. The fallback pass is ours.
+
+#### Extrude: every Extrude starts blank
+
+**Problem:** Extrude kept what was typed and picked the last time: an offset of -1 mm used to stop a cut short came back on the next Extrude, so a join meant to reach a sketch stopped 1 mm short of it.
+
+**Resolution:** `blank()` in `qml/ExtrudeTool.qml`, run by `begin()`: one side, 10 mm, Auto, Distance, no object, offset 0, taper 0°, distance per area off, nothing skipped. Fusion also opens Extrude fresh. Ours.
+
+#### Extrude: a line where a join meets the body's tapered walls
+
+**Problem:** After cutting the speaker mount's base away to 1 mm under its top and pushing that face back down as a join, a line runs round the base where the two meet. The new walls go straight down; the body's own walls above the line taper about 0.04° (Fusion's own STEP of the part has the same taper: outline 779.5 mm² at the bottom, 777.9 at the top of the base). Where they meet, the surfaces differ by 0.0002° to 0.037°, so they're two faces with a real edge between them. The rebuilt base is the right size at the line (within 0.03 mm² of outline) but up to about 0.02 mm (0.0008 in) smaller at the bottom than the tapered original.
+
+**Resolution:** None yet. On an exact body with straight walls the same push and join leaves no line: a circle pushed makes a cylinder, and the faces in one surface are merged into one (checked: 0 edges at the seam). A straight extrude can't continue a tapered wall, so this one is a real edge, not the rounding fault in the next entry (that fix doesn't change it: same 37,945.694 mm³ and the same edge). Possible: an option that carries the neighbouring walls on down as their own surfaces, which would give back the original exactly with no line.
+
+#### Extrude: a join up to a face or sketch stopped 0.000003 mm short and left a line
+
+**Problem:** The owner made a box (a 76.2 mm square on the YZ plane, extruded 127 mm), sketched a smaller rectangle on its end face, cut the ring round it back 76.2 mm, then extruded the shoulder face back up to the sketch as a join. A line stayed round the small rectangle: the body was 11 faces where a box has 6. The reach "up to the object" was worked out in single precision (the sketch plane, the profile's middle, the mesh), so the rebuilt end face landed at x = 126.999996948 instead of 127. Two faces 0.000003 mm apart don't merge, and OpenCascade kept them as two with four sliver walls (0.0002 mm² each) between them. It happens on any join that has to land on existing geometry, at whatever spot the rounding falls.
+
+**Resolution:**
+- `Document::facePlane` adds `exact` (origin and both axes, 9 doubles) when the engine knows the face's exact plane (`planeOfFace`); a sketch made on that face keeps it, in the file too. `planeAxes` reads it (or the old single-precision plane for sketches made before).
+- `Document::readExtrude` works out the start and direction in doubles from the placements, and `Document::extrudeReach` measures in doubles: up to a flat face from the engine's exact plane, up to a sketch point, line, arc or profile from the sketch's exact plane. Edges and points of a body, and projected sketch geometry, still come from the mesh (single precision).
+- `HeavyEngine::combine`: `SetFuzzyValue(kTouching)` with `kTouching` = 0.00001 mm (Parasolid's session precision): faces closer than that count as the same place in a join, cut or intersect. Backstop for the sketch solver (about 0.0000005 mm) and the cases above still measured in single precision. Earlier a large fuzz made the converted speaker mount vanish; at this size it doesn't (same results as before on it).
+
+The owner's box: the join now ends at exactly 127, 6 faces, 737,417.880 mm³ (the box before any cut), 0.06 s. Also checked with a cut of 37.3 mm and a join up to the end face instead of the sketch: 6 faces. Stock: `BOPAlgo_Options::SetFuzzyValue`, `BRepAdaptor_Surface` (exact plane). The rest is ours.
+
+#### Join, cut, intersect: checked once; faces merged only within 0.0001 mm
+
+**Problem:** Two things in `HeavyEngine::combine`, found by comparing with FreeCAD, CadQuery and build123d's code.
+- After every boolean, the full validity check (`BRepCheck_Analyzer`) ran on the result, then the faces were merged and the check ran again on that. FreeCAD (`FCBRepAlgoAPI_BooleanOperation`, `TopoShape::makeElementBoolean`) and CadQuery run no full check after a boolean at all. On the speaker mount the two checks were about 0.3 s of a 1 s join.
+- Faces of one surface were merged (`ShapeUpgrade_UnifySameDomain`) within 0.01 mm and 0.0001 rad. A merge keeps one face's surface, so a face could move up to 0.01 mm (0.0004 in), past the 0.0001 in the model must hold; and over a 300 mm face, 0.0001 rad is 0.03 mm. FreeCAD (its own `modelRefine.cpp`: planes, cylinders, B-splines within 0.0000001 mm), CadQuery and build123d (UnifySameDomain at its defaults) and SolveSpace (`SShell::MergeCoincidentSurfaces`, planes within 0.000001 mm) all merge far tighter. The 0.01 mm was for a sketch on a converted body's face sitting 0.0001 mm off it; sketches on faces now use the face's exact plane, and joins treat faces within 0.00001 mm as touching.
+
+**Resolution:**
+- The result is merged first, then checked once (quick volume check, then `BRepCheck_Analyzer`). Only if that fails is the unmerged result checked, repaired if it needs it (`BOPTools_AlgoTools::CorrectCurveOnSurface`, as before), merged again and checked. A result is never used unchecked.
+- Merge within `kMergeLinear` 0.0001 mm and `kMergeAngular` 0.000001 rad (0.001 mm over a metre).
+- Tried and left out: CadQuery's glue mode for a join that only touches the body (`SetGlue`, about twice as quick in a probe). It is only right when the two pieces don't overlap at all, and our touch test comes from the drawn mesh, which can miss an overlap of 0.01 mm; a wrong glue gives a broken solid.
+
+Speaker mount: cut 0.8 to 1.0 s, join 0.7 to 0.86 s (were about 0.94 and 1.0), same volumes. Owner's box: still 6 faces after the cut and join. Stock: `BRepAlgoAPI_Fuse/Cut/Common`, `ShapeUpgrade_UnifySameDomain`, `BRepCheck_Analyzer`. The order and tolerances are ours.
+
+#### Extrude: up to a curved face, an edge or a corner, measured on the exact shape
+
+**Problem:** Extruding up to an object measured how far from the drawn mesh for anything but a flat face or a sketch: single precision, and up to 0.01 mm off a curve (a cylinder's mesh is flats). FreeCAD (`FeatureExtrude::generateSingleExtrusionSide` -> `TopoShape::makeElementPrismUntil` -> `BRepFeat_MakePrism::Perform(face)`), CadQuery (`BRepFeat_MakePrism`) and build123d (`Solid.extrude_until`: extrude past, split by the target's surface) never measure a distance at all: the extrude ends on the target's own surface.
+
+**Resolution:** `GeometryEngine::reach` (Heavy: on the exact shape; Lite: none). A face: where a line from the profile's middle along the extrude first meets it (`IntCurvesFace_ShapeIntersector`). An edge: its farthest point either way along the extrude (`BRepExtrema_DistShapeShape` against a plane across the extrude, far ahead and far back). A corner: its point. `Document::extrudeReach` uses it before the mesh, which is now only the fallback. The edges and corners are numbered by the same lists the mesh is made from (`shownEdges`, `shownCorners`), so a picked edge is always the same edge. Checked: up to a box's corner and edge, 127.000000000 mm exactly; up to a cylinder's side, 174.600196851 (exact answer 174.600196851); up to its top circle, 225.400000000.
+
+Still different from Fusion: an extrude up to a curved face ends flat, at the point where its middle meets the face. Fusion (and FreeCAD, through `BRepFeat_MakePrism`) end it on the curved face itself. Stock: `IntCurvesFace_ShapeIntersector`, `BRepExtrema_DistShapeShape`. The rest is ours.
+
+#### Extrude lengths in inches
+
+**Problem:** Extrude started at "10 mm", showed All's reach in mm, and a dragged length was rounded to 0.1 mm (0.004 in), while every sketch dimension is in inches. The owner works in inches and thousandths.
+
+**Resolution:** `ExtrudeTool.lenText`: lengths are shown in inches to 0.001 in (`Units.plain`); Extrude starts at 1.000 in, offsets at 0.000 in; a dragged length is that shown value exactly. A plain number typed is inches, as everywhere; "25 mm" still works. The profile gap finder and Mesh to Solid's fit say inches too. Ours.
+
+#### Extrude: exact sketch curves, one boolean per body, no nudges or retries
+
+**Problem:** A spline, ellipse or conic in a sketch reached the engine as its drawn points, so a 300-point spline cut made 7,204 side faces and took 58 s. The extrude also carried workarounds from chasing an angled-wall problem: a 0.05 mm nudge and retry, edge repair, a wall-edge mover, and a volume estimate checked against the result. And each area went through its own boolean.
+
+**Resolution:**
+- `Profile` carries each curve exactly (`Profile::Curve`: B-spline poles, knots, weights, or an ellipse). `Document::exactCurves` tags every profile step lying on one curve. A fit spline is its centripetal Catmull-Rom curve written exactly as Bezier spans, a control spline is its clamped cubic B-spline, a conic is its rational quadratic Bezier. `extrudeOn` makes one exact edge per curve run, and puts corners where the curves truly cross (`Geom2dAPI_InterCurveCurve`).
+- `GeometryEngine::combine(body, tools, op)`: every area of a side goes into one OpenCascade boolean (a list of tools), as FreeCAD and CadQuery do.
+- Whether the boolean did anything comes from its own history (`IsDeleted`, `Modified`), not from volumes. OpenCascade's plain volume of a face with a long spline edge can be out by about 1.3% (a fixed number of sample points per edge). When nothing changed, a point inside each tool is classified to confirm it (`BRepClass3d_SolidClassifier`).
+- Removed: the nudge and retry, the edge repair, `wallEdges`/`moveWallEdges`, `overlapEstimate`/`estimateExtrude`.
+
+300-point spline cut: 8 faces, about 5 s in the app. Stock: `BRepAlgoAPI_Fuse/Cut/Common` with a tool list, `Geom2d_BSplineCurve`, `Geom2d_Ellipse`. Ours: the exact curve forms and the tagging. UI: Extrude, any sketch with curves.
+
+#### Extrude: a taper with spline sides
+
+**Problem:** A taper used `LocOpe_DPrism`. On a spline profile it came out invalid (100 faces) or threw. OpenCascade's other draft tools can't do it either: `BRepOffsetAPI_DraftAngle` only leans flat and round sides (`Draft_Modification_1.cxx` returns "face recomputation" for any other curve), and `BRepOffsetAPI_MakeDraft` crashed on a spline. FreeCAD lofts to an offset copy of the outline (approximate corners), and CadQuery uses `LocOpe_DPrism`. `LocOpe_DPrism` was also wrong on every widening taper: a 10 mm square, 8 mm at +5 degrees gave 916.089 mm³, where the exact figure is 917.211.
+
+**Resolution:** `taper::prism` (`src/engine/heavy/taper.cpp`), drafting each side on its own as a commercial kernel does:
+- A straight edge leans as a plane, an arc as a cone, and a spline or ellipse as the ruled surface its leaning lines sweep. That last is approximated to 0.0000001 mm (`AdvApprox_ApproxAFunction`, cut at the curve's own knots), with each bottom point paired with its own top point.
+- Each corner runs up where the two sides beside it truly meet. It is followed by Newton's method on the two grown outlines, then fitted to 0.0000001 mm. Corners where the sides carry on smoothly run straight up. A side may run past its edge's end (its natural continuation) to reach a corner.
+- The edges' curves on each face are written directly, not projected.
+- Refused, with the reason given: an edge shrinking to nothing before the top, sides running into each other (`BOPAlgo_CheckerSI` to level 4, edges through faces), and a top outline crossing itself (`BRepCheck_Analyzer`). Level 5 is left out: it intersects every curved face with itself over its whole parameter box, so a closed spline side with a sharp start always fails at its own seam (`BOPAlgo_CheckerSI.cxx`, `CheckFaceSelfIntersection`).
+- Positive widens the shape as it goes (Fusion's way, as before).
+
+Checked against exact volumes: square, circle (cone frustum), slot, and a D shape (sharp plane/cone corners), each at ±10 and ±30 degrees, all within 0.00000001 relative. Spline flower at ±3 and −10 degrees within 0.00004 against dense offset points. Star cut with a 5 degree taper in the app: 173,578.39 mm³, exact. 3 to 50 ms per side set. Stock: `Geom_Plane`, `Geom_ConicalSurface`, `Geom_BSplineSurface`, `AdvApprox`, `BOPAlgo_CheckerSI`. Ours: the builder. UI: Extrude, Taper angle.
+
+#### Extrude and booleans: why a result was refused, said plainly
+
+**Problem:** A failed extrude said only "Nothing was made", or "couldn't be built ... left as it was", with no reason. And a cut whose walls lay a hair off a converted model's own walls came back valid and closed, but with 106 edges shared by more than two faces and next to nothing cut away. It was kept.
+
+**Resolution:**
+- `GeometryEngine::whyNot()`: the reason for the last extrude or combine that gave nothing. The extrude's note carries it: "The cut couldn't be built on Body3: the result would touch itself along a line, leaving a face with no area there. It was left as it was." The same goes for areas that couldn't be extruded at all (a taper too steep, an outline that doesn't close).
+- A boolean's result is kept only if:
+  - no edge or corner had to be loosened past 0.00001 in (0.000254 mm), or past the loosest of the shapes it started from, whichever is larger (`loosest`, `kAccuracy`). Reason: "the shapes don't quite meet where they should: the result would be looser than 0.00001 in there".
+  - no face has zero area (`hasEmptyFace`). Reason: "the result would touch itself along a line, leaving a face with no area there".
+  - it is a valid closed solid (`soundSolid`). Reason: "the result wouldn't be a sound solid".
+- The merged result is tried first, then the unmerged one. If both fail, the more telling reason is given: loosened, then empty face, then unsound.
+- Material that touches itself along a line or at a point is kept, as drawn (the owner's choice): a star whose tips land exactly on the block's walls, a bow-tie whose triangles meet at a point. Edges shared by more than two faces are allowed.
+
+Checked: the star on the walls and the bow-tie are kept, loosest edge 0.0000001 mm, exact volumes. A self-crossing spline figure-eight is refused (a face of no area). The cut on a converted speaker mount is refused (edges loosened to 0.3 mm). Stock: `BRepCheck_Analyzer`, `BRepGProp`, `BRep_Tool::Tolerance`. Ours: the rule and the reasons. UI: the Extrude note.
+
+#### Face move: checked by self-intersection, not volume
+
+**Problem:** A moved face (`pushFace`) was checked by comparing the volume change against the face's area times the distance, with 1% slack. Volumes are unreliable on spline faces (see above), and the slack could hide a small collision.
+
+**Resolution:** The moved body must pass `BOPAlgo_CheckerSI` to level 4 (no edge passing through a face). The block's top face moved up and down 5 mm: exact, checked in 0.00 to 0.05 s. Stock: `BOPAlgo_CheckerSI`. UI: Extrude of a body's own face, no taper.
+
+#### Booleans: the model holds 0.00001 in
+
+**Problem:** The model was to hold 0.0001 in. That is now 0.00001 in (0.000254 mm). And faces of one surface merged after a join, cut or intersect within 0.000001 rad: over a 20 ft face, two faces that far apart in angle lean 0.006 mm (0.00024 in) apart at the far end, and the merge keeps one of them.
+
+**Resolution:**
+- `kAccuracy` is 0.000254 mm: a boolean whose result had to be loosened past that (or past the shapes that went in) is refused with "the result would be looser than 0.00001 in there".
+- `kMergeAngular` is 0.00000001 rad: 0.00006 mm over 20 ft. `kMergeLinear` stays 0.0001 mm (0.0000039 in).
+
+Stock: `ShapeUpgrade_UnifySameDomain`. Ours: the limits. UI: none; the Extrude note gives the reason.
+
+#### Extrude: a line crossing a curve meets it exactly, at any size
+
+**Problem:** A straight line drawn across a 10 ft spline flower came out as a wall turned 0.0002 rad (0.012 degrees) in plan: 0.4 mm off at its ends. The profile's corner where the line crosses the curve is found on the curve's straight sample steps. The engine moves it onto the true crossing (`Geom2dAPI_InterCurveCurve`), but took that crossing only within 0.05 mm of the drawn corner. On a big curve the steps bow further than that off it (40 mm steps on the 10 ft flower), so the corner stayed on the curve at a point part way between two samples, off the line.
+
+**Resolution:** The crossing is taken up to one sample step's length either side of the drawn corner (at least 0.05 mm). The 10 ft flower's four trimmed flats are now within 0.0000000000002 mm of the lines drawn.
+
+Stock: `Geom2dAPI_InterCurveCurve`. Ours: the reach. UI: none.
+
+#### Extrude: a curve closing on itself at a corner is two edges
+
+**Problem:** A figure-eight drawn as one spline was refused at 100 mm ("a face with no area"), yet built at 10 ft. Its left lobe runs from the crossing round to the crossing: one edge, starting and ending at the same corner. Swept up, the lobe's wall became one face that wraps round to itself over a seam. A seam is how a smoothly closed surface (a cylinder) is held, not a sharp corner. The cut kept that wall with no area. At 10 ft the test's trim lines happened to split the lobe, which hid it.
+
+**Resolution:** A curve run that comes back to its own start with a sharp corner there (tangents more than 0.0000001 rad apart) is made as two edges, split at the middle of its range, as a whole circle already is. The crossing is then a real corner edge between two faces. A curve that closes smoothly (a closed spline flower) stays one edge.
+
+Checked: the 100 mm figure-eight builds valid, its opening at the top and its floor 1761.670661387 mm² both (walls straight), volume exact. Its lobes touch along one line at the crossing, kept as for the bow-tie.
+
+Stock: `BRepBuilderAPI_MakeEdge`. Ours: the split. UI: none.
+
+#### Extrude: an arc crossing a line meets it exactly, on its own circle
+
+**Problem:** A gear with a bore and bolt holes cut through a 10 ft plate left its arc walls up to 0.005 mm off the arcs drawn (0.00017 mm at 100 mm). Where an arc meets a line, the profile's corner is found on the arc's straight sample steps, on a chord inside the circle. The step from the last sample to that corner was not marked as on the arc, so it was built flat. The corner was left where it was found, because corners were only moved onto the true crossing next to a spline, ellipse or conic. And the arc was made through three of its points, which gives a circle of their own, off the drawn one by their error.
+
+**Resolution:**
+- The sketch marks a step as on an arc when both its ends lie on the arc's drawn path, even if one end is a crossing inside the circle (`Document::arcCentres`).
+- An arc's radius is the largest distance of its samples from its centre, since a crossing lies inside the circle.
+- An arc meeting a line or another arc gets its corner moved onto the true crossing of the circle and the line (`Geom2dAPI_InterCurveCurve`), within one sample step. Two lines still meet where they were drawn.
+- The arc edge is made on the drawn circle itself (its centre and radius), from corner to corner, round the way its samples go.
+
+Checked: every wall of the bore-and-bolt-hole gear within 0.00000000003 mm of the circles drawn, at 100 mm and 10 ft. Circles that meet nothing were already exact.
+
+Stock: `Geom2dAPI_InterCurveCurve`, `GC_MakeArcOfCircle` (circle and two points). Ours: the marking, the radius, the corner rule. UI: none.
+
+#### Booleans: a flat face through an extruded curve's wall meets it exactly
+
+**Problem:** A 32-tooth spline gear cut through a plate was refused at both sizes ("the result would be looser than 0.00001 in there"), and so was a spline gear body's face cut through one. Where the plate's bottom face crosses a tooth's wall, OpenCascade works the edge out as it does any free-form crossing: by walking along it and fitting a curve (`IntPatch_Intersection::GeomParamPerfom`, `IntPatch_ImpPrmIntersection`; read in the 7.9.3 source). It has no exact case for a plane and a wall swept from a curve. The fitted edges were 0.0013 mm loose at 100 mm and 0.036 mm loose at 10 ft. A cut that starts on a face, or ends exactly on one, never showed this, because there the faces lie in one plane and the tool's own exact edges are used.
+
+**Resolution:** After the boolean, before the merge (`exactSections`), the engine looks at each new edge between:
+- a wall swept straight from a curve that lies square to the sweep (`Geom_SurfaceOfLinearExtrusion`), and
+- a flat face square to that sweep.
+
+That edge is exactly the wall's curve, moved to the face's height. It gets:
+- that curve as its curve;
+- the wall's own line at that height as its place on the wall;
+- the curve laid flat as its place on the face.
+
+Where it starts and ends along the curve is read off its own place on the wall (the wall's first parameter is the curve's). It is not found by projecting its corners, because on a curve that comes near itself (a figure-eight's crossing) a projection lands on the other branch: that gave a 6096 mm loose edge before it was changed. Its new corners are put on it, and its tolerance becomes what it really needs, measured (`ShapeAnalysis_Edge::CheckSameParameter`, then `BRepLib::UpdateTolerances`). The result is used only if it comes out valid and no looser than the boolean's own. Otherwise the boolean's own is kept, as it was in a few full-suite cases already within the limit. The work is done on a copy. Edges and corners of the bodies that went in are never moved, so undo keeps them as they were. This works both ways round: a tool's spline walls through a body's faces, and a body's spline walls through a tool's floor.
+
+Checked: the spline gear cut through, and the spline gear body's face cut through, at 100 mm and 10 ft. 64 to 88 edges made exact each time. Loosest edge 0.0000051 mm, no edge on more than two faces, every wall within 0.00000000003 mm of the splines drawn, valid.
+
+Stock: `BRepBuilderAPI_Copy`, `GeomAPI::To2d`, `ShapeAnalysis_Edge`, `BRepLib::UpdateTolerances`. Ours: the exact crossing. UI: none.
+
+#### Booleans: exact crossings hold at 100 ft too
+
+**Problem:** At 100 ft (a 100 ft plate, 40 ft thick) two cuts were still refused:
+- A 300-point wavy spline cut through. OpenCascade's fitted edges across the plate's bottom strayed 3.3 mm off mid-span. That was past the fixed 0.1 mm the exact-crossing step allowed when confirming it had the right edge, so it skipped them.
+- A spline figure-eight cut through. Four exact edges met at the crossing on the plate's bottom, but two ended 0.0012 mm away. Their ends had been read off OpenCascade's fitted places on the wall.
+
+**Resolution:**
+- An edge is confirmed as lying along the wall's curve within twice what the boolean itself says it may be off (its tolerance), not a fixed distance.
+- An end at an upright edge (a straight edge along the sweep) is put exactly where that edge stands on the face's plane. It is found from the fitted end by Newton's method along the curve: a local step, so it can't jump to another branch of a curve that comes near itself.
+- Every corner of a profile where a curve meets a line, an arc or itself is polished to the crossing by Newton's method on the two curves, after `Geom2dAPI_InterCurveCurve` finds it. Two areas sharing one crossing (a figure-eight's lobes) then put their corners on the very same point.
+- A refusal for looseness now writes its loosest edges and corners to the window's log, with what each lies between and where. Any refusal can be traced afterwards.
+
+Checked: the hammer suite (`history/tools/probes/suitehammer`), 19 cases at 100 mm, 10 ft and 100 ft:
+- splines and gears through, exactly to the bottom, 3x deeper, partway;
+- another body's face as the profile;
+- slots, rounded rectangles, D shapes, keyholes, overlapping circles, a plate with 12 holes and a slot;
+- bow-tie, heptagram, figure-eight, star over circle.
+
+Stock: `Geom2dAPI_InterCurveCurve`. Ours: the polish, the upright ends, the bound, the log. UI: none; the log is the window's.
+
+#### Display: walls swept from a curve meshed without interior checks
+
+**Problem:** A 32-tooth spline gear cut through a 40 ft plate took 8 s, and 6.4 s of that was making the triangles to draw. Delabella leaves walls swept from a curve bare, so they go to the standard mesher (Watson). Watson also checked how far the inside of each wall strays from its triangles. That filled the 44 tall walls with 524,812 triangles.
+
+**Resolution:** A wall swept straight from a curve is straight from end to end. Triangles between the points of its edges are as close to it as those points are to the curve, so for those faces (`GeomAbs_SurfaceOfExtrusion`) only, the inside isn't checked (`ControlSurfaceDeflection` off). The same 44 walls now take 0.05 s and 2,480 triangles. Every other face is meshed as before.
+
+Stock: `BRepMesh_IncrementalMesh`, `IMeshTools_Parameters`. Ours: the per-face setting in `HeavyEngine::mesh`. UI: none.
+
+#### Booleans: a body OpenCascade calls invalid is put right before a join, cut or intersect
+
+**Problem:** A model converted from a mesh by an older OmaMake came in with 47 flat strips about 0.01 mm wide, left between its faces. Its edges are up to 0.05 mm loose. In one strip, three edges don't meet on the face. OpenCascade's check therefore calls the whole body invalid, and every cut of it was refused as "not a sound solid". Before that check was added, the same cuts went through.
+
+**Resolution:** Before a join, cut or intersect, each body is checked once (a body never changes once made, so the answer is kept per body). A body that fails the check, or has an edge with a face on one side only, is put right on a copy with OpenCascade's standard Shape Healing:
+- `ShapeFix_Shape` first: wires, their order and direction, edges and their curves on the faces.
+- Then `ShapeFix_FixSmallFace`: faces narrower than the body's own loosest edge are folded into the faces beside them.
+
+Both work within the body's own loosest edge or corner, never past it. The fix is kept only if:
+- the body comes out sound;
+- it is no looser than before;
+- every corner of the fixed body lies within that same distance of a corner of the old one.
+
+The faces keep their own surfaces, so that is the same shape. The original body stays untouched, for undo. Results the Boolean has already checked in full are marked sound and not checked again. The window's log says when a body was put right, how, and how long it took.
+
+On that model the 47 strips are folded away in 0.3 s (the first check takes 0.1 s). The body loses 0.0066 mm² of surface and keeps its box exactly.
+
+**Not covered:** that is not enough for that model's cuts. Cut upward with its own outline (5 mm, 20 mm, or up to its shoulder), the Boolean still can't tell inside from outside. The part to be cut away is kept as a second solid, and the thread's faces are left inside the material. Its curved faces really don't meet its flat ones (231 edges lie over 0.001 mm off their faces in 3D, the worst 0.05 mm), and the tool's walls lie on the body's walls within that. No repair short of refitting the surfaces tightens that. Those cuts are now refused, with a log (next two entries). A first version of this entry said the 20 mm cut went through: it was accepted, but broken in the same way, which the next entry's checks now catch.
+
+Stock: `ShapeFix_Shape`, `ShapeFix_FixSmallFace`, `BRepCheck_Analyzer`, `ShapeAnalysis_Shell`. Ours: when it runs, the limits, the corner check, the per-body memory. UI: none; the log is the window's.
+
+#### Booleans: a result with faces left inside, or a shell that isn't closed, is refused
+
+**Problem:** A cut of a converted model came back from OpenCascade's Boolean "valid" by its own check (`BRepCheck_Analyzer`), with no edge that has a face on one side only, but broken:
+- two solids, the part meant to be cut away kept as the second;
+- 4 shells that weren't closed;
+- 17 faces marked internal, left inside the material, which showed through the model like a wireframe;
+- nothing removed (35,331 mm³ before and after).
+
+It was accepted and saved.
+
+**Resolution:** A sound solid now also has every shell closed (each edge of a shell used by two of its faces, `BRep_Tool::IsClosed`), and no face marked internal or external. These come before OpenCascade's own check, which passes both. That cut is now refused and the body stays as it was.
+
+Stock: `BRep_Tool::IsClosed`, `TopAbs_INTERNAL`. Ours: `soundSolid`. UI: none.
+
+#### Extrude: checked whole when done; on failure all put back, with a log file
+
+**Problem:** An extrude that went wrong left only a short note on screen and a line or two in the window's log. That wasn't enough to work out why afterwards.
+
+**Resolution:** When an extrude has done everything it was asked, every body it changed or made is checked in full (`GeometryEngine::inspect`: the sound-solid check above, plus no face of no area). If any isn't sound, or any body's join, cut or intersect couldn't be built, or no area could be extruded, all of it is put back as it was, and one log file is written per failure. Dev builds write it to the source folder's `logs/` (`OMAMAKE_SOURCE_DIR`, gitignored); the on-screen note gives its path. The log holds:
+- when it happened, the file, and the engine;
+- what the person was told;
+- the extrude's settings as asked;
+- every step top to bottom with times: the areas (placement, loops, arcs, exact curves), each side (operation, spans, bodies reached), the tools made, each body's operation and its outcome;
+- each engine line above the step it belongs to (`GeometryEngine::takeTrace`), including any repair before use and any refused result described in full;
+- each body and tool as it came out and as it went in, described in full (`describe`): solids, each shell (faces, closed or open, where), faces marked internal (area, where), OpenCascade's findings by kind of piece with where they are, edges with a face on one side only, loosest edge and corner, volume and box.
+
+Stock: `BRepCheck`, `ShapeAnalysis_Shell`, `BRepBndLib`. Ours: the check, the put-back, the log and its contents. UI: the failure note names the log file.
+
+#### Extrude: pieces left apart become bodies of their own
+
+**Problem:** A cut that left pieces standing apart kept them all in the one body as several solids. Cutting only the area between an outline and the circles inside it, for example, leaves a pin where each circle was. Fusion puts each separate piece in as a body of its own.
+
+**Resolution:** After the whole-extrude check passes, each body the extrude changed is looked at for separate solids (`GeometryEngine::pieces`). Where there are several, the biggest by volume stays that body and each other one becomes a new body in the active component's Bodies. A new body made of several solids is split the same way. The geometry isn't touched: each piece is the solid exactly as the Boolean left it, and a body already checked sound passes that on to its pieces. Undo removes the new bodies and puts the original back whole. The log notes each split.
+
+Stock: `TopExp_Explorer` (solids), `BRepGProp`. Ours: `pieces`, which piece keeps the body, where the rest go. UI: the new bodies show in the Browser under the active component's Bodies.
+
+#### Extrude: a new body's faces in one surface made one
+
+**Problem:** A new body extruded from a sketch circle came out with its round side in two half faces and a line down it. A cut or join didn't have this, since a Boolean's result already had its faces merged. A plate with three holes as a new body had 12 faces where it should have 9.
+
+**Resolution:** Each new body not made by a join now gets the same merge as a Boolean's result (`GeometryEngine::merged`): FreeCAD's way (`refine::sameSurfaces`), then OpenCascade's `ShapeUpgrade_UnifySameDomain`, with the same 0.0001 mm and 0.00000001 rad limits. The merged body is kept only if:
+- it has fewer faces;
+- it's a sound solid, with no face of no area;
+- it's no looser than before (or 0.00001 in);
+- its volume is the same to a millionth of a percent.
+
+Otherwise the body stays exactly as it was built, and the log says why.
+
+Stock: `ShapeUpgrade_UnifySameDomain`, `BRepGProp`. Ours: `merged`, the conditions, which new bodies get it. UI: none (one face where there were two).
+
+#### Extrude: Fuzzy profile, tried automatically when the exact one fails
+
+**Problem:** A model whose own faces don't quite meet can't always be cut exactly. A body converted from a mesh is the usual case: neighbouring faces there can be up to 0.05 mm apart. Where an extrude's tool crosses two faces that should share an edge, the two crossings miss each other, nothing closes, and the Boolean fails. Every cut on the converted speaker mount failed this way. A "Fuzzy profile" tick box (2026-11-06) fixed those cuts, but only when someone knew to tick it.
+
+**Resolution:** It is automatic now, and the tick box is gone (2026-11-07). An extrude is tried in this order:
+1. The whole extrude is worked out exactly, as always (`Document::computeExtrudeTrying` calls `computeExtrude` with `job.fuzzy` false). Each Boolean uses `kTouching`, 0.00001 mm, which every extrude has always used.
+2. Only if that failed because a body's join, cut or intersect couldn't be built (`ExtrudeResult::booleanFailed`, set where the step fails in `computeExtrude`) is the whole extrude worked out again from the start, with `job.fuzzy` true. Any other failure (no area could be extruded, a bad setting) is reported as it is, with no second try. Exact models never reach this step.
+3. In the second try each Boolean is still tried exactly first (`HeavyEngine::combine` → `combineAt(…, kTouching)`). Only a Boolean that fails is taken again with `SetFuzzyValue(kFuzzyProfile)`: points up to 0.001 mm (0.00004 in) apart are taken as one place. So only the Booleans that need it are fuzzy.
+4. A fuzzy result passes the same checks as any other Boolean before it's kept: a sound solid (every shell closed, nothing internal or external, OpenCascade's check), no face of no area, and no looser than the loosest input or `kAccuracy` (0.000254 mm, 0.00001 in), whichever is larger. A fuzzy Boolean that fails any of these is refused, the same way an exact one is.
+5. Then the whole-extrude check, the put-back on failure, and the split into separate bodies run as usual (see "Extrude: checked whole when done…").
+
+What the person is told:
+- **Built exactly:** nothing new.
+- **Built on the second try:** after the extrude finishes, a note stays up long enough to read (`ExtrudeTool.qml`, `tool.readingMs`): "This extrude needed Fuzzy profile: the model's faces don't quite meet, so it couldn't be built exactly. Where the profile meets the model it may be off by up to 0.001 mm (0.00004 in)." If the model is looser than that, the note goes on: "The model itself is only exact to N mm (N in) there." N is the loosest edge or corner of the bodies the extrude reached, measured before the extrude (`GeometryEngine::looseness`, Heavy's `loosest`; Lite returns 0). On the converted speaker mount it is 0.052 mm (0.0021 in).
+- **Failed both times:** everything is put back as usual. The note says why, adds "It was tried again with Fuzzy profile (points up to 0.001 mm apart taken as one), and that failed too.", and names one log file holding both tries in order ("first try, exact:", then "second try, automatic, with Fuzzy profile").
+
+The estimate, and why it's honest: fuzzy only joins points within 0.001 mm of each other, so a face it moves moves no further than that. Everywhere else the result is the exact geometry of the profile and the model. A fuzzy result can't come out looser than the model already was (step 4), so the model's own looseness bounds the error where that is the larger figure.
+
+Tolerances in play:
+- `kTouching` 0.00001 mm: every Boolean, every time (Parasolid's session precision).
+- `kFuzzyProfile` 0.001 mm (0.00004 in): the second try only, and only the Booleans that failed exactly (`document.cpp`).
+- `kAccuracy` 0.000254 mm (0.00001 in): the floor for how loose any result may be.
+
+Measured on the converted speaker mount (`history/tools/probes/suitespeaker`, three box cuts through it): all three fail exactly, and each is built on the second try with the note. Each volume is within 0.004 % to 0.021 % of the same cut worked out separately. Each takes about 7 to 10 s in all.
+
+Stock: `BOPAlgo_Options::SetFuzzyValue`, `BRepCheck`. Ours: the two tries and when the second runs, exact first per Boolean, the checks a fuzzy result must pass, the accuracy note, `looseness`, the log of both tries. UI: no tick box; a note after an extrude that needed it.

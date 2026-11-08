@@ -14,6 +14,7 @@ Item {
     required property var theme
     property var commands: []
     property bool open: false
+    property alias queryText: input.text   // the typed words (set by tests)
     property int timesOpened: 0          // remembered (Main.qml Settings); the hint goes after 3
     property int current: 0
     property point mouseAt: Qt.point(-1, -1)
@@ -32,6 +33,36 @@ Item {
 
     // Groups that aren't the mode's own work (modelling or sketching): always below the rest.
     readonly property var asideGroups: ["Look", "File", "App"]
+
+    // The symbol each constraint command shows beside its name (SketchIcon's kinds).
+    readonly property var symbols: ({
+        // constraints
+        "Parallel": "parallel", "Perpendicular": "perpendicular", "Equal": "equal", "Collinear": "collinear",
+        "Horizontal/Vertical": "hv", "Coincident": "coincident", "Midpoint": "midpoint", "Symmetry": "symmetry",
+        "Tangent": "tangent", "Curvature": "curvature", "Concentric": "concentric", "Fix/UnFix": "fix", "Sketch Dimension": "dimension",
+        // sketch tools (each kind has its own)
+        "Line": "line", "Midpoint Line": "midline",
+        "2-Point Rectangle": "rect2", "3-Point Rectangle": "rect3", "Center Rectangle": "rectc",
+        "Center Diameter Circle": "circlec", "2-Point Circle": "circle2", "3-Point Circle": "circle3",
+        "2-Tangent Circle": "circle2t", "3-Tangent Circle": "circle3t",
+        "3-Point Arc": "arc3", "Center Point Arc": "arcc", "Tangent Arc": "arctan",
+        "Inscribed Polygon": "polyin", "Circumscribed Polygon": "polyout", "Edge Polygon": "polyedge",
+        "Center To Center Slot": "slotcc", "Overall Slot": "slotov", "Center Point Slot": "slotcp",
+        "Three Point Arc Slot": "slot3a", "Center Point Arc Slot": "slotca",
+        "Fit Point Spline": "splinefit", "Control Point Spline": "splinectl", "Conic Curve": "conic",
+        "Point": "point", "Ellipse": "ellipse", "Text": "text", "Text on Path": "textpath", "Mirror": "mirror",
+        "Circular Pattern": "patternc", "Rectangular Pattern": "patternr",
+        "Fillet": "fillet", "Equal Distance Chamfer": "chamferequal", "Distance And Angle Chamfer": "chamferangle",
+        "Two Distance Chamfer": "chamfertwo", "Offset": "offset", "Trim": "trim", "Extend": "extend", "Break": "break",
+        "Sketch Scale": "scale", "Blend Curve": "blend", "Move/Copy": "movecopy",
+        "Parameters": "fx", "Project": "project", "Create Sketch": "sketch", "Toggle Construction": "construction",
+        // model tools
+        "Extrude": "extrude"
+    })
+    // The symbol a row shows: a family's row shows its default kind's.
+    function symbolFor(m) {
+        return symbols[m.family && m.def ? m.def.name : m.name] || ""
+    }
 
     // How well a command's name fits what's typed (0: not at all). Best first: the name starts
     // with it; a word in the name does ("r" → 2-Point Rectangle); the words' first letters do
@@ -236,9 +267,21 @@ Item {
                     radius: 10
                     color: index === search.current ? Qt.rgba(theme.accent.r, theme.accent.g, theme.accent.b, 0.16) : "transparent"
 
+                    // A constraint's symbol, left of its name (owner t51u).
+                    SketchIcon {
+                        id: rowIcon
+                        readonly property string symbol: search.symbolFor(modelData)
+                        visible: symbol !== ""
+                        kind: symbol
+                        ink: theme.accent
+                        scale: 1.5                       // half again as large, easier to make out (owner t52u)
+                        anchors.left: parent.left
+                        anchors.leftMargin: 17 + (modelData.depth ? 24 : 0)
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
                     Column {
                         anchors.left: parent.left
-                        anchors.leftMargin: 14 + (modelData.depth ? 24 : 0)
+                        anchors.leftMargin: 14 + (modelData.depth ? 24 : 0) + 34
                         anchors.right: parent.right
                         anchors.rightMargin: 96          // clear of the keys, "default" and the arrow
                         anchors.verticalCenter: parent.verticalCenter

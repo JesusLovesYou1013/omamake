@@ -1,4 +1,4 @@
-QT += core gui qml quick quick3d
+QT += core core-private gui gui-private qml quick quick3d
 
 CONFIG += c++20 release
 TARGET = omamake
@@ -14,18 +14,26 @@ INCLUDEPATH += src
 LIBS += -lmanifold
 # Heavy engine: OpenCascade (exact shapes, STEP).
 INCLUDEPATH += /usr/include/opencascade
-LIBS += -lTKernel -lTKMath -lTKG2d -lTKG3d -lTKGeomBase -lTKBRep -lTKGeomAlgo -lTKTopAlgo -lTKPrim -lTKBO -lTKBool -lTKMesh -lTKShHealing -lTKDESTEP -lTKDESTL -lTKXSBase
+LIBS += -lTKernel -lTKMath -lTKG2d -lTKG3d -lTKGeomBase -lTKBRep -lTKGeomAlgo -lTKTopAlgo -lTKPrim -lTKFeat -lTKBO -lTKBool -lTKHLR -lTKMesh -lTKShHealing -lTKDESTEP -lTKDESTL -lTKXSBase
 
 # The QML files are read from the source tree at startup (no compile for UI changes).
 DEFINES += OMAMAKE_SOURCE_QML_DIR=\\\"$$PWD/qml\\\"
+# Failed operations' logs go in this folder's logs/ (dev builds; gitignored).
+DEFINES += OMAMAKE_SOURCE_DIR=\\\"$$PWD\\\"
 
 HEADERS += \
     src/document/document.h \
+    src/document/expression.h \
+    src/document/parameterfile.h \
     src/document/sketchgeometry.h \
     src/document/profiles.h \
     src/document/projection.h \
     src/engine/engine.h \
     src/engine/heavy/meshsolid.h \
+    src/engine/heavy/refine.h \
+    src/engine/heavy/pushface.h \
+    src/engine/heavy/projectexact.h \
+    src/engine/heavy/taper.h \
     src/theme/dialoglook.h \
     src/theme/omarchytheme.h \
     src/theme/transparency.h \
@@ -34,12 +42,18 @@ HEADERS += \
 SOURCES += \
     src/main.cpp \
     src/document/document.cpp \
+    src/document/expression.cpp \
+    src/document/parameterfile.cpp \
     src/document/sketchgeometry.cpp \
     src/document/profiles.cpp \
     src/document/projection.cpp \
     src/engine/lite/liteengine.cpp \
     src/engine/heavy/heavyengine.cpp \
     src/engine/heavy/meshsolid.cpp \
+    src/engine/heavy/refine.cpp \
+    src/engine/heavy/pushface.cpp \
+    src/engine/heavy/projectexact.cpp \
+    src/engine/heavy/taper.cpp \
     src/theme/dialoglook.cpp \
     src/theme/omarchytheme.cpp \
     src/theme/transparency.cpp \
