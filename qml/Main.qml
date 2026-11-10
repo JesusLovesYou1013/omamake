@@ -272,7 +272,7 @@ Window {
 
             // The body, hidden by its eye in the Browser (the fade is the view's crossfade).
             Node {
-                visible: root.bodyVisible && !rewind.showing
+                visible: root.bodyVisible && !rewind.showing && !rewind.framesShowing && !edgePreviewShown
 
                 Model {
                     geometry: MeshGeometry { id: faces }
@@ -286,6 +286,56 @@ Window {
                 }
                 Model {
                     geometry: MeshGeometry { id: edges; lines: true }
+                    depthBias: -40
+                    materials: PrincipledMaterial {
+                        lighting: PrincipledMaterial.NoLighting
+                        baseColor: theme.modelEdge
+                    }
+                }
+            }
+
+            // Chamfer's preview: the model as the chamfer would leave it, in place of the model (ChamferTool).
+            Node {
+                visible: root.bodyVisible && !rewind.showing && !rewind.framesShowing && edgePreviewShown
+                Model {
+                    objectName: "chamferPreview"
+                    geometry: MeshGeometry { id: chamferFaces }
+                    materials: PrincipledMaterial {
+                        baseColor: theme.model
+                        metalness: navigation.simpleLook ? 0.08 : 0.85
+                        roughness: navigation.simpleLook ? 0.42 : 0.28
+                    }
+                    castsShadows: true
+                    receivesShadows: true
+                }
+                Model {
+                    geometry: MeshGeometry { id: chamferEdges; lines: true }
+                    depthBias: -40
+                    materials: PrincipledMaterial {
+                        lighting: PrincipledMaterial.NoLighting
+                        baseColor: theme.modelEdge
+                    }
+                }
+            }
+
+            // The Timeline's rewind across an Extrude, Chamfer or Fillet (GB-057, GB-058): the model with the step
+            // grown, as real solids, to where the marker is (Document::rewindFramesShow's frame), in place of the model.
+            Node {
+                id: rewindFrameNode
+                visible: rewind.framesShowing     // its own bodies' eyes are in the frame (a first body isn't there yet)
+                Model {
+                    objectName: "rewindFrameModel"
+                    geometry: MeshGeometry { id: rewindFrameFaces }
+                    materials: PrincipledMaterial {
+                        baseColor: theme.model
+                        metalness: navigation.simpleLook ? 0.08 : 0.85
+                        roughness: navigation.simpleLook ? 0.42 : 0.28
+                    }
+                    castsShadows: true
+                    receivesShadows: true
+                }
+                Model {
+                    geometry: MeshGeometry { id: rewindFrameEdges; lines: true }
                     depthBias: -40
                     materials: PrincipledMaterial {
                         lighting: PrincipledMaterial.NoLighting
@@ -1884,7 +1934,7 @@ Window {
         id: sketchBar
         anchors.top: parent.top
         anchors.topMargin: 14
-        guideBelow: extrudeTool.rowsBottom - 14
+        guideBelow: Math.max(extrudeTool.rowsBottom, chamferTool.rowsBottom, filletTool.rowsBottom) - 14
         anchors.horizontalCenter: parent.horizontalCenter
         theme: theme
         sketch: sketch
@@ -2217,6 +2267,8 @@ Window {
             { name: "Grid", hint: navigation.gridVisible ? "Hide the floor grid" : "Show the floor grid", group: "Look", modes: ["model"], keys: "", run: () => navigation.gridVisible = !navigation.gridVisible },
             { name: "Simple Look", words: "fast performance effects", hint: navigation.simpleLook ? "Back to full shading and shadows" : "Fewer effects, for slower computers", group: "Look", modes: ["model"], keys: "", run: () => navigation.simpleLook = !navigation.simpleLook },
             { name: "Extrude", words: "extrude push pull pad boss cut join profile area face distance symmetric two sides new body", hint: "Push profiles or flat faces out into a body, a join, or a cut", group: "Create", modes: ["model"], keys: "E", letter: "e", run: () => Qt.callLater(extrudeTool.begin) },
+            { name: "Chamfer", words: "chamfer bevel edge corner equal distance two distances angle miter blend tangent chain", hint: "Bevel edges: equal, two distances or distance and angle; runs on through where it's too big", group: "Modify", modes: ["model"], keys: "Shift C", run: () => { filletTool.cancel(); Qt.callLater(chamferTool.begin) } },
+            { name: "Fillet", sym: "filletmodel", words: "fillet round radius edge corner constant chord length tangent chain blend", hint: "Round edges: a constant radius or chord length; runs on through where it's too big", group: "Modify", modes: ["model"], keys: "Shift F", run: () => { chamferTool.cancel(); Qt.callLater(filletTool.begin) } },
             { name: "New Component", hint: "An empty component inside the active one, made active", group: "Assemble", modes: ["model"], keys: "", run: () => doc.newComponent() },
             { name: "Browser", hint: browserTree.shown ? "Hide the design tree" : "Show the design tree", group: "Look", modes: both, keys: "", run: () => browserTree.shown = !browserTree.shown },
             { name: "Origin Planes: Cross", hint: "All planes full size, through the centre (how OmaMake opens)", group: "Look", modes: ["model"], keys: "", run: () => root.setPlaneStyle("", "cross") },
@@ -2284,30 +2336,50 @@ Window {
         anchorItem: modeButton
     }
 
-    // Esc: closes the search or menu first (they handle it), then cancels Create Sketch's
-    // pick, then stops panning, then finishes the sketch (same as Finish Sketch, owner
-    // 2026-10-29), then clears the selection.
+    // Esc, the app's one (owner pt158u, GB-056: "clicking escape should just escape out of any tool that I am
+    // using, period"): whatever focus has, the top layer goes. A question or menu first, then the
+    // dimension box, Create Sketch's pick, Find Profile Gaps' rings, panning, a model tool (Extrude: back
+    // from picking an object first; Chamfer, Fillet: nothing applied), a sketch drawing tool, picked
+    // constraint badges, the sketch itself (Finish Sketch, owner 2026-10-29), and last the selection.
+    // The tools' boxes don't take Esc themselves. A tool-options box being typed in (its list, a text's
+    // words) and the Parameters window keep their own Esc.
     Shortcut {
         id: escKey
         sequence: "Esc"
-        enabled: (sketch.picking || sketch.active || navigation.panMode || selection.selected.length > 0)
-                 && !search.open && !modeMenu.open && !planeMenu.open && !dimInput.open
-        onActivated: {
-            if (sketch.picking)
-                sketch.picking = false
-            else if (root.gapsOn)
-                root.hideGaps()                      // Find Profile Gaps' rings go first
-            else if (navigation.panMode)
-                navigation.panMode = false
-            else if (sketchTools.tool)
-                sketchTools.cancel()                 // a drawing tool stops first, then the sketch
-            else if (sketchTools.pickedConstraints.length)
-                sketchTools.pickedConstraints = []   // then picked constraint badges
-            else if (sketch.active)
-                sketch.finish()
-            else
-                selection.clear()
-        }
+        context: Qt.ApplicationShortcut
+        enabled: !parametersWindow.open && !toolOptions.typing && !textEdit.typing
+        onActivated: root.escTop()
+    }
+    function escTop() {
+        if (breakAsk.shown)
+            breakAsk.shown = false
+        else if (search.open)
+            search.open = false
+        else if (modeMenu.open)
+            modeMenu.close()
+        else if (planeMenu.open)
+            planeMenu.close()
+        else if (dimInput.open)
+            dimInput.cancel()
+        else if (sketch.picking)
+            sketch.picking = false
+        else if (root.gapsOn)
+            root.hideGaps()
+        else if (navigation.panMode)
+            navigation.panMode = false
+        else if (extrudeTool.open)
+            extrudeTool.cancel()
+        else if (chamferTool.open || filletTool.open) {
+            chamferTool.cancel()
+            filletTool.cancel()
+        } else if (sketchTools.tool)
+            sketchTools.cancel()                 // a drawing tool stops first, then the sketch
+        else if (sketchTools.pickedConstraints.length)
+            sketchTools.pickedConstraints = []
+        else if (sketch.active)
+            sketch.finish()
+        else
+            selection.clear()
     }
     // Sketch mode's keys (SketchKeys.js; owner, 2026-10-30): every sketch tool's and
     // constraint's `keys`, and each family's (Families.js). A family's key runs its default
@@ -2346,10 +2418,35 @@ Window {
         id: extrudeKey
         sequence: "E"
         enabled: !sketch.active && !sketch.picking && !search.open && !modeMenu.open && !planeMenu.open
-                 && !dimInput.open && !toolOptions.typing && !extrudeTool.open && !doc.working
+                 && !dimInput.open && !toolOptions.typing && !extrudeTool.open && !chamferTool.open && !filletTool.open && !doc.working
         onActivated: {
             noteUse("Extrude")
             extrudeTool.begin()
+        }
+    }
+    // Shift+F Fillet, Shift+C Chamfer (owner, pt157u, GB-055: Fusion has F for Fillet and none for Chamfer;
+    // F is the sketch's Fillet here, and in a sketch Shift+F / Shift+C stay Fix/UnFix and Coincident).
+    // Model only, as E; not while a box is being typed in (a text box takes its own keys first).
+    readonly property bool modelKeysOn: !sketch.active && !sketch.picking && !search.open && !modeMenu.open && !planeMenu.open
+                                        && !dimInput.open && !toolOptions.typing && !extrudeTool.open && !doc.working
+    Shortcut {
+        id: filletKey
+        sequence: "Shift+F"
+        enabled: root.modelKeysOn && !filletTool.open
+        onActivated: {
+            noteUse("Fillet")
+            chamferTool.cancel()
+            filletTool.begin()
+        }
+    }
+    Shortcut {
+        id: chamferKey
+        sequence: "Shift+C"
+        enabled: root.modelKeysOn && !chamferTool.open
+        onActivated: {
+            noteUse("Chamfer")
+            filletTool.cancel()
+            chamferTool.begin()
         }
     }
     // S: the command search (Fusion's S opens its shortcuts box; Alt+Space works everywhere).
@@ -2614,6 +2711,35 @@ Window {
         z: 35
         onSay: (text, ms) => sketch.say(text, ms)
     }
+    // Model Chamfer and Model Fillet: one tool (EdgeTool.qml), one at a time, sharing the preview's meshes.
+    EdgeTool {
+        id: chamferTool
+        feature: "chamfer"
+        anchors.fill: parent
+        theme: theme
+        selection: selection
+        previewFaces: chamferFaces
+        previewEdges: chamferEdges
+        project: p => root.toScreen(p)
+        fadeMs: root.fadeMs
+        z: 35
+        onSay: (text, ms) => sketch.say(text, ms)
+    }
+    EdgeTool {
+        id: filletTool
+        feature: "fillet"
+        anchors.fill: parent
+        theme: theme
+        selection: selection
+        previewFaces: chamferFaces
+        previewEdges: chamferEdges
+        project: p => root.toScreen(p)
+        fadeMs: root.fadeMs
+        z: 35
+        onSay: (text, ms) => sketch.say(text, ms)
+    }
+    readonly property bool edgePreviewShown: chamferTool.previewShown || filletTool.previewShown
+    Binding { target: doc; property: "chamferPreviewShown"; value: root.edgePreviewShown }
     ParametersWindow {
         id: parametersWindow
         theme: theme
@@ -2685,9 +2811,9 @@ Window {
         // in a sketch, the history from doc.sketchReadyFrom on (and this opening's own steps, always).
         readyCount: sketch.active ? doc.sketchReadyFrom : doc.modelReadyFrom
         readyDone: sketch.active ? doc.sketchWalkDone : doc.modelBuildDone
-        builtCount: sketch.active ? -1 : doc.modelBuiltTo
+        builtCount: sketch.active ? -1 : Math.max(doc.modelBuiltTo, doc.modelBuildingTo)   // the progress fill follows the rebuild itself (GB-062)
         marker: rewind.pos
-        markerEnabled: !extrudeTool.open && !sketchTools.tool && !doc.working
+        markerEnabled: !extrudeTool.open && !chamferTool.open && !filletTool.open && !sketchTools.tool && !doc.working
         frozen: markerHeld || settling.running
         onMarkerDragged: position => rewind.goTo(position)
         onMarkerDropped: rewind.settle()
@@ -2720,7 +2846,17 @@ Window {
         readonly property real low: built * spanLow
         readonly property real high: built * spanHigh
         readonly property real glowWidth: Math.max(0.3, reach * 0.04)
-        readonly property bool showing: built > 0 && built < 1 && stepItem >= 0 && reach > 0
+        readonly property bool showing: built > 0 && built < 1 && stepItem >= 0 && reach > 0 && !framesStep
+        // Part way across an Extrude, Chamfer or Fillet (GB-057 pt159u, GB-058 pt160u: "represent the actual object
+        // in real time, in real space"): the step grown to `built` as real solids (frames off the main thread,
+        // Document::rewindFramesBegin). The plane split above is left for the other steps.
+        property bool framesStep: false
+        property int frameShown: 0         // the frame drawn (0: none, the design as it is shows)
+        readonly property bool framesShowing: built > 0 && built < 1 && stepItem >= 0 && framesStep && frameShown > 0
+        function showFrame() {
+            frameShown = framesStep && built > 0 && built < 1 ? doc.rewindFramesShow(built, rewindFrameFaces, rewindFrameEdges) : 0
+        }
+        onBuiltChanged: if (framesStep) showFrame()
         function prepare(k) {
             if (stepItem === k)
                 return
@@ -2728,6 +2864,7 @@ Window {
             const n = historyTimeline.countAt(k + 1) - historyTimeline.countAt(k)
             const st = doc.rewindStep(n)
             step = st
+            framesStep = doc.rewindFramesBegin(n)
             if (!st.axis) {
                 spanLow = 0
                 spanHigh = 0
@@ -2895,6 +3032,7 @@ Window {
     // when the row changes under it (a sketch opened or left, a run of moves opened out or folded).
     Connections {
         target: doc
+        function onRewindFrameReady() { rewind.showFrame() }
         function onHistoryChanged() {
             if (!rewind.moving && !historyTimeline.markerHeld && !settling.running) {
                 rewind.stepItem = -1
@@ -2951,7 +3089,6 @@ Window {
         visible: opacity > 0
         focus: shown
         Behavior on opacity { NumberAnimation { duration: 150 } }
-        Keys.onEscapePressed: shown = false
         function answer(yes) {
             shown = false
             if (!yes)
@@ -3040,7 +3177,7 @@ Window {
         radius: height / 2
         color: Qt.rgba(theme.panelBg.r, theme.panelBg.g, theme.panelBg.b, 0.6)
         border.color: Qt.rgba(theme.border.r, theme.border.g, theme.border.b, 0.6)
-        opacity: search.timesOpened >= 3 || search.open || sketch.active || sketch.picking || extrudeTool.open ? 0 : 0.85
+        opacity: search.timesOpened >= 3 || search.open || sketch.active || sketch.picking || extrudeTool.open || chamferTool.open || filletTool.open ? 0 : 0.85
         visible: opacity > 0
         Behavior on opacity { NumberAnimation { duration: 400 } }
 

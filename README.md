@@ -2,7 +2,7 @@
 
 A parametric 3D CAD program made for [Omarchy](https://omarchy.org), and for any Linux system.
 
-**Status: version 0.51.** Sketch mode is about 95% done, and Extrude is the first modelling tool. The Timeline scrubs back and forth over every step, also in files opened from disk. The other modelling tools are next.
+**Status: version 0.52.** Sketch mode is about 95% done. Extrude, Chamfer and Fillet are the modelling tools so far. The Timeline scrubs back and forth over every step, also in files opened from disk, and shows a chamfer, fillet or extrude growing as you drag. The other modelling tools are next.
 
 ## What works so far
 
@@ -15,6 +15,7 @@ A parametric 3D CAD program made for [Omarchy](https://omarchy.org), and for any
 - **Project.** Throw the whole model's outline, or any face's, flat or curved, straight onto a sketch as lines, arcs and circles.
 - **Importing.** STEP, STL and OBJ files come in as solids. Fit Curved Surfaces turns a mesh's facets into true cylinders, cones, spheres, fillets and threads. It's been proven on one threaded part so far.
 - **Extrude.** Pull a closed sketch profile or a flat face into a new body, or join, cut or intersect with the bodies already there.
+- **Chamfer and Fillet** (Shift+C, Shift+F). Bevel or round edges, every edge of a face, or a single corner or cone tip, with a live preview you drag or type into. Equal, Two Distances and Distance and Angle chamfers; Constant Radius and Chord Length fillets. Sizes too big for the space keep cutting evenly until the cuts meet (a cylinder's two rims rounded to its radius make a sphere), and chamfers and fillets that run into each other blend in either order.
 - **Exporting** a body as a STEP file.
 - **Saving.** Save and Save As (Ctrl+S, Ctrl+Shift+S, or search) write the whole design, its sketches, constraints and history to a readable `.omamake` file, in `~/Documents/OmaMake` unless you pick another folder. Opening comes next.
 - **One history.** Every action is kept in order and Ctrl+Z steps back through all of them, in and out of sketches. The Timeline along the bottom shows it: a sketch is one point there, and inside a sketch you see only that sketch's own steps. Drag the marker back and forth to see the design as it was at any step; in an opened file the steps are rebuilt in the background while you keep working, and a faint fill shows how far they're ready.

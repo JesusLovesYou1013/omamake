@@ -14,7 +14,7 @@ INCLUDEPATH += src
 LIBS += -lmanifold
 # Heavy engine: OpenCascade (exact shapes, STEP).
 INCLUDEPATH += /usr/include/opencascade
-LIBS += -lTKernel -lTKMath -lTKG2d -lTKG3d -lTKGeomBase -lTKBRep -lTKGeomAlgo -lTKTopAlgo -lTKPrim -lTKFeat -lTKBO -lTKBool -lTKHLR -lTKMesh -lTKShHealing -lTKDESTEP -lTKDESTL -lTKXSBase
+LIBS += -lTKernel -lTKMath -lTKG2d -lTKG3d -lTKGeomBase -lTKBRep -lTKGeomAlgo -lTKTopAlgo -lTKPrim -lTKFeat -lTKFillet -lTKOffset -lTKBO -lTKBool -lTKHLR -lTKMesh -lTKShHealing -lTKDESTEP -lTKDESTL -lTKXSBase
 
 # The QML files are read from the source tree at startup (no compile for UI changes).
 DEFINES += OMAMAKE_SOURCE_QML_DIR=\\\"$$PWD/qml\\\"
@@ -32,12 +32,14 @@ HEADERS += \
     src/engine/heavy/meshsolid.h \
     src/engine/heavy/refine.h \
     src/engine/heavy/pushface.h \
+    src/engine/heavy/chamfer.h \
     src/engine/heavy/projectexact.h \
     src/engine/heavy/taper.h \
     src/theme/dialoglook.h \
     src/theme/omarchytheme.h \
     src/theme/transparency.h \
-    src/view/meshgeometry.h
+    src/view/meshgeometry.h \
+    src/view/modifierkeys.h
 
 SOURCES += \
     src/main.cpp \
@@ -52,12 +54,14 @@ SOURCES += \
     src/engine/heavy/meshsolid.cpp \
     src/engine/heavy/refine.cpp \
     src/engine/heavy/pushface.cpp \
+    src/engine/heavy/chamfer.cpp \
     src/engine/heavy/projectexact.cpp \
     src/engine/heavy/taper.cpp \
     src/theme/dialoglook.cpp \
     src/theme/omarchytheme.cpp \
     src/theme/transparency.cpp \
-    src/view/meshgeometry.cpp
+    src/view/meshgeometry.cpp \
+    src/view/modifierkeys.cpp
 
 # Qt Quick shaders (2D effects) are compiled to .qsb beside their source, where the QML reads them.
 QSB_SOURCES = $$PWD/qml/shaders/crossfade.frag

@@ -109,6 +109,26 @@ struct FitResult {
     double worstMm = 0;         // the furthest a source point ended up from its surface
 };
 
+// Model Chamfer and Model Fillet (one pipeline, GB-051): one edge to chamfer or round, as its selection set gives it.
+struct ChamferEdge {
+    int edge = -1;          // numbered as in the body's mesh
+    int set = 0;            // its selection set: d1 is measured on the face most of the set's edges share
+    int kind = 0;           // chamfer: 0 Equal Distance, 1 Two Distances, 2 Distance and Angle; fillet: 3 radius d1, 4 chord length d1
+    double d1 = 1, d2 = 1;  // mm
+    double angle = 45;      // degrees, between the bevel and d1's face
+    bool flip = false;      // d1 (and the angle) on the other face
+    double at = 0.5;        // chamferSections only: where along the edge, 0 its start to 1 its end
+    int point = -1;         // GB-053: a corner (point) instead of an edge, numbered as in the body's mesh points;
+                            // chamfer: a flat across the point's equal-angle axis d1 in, fillet: a round of radius
+                            // d1 (chord: d1 the diameter of the circle it touches the faces in)
+};
+enum class ChamferCorner { Chamfer, Miter, Blend };
+struct ChamferReport {
+    std::vector<int> ranThrough;    // too big for the faces beside them: carried on through what lies there
+    std::vector<int> skipped;       // left sharp
+    std::string note;
+};
+
 class GeometryEngine {
 public:
     virtual ~GeometryEngine() = default;
@@ -196,6 +216,27 @@ public:
         (void)body; (void)kind; (void)index; (void)plane; (void)pieces;
         why = "this engine has no exact edges";
         return false;
+    }
+    // Model Chamfer / Fillet: a new body, `body` with these edges bevelled (or rounded, kinds 3 and 4: all of one
+    // call are one or the other); corners where they meet as `corner` says (chamfers).
+    // An edge too big for its faces runs through (see ENGINE-HANDOFF "Chamfer"); `report` names those and any
+    // left sharp. 0 and whyNot() when nothing could be done (the Lite engine has no edges to chamfer).
+    virtual BodyId chamfer(BodyId body, const std::vector<ChamferEdge> &edges, ChamferCorner corner, ChamferReport &report) {
+        (void)body; (void)edges; (void)corner;
+        report.note = "Chamfer and Fillet need the exact engine";
+        return 0;
+    }
+    // One face's edges (numbered as in the mesh); every edge joined on smoothly to these, on and on (Tangent
+    // Chain); and a feature's edges: those of `now` on faces lying where `after` has a face `before` hadn't
+    // (before 0: all of after's).
+    virtual std::vector<int> faceEdges(BodyId body, int face) const { (void)body; (void)face; return {}; }
+    virtual std::vector<int> tangentChain(BodyId body, const std::vector<int> &edges) const { (void)body; return edges; }
+    virtual std::vector<int> featureEdges(BodyId now, BodyId before, BodyId after) const { (void)now; (void)before; (void)after; return {}; }
+    // Where each edge's chamfer lies halfway along it: 9 numbers (the edge's point, the bevel's end on d1's face,
+    // on the other face), empty when it can't say.
+    virtual std::vector<std::vector<double>> chamferSections(BodyId body, const std::vector<ChamferEdge> &edges) const {
+        (void)body;
+        return std::vector<std::vector<double>>(edges.size());
     }
     virtual BodyId translate(BodyId body, double x, double y, double z) = 0;
     // Read a STEP file, in its own position and sized in mm whatever its units. 0 and why if it

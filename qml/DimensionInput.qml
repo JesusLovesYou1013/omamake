@@ -66,6 +66,11 @@ Item {
         field.forceActiveFocus()
         field.selectAll()
     }
+    // Esc (Main.qml's one Esc): the typed value dropped, the box shut.
+    function cancel() {
+        cancelled()
+        close()
+    }
     function close() {
         if (!open)
             return
@@ -139,7 +144,6 @@ Item {
             Keys.onTabPressed: if (box.picks.length) box.pick(box.pickAt)
             Keys.onDownPressed: if (box.picks.length) box.pickAt = (box.pickAt + 1) % box.picks.length
             Keys.onUpPressed: if (box.picks.length) box.pickAt = (box.pickAt + box.picks.length - 1) % box.picks.length
-            Keys.onEscapePressed: { box.cancelled(); box.close() }
         }
     }
     // The parameters that fit what is being typed.

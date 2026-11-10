@@ -8,7 +8,8 @@ import QtQuick
 // conic, point, ellipse, text, mirror, patterns, fillet, chamfers, offset, trim, extend, break,
 // scale, blend, move/copy, delete, construction, project, create sketch; and in the model, extrude.
 // Drawn here so it looks the same in every font. `kind` is a constraint type (any type the solver
-// knows is mapped by `kindFor`), `ink` the colour. Size 18 by default (the glyph is drawn in 16).
+// knows is mapped by `kindFor`), `ink` the colour. Size 18 by default (the glyph is drawn in 16); any other size
+// paints the glyph at that size (GB-059), so it stays sharp.
 //   horizontal —   vertical |   parallel //   perpendicular ⊥   equal =   collinear —•—
 //   coincident ●   online ○   midpoint ▲   symmetry •|•   fix (a lock)   unfix (an open lock)
 //   tangent (a ring on a line)   concentric ◎   pattern (three dots)
@@ -19,10 +20,17 @@ Canvas {
     id: icon
     property string kind: ""
     property color ink: "white"
+    // Icon sizing standard (GB-060, owner pt162u: the Fillet / Chamfer size "would be the standard size for
+    // sizing going forward"): where a symbol stands for a command or a step (the command search's rows, 27 px;
+    // the Timeline's steps, 22 px, EyeIcon / ChainIcon / the move cross the same), `full` is set and every
+    // symbol's artwork fills its box edge to edge as the model Chamfer / Fillet do (the others, drawn with a
+    // 2 unit margin, are enlarged 1.22 about the centre, line weights kept). Off (18 px) for the small badges.
+    property bool full: false
     width: 18
     height: 18
     onInkChanged: requestPaint()
     onKindChanged: requestPaint()
+    onFullChanged: requestPaint()
 
     // A solver constraint type to the symbol that shows it.
     function kindFor(type) {
@@ -37,10 +45,19 @@ Canvas {
     onPaint: {
         const c = getContext("2d")
         c.reset()
-        c.translate((width - 16) / 2, (height - 16) / 2)
+        // Drawn in 16 units on an 18 box, scaled to the size it's given (GB-059: larger where it's shown
+        // larger, painted at that size instead of a small picture stretched).
+        const s = Math.min(width, height) / 18
+        c.translate((width - 16 * s) / 2, (height - 16 * s) / 2)
+        c.scale(s, s)
+        const kind = icon.kind
+        // (Extrude's block spans 2..14 x 1.6..13.5: 1.3 about its own middle fills the box the same.)
+        const k = !icon.full || kind === "chamfermodel" || kind === "filletmodel" ? 1 : kind === "extrude" ? 1.3 : 1.22
+        const my = kind === "extrude" ? 7.6 : 8
+        if (k !== 1) { c.translate(8, 8); c.scale(k, k); c.translate(-8, -my) }
         c.strokeStyle = ink
         c.fillStyle = ink
-        c.lineWidth = 1.6
+        c.lineWidth = 1.6 / k
         c.lineCap = "round"
         const line = (x1, y1, x2, y2) => { c.beginPath(); c.moveTo(x1, y1); c.lineTo(x2, y2); c.stroke() }
         const dot = (x, y, r) => { c.beginPath(); c.arc(x, y, r, 0, Math.PI * 2); c.fill() }
@@ -48,8 +65,8 @@ Canvas {
         const head = (x, y, dx) => { c.beginPath(); c.moveTo(x, y); c.lineTo(x + dx * 3, y - 2.2); c.lineTo(x + dx * 3, y + 2.2); c.closePath(); c.fill() }
         // ---- sketch tools ----
         const PI = Math.PI
-        const thin = () => { c.lineWidth = 1.1 }
-        const bold = () => { c.lineWidth = 1.5 }
+        const thin = () => { c.lineWidth = 1.1 / k }
+        const bold = () => { c.lineWidth = 1.5 / k }
         const dash = on => c.setLineDash(on ? [2, 1.6] : [])
         const path = pts => { c.beginPath(); pts.forEach((p, i) => i ? c.lineTo(p[0], p[1]) : c.moveTo(p[0], p[1])); c.stroke() }
         const arcAt = (x, y, r, a0, a1) => { c.beginPath(); c.arc(x, y, r, a0, a1); c.stroke() }
@@ -57,7 +74,6 @@ Canvas {
         const stadium = (x1, x2, y, r) => { c.beginPath(); c.moveTo(x1, y - r); c.lineTo(x2, y - r); c.arc(x2, y, r, -PI / 2, PI / 2); c.lineTo(x1, y + r); c.arc(x1, y, r, PI / 2, PI * 1.5); c.closePath(); c.stroke() }
         const oval = (x, y, rx, ry, rot) => { c.beginPath(); for (let i = 0; i <= 36; i++) { const t = i * PI / 18, ex = rx * Math.cos(t), ey = ry * Math.sin(t), px = x + ex * Math.cos(rot) - ey * Math.sin(rot), py = y + ex * Math.sin(rot) + ey * Math.cos(rot); i ? c.lineTo(px, py) : c.moveTo(px, py) } c.stroke() }
         const tip = (x, y, dx, dy, s) => { c.beginPath(); c.moveTo(x, y); c.lineTo(x - dx * s - dy * s * 0.5, y - dy * s + dx * s * 0.5); c.lineTo(x - dx * s + dy * s * 0.5, y - dy * s - dx * s * 0.5); c.closePath(); c.fill() }
-        const kind = icon.kind
         // fx (parameters): the italic "fx" function mark every spreadsheet and CAD program uses, drawn with strokes.
         if (kind === "fx") {
             bold(); c.lineJoin = "round"
@@ -122,6 +138,36 @@ Canvas {
             bold(); c.beginPath(); c.moveTo(2, 13.5); c.lineTo(9, 13.5); c.lineTo(14, 10.5); c.lineTo(7, 10.5); c.closePath()
             c.globalAlpha = 0.45; c.fill(); c.globalAlpha = 1; c.stroke()
             line(8, 11, 8, 3.8); tip(8, 1.6, 0, -1, 3.4); return
+        }
+        // Model Chamfer and Fillet (GB-059, owner pt161u: "The angle for chanfer needs to be obvious and the radius
+        // for fillet needs to be obvious at the smaller sizes"); facing as Fusion 360's (GB-060, owner pt162u: Fillet's
+        // corner top right, Chamfer's top left, drawn mirrored). GB-062 (owner pt164u: "the profile of the object
+        // they're trying to portray to be very defined, a very fine line ... I wanted the actual fillet to be larger,
+        // and there to be more distance between the apex of the fillet round and the actual form"): the block's whole
+        // end profile as one fine, even line (no glow, gradient or fade), a flat fill with a hard edge, the sharp
+        // corner that was taken off faintly dashed. Fillet: a quarter round of 10.5 on the 14 x 13 block (its apex
+        // 4.3 from the old corner), its centre and radius drawn finer still. Chamfer: a 7 x 7 45 degree flat, its
+        // angle to the side marked.
+        if (kind === "chamfermodel" || kind === "filletmodel") {
+            const round = kind === "filletmodel"
+            if (!round) { c.translate(16, 0); c.scale(-1, 1) }
+            const L = 1, T = 1.5, Rt = 15, B = 14.5          // the block's end
+            const R = round ? 10.5 : 7                       // how much is taken off its top right corner
+            const profile = () => {
+                c.beginPath(); c.moveTo(L, B); c.lineTo(L, T); c.lineTo(Rt - R, T)
+                if (round) c.arc(Rt - R, T + R, R, -PI / 2, 0); else c.lineTo(Rt, T + R)
+                c.lineTo(Rt, B); c.closePath()
+            }
+            profile(); c.globalAlpha = 0.22; c.fill(); c.globalAlpha = 1
+            c.lineWidth = 0.9; c.globalAlpha = 0.55; dash(true); path([[Rt - R, T], [Rt, T], [Rt, T + R]]); dash(false); c.globalAlpha = 1
+            c.lineJoin = "miter"; c.lineWidth = 1.3; profile(); c.stroke()
+            c.lineWidth = 0.9
+            if (round) {
+                const cx = Rt - R, cy = T + R, q = (R - 2.2) * Math.SQRT1_2
+                dot(cx, cy, 1.1); line(cx, cy, cx + q - 1.4, cy - q + 1.4); tip(cx + q + 0.6, cy - q - 0.6, Math.SQRT1_2, -Math.SQRT1_2, 2.6)
+            } else
+                arcAt(Rt, T + R, 3.8, -PI * 3 / 4, -PI / 2)
+            return
         }
         if (kind === "sketch") { bold(); path([[2, 12], [4.5, 4], [14, 4], [11.5, 12], [2, 12]]); thin(); line(5.5, 9, 9, 6.5); dot(9, 6.5, 1.3); return }
         switch (icon.kindFor(icon.kind)) {

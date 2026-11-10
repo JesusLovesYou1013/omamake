@@ -45,8 +45,21 @@ namespace {
 
 // Exactly one surface: FreeCAD's FaceTypedPlane/Cylinder::isEqual (modelRefine.cpp:354, 457), and a
 // cone the same way (one apex, one axis line, one half-angle, either way along it).
+// Only these three kinds: the faces are rebuilt from their outline below, which is right for them alone.
+// GB-063 (owner, pt169u: a chamfer run into the hole fillets "inverted them to be internal fillets instead of
+// external", the chamfer "seem[ing] to glitch through them"): two pieces of one hole's round (a torus, the
+// very same surface object, so the old `sa == sb` shortcut took them for one) were rebuilt as a single face,
+// and on a torus, closed both ways round, the outline bounded the rest of the ring instead: 1211.79 mm2 of
+// it in place of the 209.44 left, the body's volume 12791 mm3 off, and OpenCascade's check still passed.
+// Spheres, tori and free-form faces are left to OpenCascade's merge (ShapeUpgrade_UnifySameDomain), after.
 bool sameSurface(const TopoDS_Face &a, const TopoDS_Face &b) {
     const Handle(Geom_Surface) sa = BRep_Tool::Surface(a), sb = BRep_Tool::Surface(b);
+    const auto kind = [](const Handle(Geom_Surface) &s) {
+        return !Handle(Geom_Plane)::DownCast(s).IsNull() || !Handle(Geom_CylindricalSurface)::DownCast(s).IsNull()
+               || !Handle(Geom_ConicalSurface)::DownCast(s).IsNull();
+    };
+    if (!kind(sa) || !kind(sb))
+        return false;
     if (sa == sb)
         return true;
     const auto pa = Handle(Geom_Plane)::DownCast(sa), pb = Handle(Geom_Plane)::DownCast(sb);
@@ -259,6 +272,13 @@ TopoDS_Shape sameSurfaces(const TopoDS_Shape &shape, int *united) {
             const TopoDS_Face ref = *std::max_element(group.begin(), group.end(), [](const TopoDS_Face &a, const TopoDS_Face &b) { return areaOf(a) < areaOf(b); });
             const TopoDS_Face one = unite(group, ref, reshape);
             if (one.IsNull() || !BRepCheck_Analyzer(one).IsValid())
+                continue;
+            // GB-063: the face made must cover what the faces it replaces did, no more and no less (an
+            // outline taken the wrong way round bounds the rest of the surface: valid, and wrong).
+            double was = 0;
+            for (const TopoDS_Face &f : group)
+                was += areaOf(f);
+            if (std::abs(areaOf(one) - was) > 1e-6 * std::max(was, 1.0))
                 continue;
             reshape->Replace(group[0], one);
             for (std::size_t k = 1; k < group.size(); ++k)

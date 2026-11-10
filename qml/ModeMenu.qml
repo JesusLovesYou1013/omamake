@@ -24,7 +24,6 @@ Item {
     }
     function close() { open = false }
 
-    Keys.onEscapePressed: close()
 
     MouseArea {
         anchors.fill: parent

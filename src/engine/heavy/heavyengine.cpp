@@ -14,6 +14,9 @@
 #include <TopoDS_Vertex.hxx>
 #include <BRepGProp.hxx>
 #include <BRepTools.hxx>
+#include <BRepTopAdaptor_FClass2d.hxx>
+#include <GeomAPI_ProjectPointOnSurf.hxx>
+#include <array>
 #include <BRepTools_WireExplorer.hxx>
 #include <GCPnts_TangentialDeflection.hxx>
 #include <GProp_GProps.hxx>
@@ -52,6 +55,7 @@
 #include "engine/heavy/refine.h"
 #include "engine/heavy/projectexact.h"
 #include "engine/heavy/pushface.h"
+#include "engine/heavy/chamfer.h"
 #include <Standard_Failure.hxx>
 #include "engine/heavy/taper.h"
 #include <BOPAlgo_CheckerSI.hxx>
@@ -186,13 +190,39 @@ std::vector<TopoDS_Vertex> shownCorners(const TopoDS_Shape &shape, const TopTool
     TopExp::MapShapesAndAncestors(shape, TopAbs_VERTEX, TopAbs_EDGE, vertexEdges);
     for (int v = 1; v <= vertexEdges.Extent(); ++v) {
         TopTools_IndexedMapOfShape distinct;
-        for (const TopoDS_Shape &edge : vertexEdges(v))
+        bool closes = false;
+        for (const TopoDS_Shape &edge : vertexEdges(v)) {
+            closes = closes || BRep_Tool::Degenerated(TopoDS::Edge(edge));
             if (!BRep_Tool::Degenerated(TopoDS::Edge(edge)) && !seams.Contains(edge))
                 distinct.Add(edge);
-        if (distinct.Extent() >= 2)
+        }
+        // A cone's tip is a corner too (GB-053: to chamfer or round it), a sphere's pole isn't.
+        if (distinct.Extent() >= 2 || (closes && chamfer::isTip(shape, vertexEdges.FindKey(v))))
             out.push_back(TopoDS::Vertex(vertexEdges.FindKey(v)));
     }
     return out;
+}
+
+// Every edge has its curve on each face it bounds. OpenCascade's face merge (ShapeUpgrade_UnifySameDomain)
+// reads those curves without checking and crashes the whole program on a missing one (chamfer run-through:
+// two half-turn sweeps meeting end to end, 2026-11-08); a shape without them is left unmerged.
+// With `noPoints` (a chamfer's cut), also none with a point where a surface closes to nothing (a cone's tip): the
+// merge crashed on two half cones meeting at their tip, every curve there, 2026-11-08.
+static bool mergeable(const TopoDS_Shape &shape, bool noPoints = false) {
+    if (noPoints)
+        for (TopExp_Explorer e(shape, TopAbs_EDGE); e.More(); e.Next())
+            if (BRep_Tool::Degenerated(TopoDS::Edge(e.Current())))
+                return false;
+    for (TopExp_Explorer f(shape, TopAbs_FACE); f.More(); f.Next()) {
+        const TopoDS_Face &face = TopoDS::Face(f.Current());
+        for (TopExp_Explorer e(face, TopAbs_EDGE); e.More(); e.Next()) {
+            const TopoDS_Edge &edge = TopoDS::Edge(e.Current());
+            Standard_Real a, b;
+            if (BRep_Tool::CurveOnSurface(edge, face, a, b).IsNull())
+                return false;
+        }
+    }
+    return true;
 }
 
 // Valid by OpenCascade's own check, and closed: no edge with a face on one side only (edges drawn
@@ -1142,6 +1172,8 @@ public:
             TopoDS_Shape refined = refine::sameSurfaces(shape);
             if (refined.IsNull())
                 refined = shape;
+            if (!mergeable(refined))
+                return 0;                // OpenCascade's merge would crash on it: left as it is
             ShapeUpgrade_UnifySameDomain unify(refined, true, true, false);
             unify.SetLinearTolerance(kMergeLinear);
             unify.SetAngularTolerance(kMergeAngular);
@@ -1572,10 +1604,16 @@ public:
             TopoDS_Shape merged = result;
             if (const TopoDS_Shape refined = refine::sameSurfaces(result); !refined.IsNull())
                 merged = refined;
-            ShapeUpgrade_UnifySameDomain unify(merged, true, true, false);
-            unify.SetLinearTolerance(kMergeLinear);
-            unify.SetAngularTolerance(kMergeAngular);
-            unify.Build();
+            TopoDS_Shape unified = merged;
+            if (mergeable(merged, m_chamfering)) {
+                ShapeUpgrade_UnifySameDomain unify(merged, true, true, false);
+                unify.SetLinearTolerance(kMergeLinear);
+                unify.SetAngularTolerance(kMergeAngular);
+                unify.Build();
+                unified = unify.Shape();
+            } else {
+                engineLog("engine: %s: an edge lacks its curve on a face, so faces weren't merged (OpenCascade's merge would crash)\n", names[int(op)]);
+            }
             // Kept only if sound, with no face of no area, and no looser than what went in or 0.00001 in:
             // a boolean that has to widen an edge past that glued together things that don't really
             // meet. A cut of a converted model whose walls lay a hair off the tool's came back valid and
@@ -1596,12 +1634,12 @@ public:
                     return Flaw::Empty;
                 return soundSolid(shape) ? Flaw::None : Flaw::Unsound;
             };
-            const Flaw mergedFlaw = flaw(unify.Shape());
+            const Flaw mergedFlaw = flaw(unified);
             if (mergedFlaw == Flaw::None) {
                 say("done, faces in one surface merged");
                 engineLog("engine: %s, merged and checked in %.2f s, loosest edge %.2g mm (allowed %.2g)\n", names[int(op)],
                              std::chrono::duration<double>(std::chrono::steady_clock::now() - merging).count(), worst, allowed);
-                return keepSound(unify.Shape());
+                return keepSound(unified);
             }
             const double mergedWorst = worst;
             Flaw unmerged = flaw(result);
@@ -1611,7 +1649,7 @@ public:
             }
             {   // The refused result, described for the log (both forms).
                 std::string merged, unmergedReport;
-                describe(unify.Shape(), merged);
+                describe(unified, merged);
                 describe(result, unmergedReport);
                 engineLog("engine: the refused result, faces merged:\n%s", merged.c_str());
                 engineLog("engine: the refused result, faces not merged:\n%s", unmergedReport.c_str());
@@ -1628,7 +1666,7 @@ public:
                 m_whyNot = "the result would touch itself along a line, leaving a face with no area there";
             } else if (unmerged == Flaw::Loose) {
                 engineLog("engine: loosest edge %.4f mm, allowed %.4f\n", worst, allowed);
-                logLoose("merged", unify.Shape(), allowed);
+                logLoose("merged", unified, allowed);
                 logLoose("unmerged", result, allowed);
                 say("result had to be loosened past what went in to fit together, not used");
                 m_whyNot = "the shapes don't quite meet where they should: the result would be looser than 0.00001 in there";
@@ -1677,6 +1715,461 @@ public:
         return out;
     }
 
+    // ---- Model Chamfer (chamfer.cpp does the work) ----
+
+    // The body's edges as its mesh numbers them (meshed first if it hasn't been, as the numbers need).
+    std::vector<ShownEdge> edgesOf(BodyId body) const {
+        const TopoDS_Shape &shape = m_bodies.at(body);
+        for (TopExp_Explorer e(shape, TopAbs_FACE); e.More(); e.Next()) {
+            TopLoc_Location loc;
+            if (BRep_Tool::Triangulation(TopoDS::Face(e.Current()), loc).IsNull()) {
+                (void)mesh(body);
+                break;
+            }
+        }
+        TopTools_IndexedMapOfShape seams;
+        return shownEdges(shape, seams);
+    }
+
+    // The items for chamfer.cpp: each edge with the face d1 is measured on (per set, the face most of the set's
+    // edges share; the other one when flipped). Edges that aren't there are left out (and named in `missing`).
+    std::vector<chamfer::Item> chamferItems(BodyId body, const std::vector<ChamferEdge> &edges, std::vector<int> *missing) const {
+        const TopoDS_Shape &shape = m_bodies.at(body);
+        const std::vector<ShownEdge> shown = edgesOf(body);
+        TopTools_IndexedDataMapOfShapeListOfShape edgeFaces;
+        TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edgeFaces);
+        std::map<int, std::vector<std::pair<TopoDS_Face, int>>> counts;    // per set: faces and how many edges touch each
+        const auto facesOf = [&](const TopoDS_Edge &e) {
+            std::vector<TopoDS_Face> out;
+            if (!edgeFaces.Contains(e))
+                return out;
+            for (const TopoDS_Shape &f : edgeFaces.FindFromKey(e))
+                if (std::none_of(out.begin(), out.end(), [&](const TopoDS_Face &g) { return g.IsSame(f); }))
+                    out.push_back(TopoDS::Face(f));
+            return out;
+        };
+        for (const ChamferEdge &c : edges) {
+            if (c.edge < 0 || std::size_t(c.edge) >= shown.size())
+                continue;
+            for (const TopoDS_Face &f : facesOf(shown[std::size_t(c.edge)].edge)) {
+                auto &list = counts[c.set];
+                auto found = std::find_if(list.begin(), list.end(), [&](const auto &p) { return p.first.IsSame(f); });
+                if (found == list.end())
+                    list.emplace_back(f, 1);
+                else
+                    ++found->second;
+            }
+        }
+        std::vector<chamfer::Item> out;
+        for (const ChamferEdge &c : edges) {
+            if (c.edge < 0 || std::size_t(c.edge) >= shown.size()) {
+                if (missing)
+                    missing->push_back(c.edge);
+                continue;
+            }
+            const TopoDS_Edge &e = shown[std::size_t(c.edge)].edge;
+            const std::vector<TopoDS_Face> faces = facesOf(e);
+            if (faces.size() != 2) {
+                if (missing)
+                    missing->push_back(c.edge);
+                continue;
+            }
+            int best = -1, ref = 0;
+            for (int k = 0; k < 2; ++k)
+                for (const auto &[f, n] : counts[c.set])
+                    if (f.IsSame(faces[std::size_t(k)]) && n > best) {
+                        best = n;
+                        ref = k;
+                    }
+            if (c.flip)
+                ref = 1 - ref;
+            chamfer::Item it;
+            it.edge = e;
+            it.ref = faces[std::size_t(ref)];
+            it.kind = c.kind == 1 ? chamfer::Kind::Two : c.kind == 2 ? chamfer::Kind::Angle : c.kind == 3 ? chamfer::Kind::Fillet
+                    : c.kind == 4 ? chamfer::Kind::Chord : chamfer::Kind::Equal;
+            it.d1 = c.d1;
+            it.d2 = c.kind == 1 ? c.d2 : c.d1;
+            it.angle = c.angle * M_PI / 180;
+            it.id = c.edge;
+            it.sweep = m_sweepEdges;
+            out.push_back(it);
+        }
+        return out;
+    }
+
+    // A body's corners as the mesh numbers them (Mesh::points), for points picked to chamfer or round.
+    std::vector<TopoDS_Vertex> cornersOf(BodyId body) const {
+        const TopoDS_Shape &shape = m_bodies.at(body);
+        TopTools_IndexedMapOfShape seams;
+        shownEdges(shape, seams);
+        return shownCorners(shape, seams);
+    }
+    std::vector<chamfer::Point> chamferPoints(BodyId body, const std::vector<ChamferEdge> &edges, std::vector<int> *missing) const {
+        std::vector<chamfer::Point> out;
+        const std::vector<TopoDS_Vertex> corners = cornersOf(body);
+        for (const ChamferEdge &c : edges) {
+            if (c.point < 0)
+                continue;
+            if (std::size_t(c.point) >= corners.size()) {
+                if (missing)
+                    missing->push_back(-1 - c.point);
+                continue;
+            }
+            const gp_Pnt p = BRep_Tool::Pnt(corners[std::size_t(c.point)]);
+            chamfer::Point pt;
+            pt.at[0] = p.X();
+            pt.at[1] = p.Y();
+            pt.at[2] = p.Z();
+            pt.kind = c.kind == 3 ? chamfer::Kind::Fillet : c.kind == 4 ? chamfer::Kind::Chord : chamfer::Kind::Equal;
+            pt.size = c.d1;
+            pt.id = -1 - c.point;
+            out.push_back(pt);
+        }
+        return out;
+    }
+
+    // Edges and points together (GB-055): when a point's cut won't go cleanly on what OpenCascade's own
+    // chamfer of the edges left (loose B-spline faces), the edges are all run through instead (exact turned and
+    // swept faces) and the points cut from that; the one with fewer left sharp is kept.
+    BodyId chamfer(BodyId body, const std::vector<ChamferEdge> &all, ChamferCorner corner, ChamferReport &report) override {
+        const BodyId first = chamferOnce(body, all, corner, report);
+        const bool mixed = std::any_of(all.begin(), all.end(), [](const ChamferEdge &c) { return c.point >= 0; })
+                        && std::any_of(all.begin(), all.end(), [](const ChamferEdge &c) { return c.point < 0; });
+        const bool pointsLeft = std::any_of(report.skipped.begin(), report.skipped.end(), [&](int id) {
+            return std::any_of(all.begin(), all.end(), [&](const ChamferEdge &c) { return c.point >= 0 && -1 - c.point == id; });
+        });
+        if (!mixed || m_sweepEdges || (first && !pointsLeft) || corner == ChamferCorner::Miter)
+            return first;
+        const std::string whyFirst = m_whyNot;
+        ChamferReport again;
+        m_sweepEdges = true;
+        const BodyId second = chamferOnce(body, all, corner, again);
+        m_sweepEdges = false;
+        engineLog("engine: edges and points again with every edge run through: %s (%zu left sharp, before %zu)\n",
+                  second ? "made" : "nothing made", again.skipped.size(), report.skipped.size());
+        if (second && (!first || again.skipped.size() < report.skipped.size())) {
+            if (first)
+                release(first);
+            report = again;
+            return second;
+        }
+        if (second)
+            release(second);
+        m_whyNot = whyFirst;
+        return first;
+    }
+    BodyId chamferOnce(BodyId body, const std::vector<ChamferEdge> &all, ChamferCorner corner, ChamferReport &report) {
+        m_whyNot.clear();
+        report = {};
+        // Points (GB-053): their cuts worked out on the body as it is, then cut from what the set's edges leave
+        // (GB-055: found again on the edges' result, a point the rounds had moved or taken was left sharp and
+        // the rest went on quietly; past where an edge's round and a point's meet, they now overlap and take
+        // the body down together, as two edges' rounds do).
+        std::vector<ChamferEdge> edges, points;
+        for (const ChamferEdge &c : all)
+            (c.point >= 0 ? points : edges).push_back(c);
+        if (!points.empty()) {
+            try {
+                const bool round = points.front().kind == 3 || points.front().kind == 4;
+                std::vector<int> missing;
+                const std::vector<chamfer::Point> pts = chamferPoints(body, points, &missing);
+                for (const chamfer::Point &p : pts)
+                    if (!(p.size > 0)) {
+                        m_whyNot = "the size must be above 0";
+                        return 0;
+                    }
+                BodyId from = body;
+                ChamferReport edgeReport;
+                if (!edges.empty()) {
+                    from = chamfer(body, edges, corner, edgeReport);
+                    if (!from)
+                        return 0;
+                }
+                chamfer::Report r;
+                const auto started = std::chrono::steady_clock::now();
+                const TopoDS_Shape made = chamfer::points(usable(from), pts,
+                    [](const TopoDS_Shape &s) { return !s.IsNull() && soundSolid(s) && !hasEmptyFace(s); },
+                    [this](const TopoDS_Shape &shape, const std::vector<TopoDS_Shape> &tools, bool cut) {
+                        const BodyId a = keep(shape);
+                        std::vector<BodyId> with;
+                        for (const TopoDS_Shape &t : tools)
+                            with.push_back(keep(t));
+                        m_chamfering = true;
+                        const BodyId got = combineAt(a, with, cut ? Combine::Cut : Combine::Join, kTouching);
+                        m_chamfering = false;
+                        const TopoDS_Shape out = got ? m_bodies.at(got) : TopoDS_Shape();
+                        release(a);
+                        for (const BodyId b : with)
+                            release(b);
+                        if (got)
+                            release(got);
+                        return out;
+                    },
+                    [](const std::string &line) { engineLog("engine: %s\n", line.c_str()); }, r, usable(body));
+                engineLog("engine: %s of %zu point(s): %s, %.2f s\n", round ? "fillet" : "chamfer", pts.size(), made.IsNull() ? "nothing made" : "made",
+                          std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+                if (from != body)
+                    release(from);
+                report = edgeReport;
+                report.skipped.insert(report.skipped.end(), missing.begin(), missing.end());
+                report.skipped.insert(report.skipped.end(), r.skipped.begin(), r.skipped.end());
+                report.ranThrough.insert(report.ranThrough.end(), r.ranThrough.begin(), r.ranThrough.end());
+                for (const std::string &n : r.notes)
+                    report.note += (report.note.empty() ? "" : " ") + n;
+                if (made.IsNull()) {
+                    m_whyNot = r.consumed ? "that would take the whole body away" : "nothing could be done to the points";
+                    return 0;
+                }
+                if (edges.empty() && r.skipped.size() + missing.size() >= points.size()) {     // nothing done
+                    m_whyNot = report.note.empty() ? std::string("no point could be done") : report.note;
+                    return 0;
+                }
+                return keepSound(made);
+            } catch (Standard_Failure &e) {
+                m_whyNot = e.GetMessageString() ? e.GetMessageString() : "OpenCascade failed";
+                return 0;
+            }
+        }
+        try {
+            std::vector<int> missing;
+            const std::vector<chamfer::Item> items = chamferItems(body, edges, &missing);
+            report.skipped = missing;
+            const bool round = !edges.empty() && (edges.front().kind == 3 || edges.front().kind == 4);
+            if (items.empty()) {
+                m_whyNot = round ? "none of those edges is there to fillet" : "none of those edges is there to chamfer";
+                return 0;
+            }
+            for (const chamfer::Item &it : items)
+                if (it.d1 <= 0 || it.d2 <= 0 || (it.kind == chamfer::Kind::Angle && (it.angle <= 0 || it.angle >= M_PI / 2))) {
+                    m_whyNot = it.kind == chamfer::Kind::Angle ? "the distance must be above 0 and the angle between 0 and 90 degrees"
+                                                               : "the distances must be above 0";
+                    return 0;
+                }
+            chamfer::Report r;
+            const auto started = std::chrono::steady_clock::now();
+            const TopoDS_Shape made = chamfer::make(
+                usable(body), items,
+                corner == ChamferCorner::Miter ? chamfer::Corner::Miter : corner == ChamferCorner::Blend ? chamfer::Corner::Blend : chamfer::Corner::Chamfer,
+                [](const TopoDS_Shape &s) { return !s.IsNull() && soundSolid(s) && !hasEmptyFace(s); },
+                [this](const TopoDS_Shape &shape, const std::vector<TopoDS_Shape> &tools, bool cut) {
+                    // Through the engine's own checked join or cut (mended, merged, checked), on bodies kept for it.
+                    const BodyId a = keep(shape);
+                    std::vector<BodyId> with;
+                    for (const TopoDS_Shape &t : tools)
+                        with.push_back(keep(t));
+                    m_chamfering = true;
+                    const BodyId made = combineAt(a, with, cut ? Combine::Cut : Combine::Join, kTouching);
+                    m_chamfering = false;
+                    const TopoDS_Shape out = made ? m_bodies.at(made) : TopoDS_Shape();
+                    release(a);
+                    for (const BodyId b : with)
+                        release(b);
+                    if (made)
+                        release(made);
+                    return out;
+                },
+                [](const std::string &line) { engineLog("engine: %s\n", line.c_str()); }, r);
+            engineLog("engine: chamfer of %zu edge(s): %s, %.2f s\n", items.size(), made.IsNull() ? "nothing made" : "made",
+                      std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+            report.ranThrough = r.ranThrough;
+            report.skipped.insert(report.skipped.end(), r.skipped.begin(), r.skipped.end());
+            for (const std::string &n : r.notes)
+                report.note += (report.note.empty() ? "" : " ") + n;
+            if (made.IsNull()) {
+                m_whyNot = r.consumed ? (round ? "the fillets meet and would take the whole body away" : "the chamfers meet and would take the whole body away")
+                                      : round ? "no edge could be filleted, not even by running the round through"
+                                              : "no edge could be chamfered, not even by running the bevel through";
+                return 0;
+            }
+            return keepSound(made);
+        } catch (Standard_Failure &e) {
+            m_whyNot = e.GetMessageString() ? e.GetMessageString() : "OpenCascade failed";
+            return 0;
+        }
+    }
+
+    std::vector<int> faceEdges(BodyId body, int faceNumber) const override {
+        std::vector<int> out;
+        TopTools_IndexedMapOfShape faces;
+        TopExp::MapShapes(m_bodies.at(body), TopAbs_FACE, faces);
+        if (faceNumber < 0 || faceNumber >= faces.Extent())
+            return out;
+        TopTools_IndexedMapOfShape own;
+        TopExp::MapShapes(faces(faceNumber + 1), TopAbs_EDGE, own);
+        const std::vector<ShownEdge> shown = edgesOf(body);
+        for (std::size_t i = 0; i < shown.size(); ++i)
+            if (own.Contains(shown[i].edge))
+                out.push_back(int(i));
+        return out;
+    }
+
+    std::vector<int> tangentChain(BodyId body, const std::vector<int> &edges) const override {
+        const std::vector<ShownEdge> shown = edgesOf(body);
+        // Each edge's way out of each of its ends.
+        struct End { TopoDS_Vertex v; gp_Vec out; };
+        std::vector<std::array<End, 2>> ends(shown.size());
+        for (std::size_t i = 0; i < shown.size(); ++i) {
+            BRepAdaptor_Curve c(shown[i].edge);
+            gp_Pnt p;
+            gp_Vec t0, t1;
+            c.D1(c.FirstParameter(), p, t0);
+            c.D1(c.LastParameter(), p, t1);
+            TopoDS_Vertex a, b;
+            TopExp::Vertices(shown[i].edge, a, b);
+            const bool forward = !a.IsNull() && BRep_Tool::Pnt(a).Distance(c.Value(c.FirstParameter())) < 1e-6;
+            const TopoDS_Vertex first = forward ? a : b, last = forward ? b : a;
+            ends[i] = {End{first, t0.Magnitude() > 1e-12 ? -t0.Normalized() : t0}, End{last, t1.Magnitude() > 1e-12 ? t1.Normalized() : t1}};
+        }
+        std::vector<char> in(shown.size(), 0);
+        std::vector<int> todo;
+        for (const int e : edges)
+            if (e >= 0 && std::size_t(e) < shown.size() && !in[std::size_t(e)]) {
+                in[std::size_t(e)] = 1;
+                todo.push_back(e);
+            }
+        std::vector<int> out = todo;
+        while (!todo.empty()) {
+            const int e = todo.back();
+            todo.pop_back();
+            for (const End &mine : ends[std::size_t(e)]) {
+                if (mine.v.IsNull())
+                    continue;
+                for (std::size_t g = 0; g < shown.size(); ++g) {
+                    if (in[g])
+                        continue;
+                    for (const End &theirs : ends[g])
+                        // Smoothly on: leaving the shared corner, the next edge goes on the way this one came in.
+                        if (!theirs.v.IsNull() && theirs.v.IsSame(mine.v) && mine.out.Magnitude() > 0 && theirs.out.Magnitude() > 0
+                            && mine.out.Dot(theirs.out) < -std::cos(M_PI / 180)) {
+                            in[g] = 1;
+                            out.push_back(int(g));
+                            todo.push_back(int(g));
+                            break;
+                        }
+                }
+            }
+        }
+        std::sort(out.begin(), out.end());
+        return out;
+    }
+
+    // A point inside a face and its outward normal there.
+    static bool faceSample(const TopoDS_Face &face, gp_Pnt &at, gp_Vec &normal) {
+        double u0, u1, v0, v1;
+        BRepTools::UVBounds(face, u0, u1, v0, v1);
+        BRepTopAdaptor_FClass2d inside(face, 1e-7);
+        BRepAdaptor_Surface surface(face);
+        for (const int n : {1, 3, 7, 15})
+            for (int i = 1; i <= n; ++i)
+                for (int j = 1; j <= n; ++j) {
+                    const double u = u0 + (u1 - u0) * i / (n + 1), v = v0 + (v1 - v0) * j / (n + 1);
+                    if (inside.Perform(gp_Pnt2d(u, v)) != TopAbs_IN)
+                        continue;
+                    gp_Vec du, dv;
+                    surface.D1(u, v, at, du, dv);
+                    normal = du.Crossed(dv);
+                    if (normal.Magnitude() < 1e-12)
+                        continue;
+                    normal.Normalize();
+                    if (face.Orientation() == TopAbs_REVERSED)
+                        normal.Reverse();
+                    return true;
+                }
+        return false;
+    }
+
+    // Whether a point (with its normal) lies on one of these faces, facing the same way.
+    static bool liesOn(const gp_Pnt &p, const gp_Vec &n, const std::vector<TopoDS_Face> &faces) {
+        const TopoDS_Vertex v = BRepBuilderAPI_MakeVertex(p);
+        for (const TopoDS_Face &f : faces) {
+            BRepExtrema_DistShapeShape d(v, f);
+            if (!d.IsDone() || d.Value() > 1e-4)
+                continue;
+            gp_Pnt q;
+            gp_Vec m;
+            const Handle(Geom_Surface) s = BRep_Tool::Surface(f);
+            GeomAPI_ProjectPointOnSurf onto(p, s);
+            if (!onto.IsDone() || onto.NbPoints() == 0)
+                continue;
+            double u, w;
+            onto.LowerDistanceParameters(u, w);
+            gp_Vec du, dv;
+            s->D1(u, w, q, du, dv);
+            m = du.Crossed(dv);
+            if (m.Magnitude() < 1e-12)
+                continue;
+            m.Normalize();
+            if (f.Orientation() == TopAbs_REVERSED)
+                m.Reverse();
+            if (m.Dot(n) > 0.9999)
+                return true;
+        }
+        return false;
+    }
+
+    std::vector<int> featureEdges(BodyId now, BodyId before, BodyId after) const override {
+        std::vector<int> out;
+        if (!m_bodies.count(now) || !m_bodies.count(after))
+            return out;
+        const auto facesOf = [](const TopoDS_Shape &s) {
+            std::vector<TopoDS_Face> list;
+            for (TopExp_Explorer e(s, TopAbs_FACE); e.More(); e.Next())
+                list.push_back(TopoDS::Face(e.Current()));
+            return list;
+        };
+        const std::vector<TopoDS_Face> old = before && m_bodies.count(before) ? facesOf(m_bodies.at(before)) : std::vector<TopoDS_Face>{};
+        std::vector<TopoDS_Face> made;
+        for (const TopoDS_Face &f : facesOf(m_bodies.at(after))) {
+            gp_Pnt p;
+            gp_Vec n;
+            if (faceSample(f, p, n) && !liesOn(p, n, old))
+                made.push_back(f);
+        }
+        TopTools_IndexedMapOfShape theirs;
+        for (const TopoDS_Face &f : facesOf(m_bodies.at(now))) {
+            gp_Pnt p;
+            gp_Vec n;
+            if (faceSample(f, p, n) && liesOn(p, n, made))
+                TopExp::MapShapes(f, TopAbs_EDGE, theirs);
+        }
+        const std::vector<ShownEdge> shown = edgesOf(now);
+        for (std::size_t i = 0; i < shown.size(); ++i)
+            if (theirs.Contains(shown[i].edge))
+                out.push_back(int(i));
+        return out;
+    }
+
+    std::vector<std::vector<double>> chamferSections(BodyId body, const std::vector<ChamferEdge> &edges) const override {
+        std::vector<std::vector<double>> out(edges.size());
+        try {
+            const TopoDS_Shape &shape = m_bodies.at(body);
+            const std::vector<chamfer::Item> items = chamferItems(body, edges, nullptr);
+            const std::vector<chamfer::Point> pts = chamferPoints(body, edges, nullptr);
+            for (std::size_t i = 0; i < edges.size(); ++i) {
+                if (edges[i].point >= 0) {
+                    for (const chamfer::Point &p : pts)
+                        if (p.id == -1 - edges[i].point) {
+                            double s[9];
+                            if (chamfer::pointSection(shape, p, s))
+                                out[i].assign(s, s + 9);
+                            break;
+                        }
+                    continue;
+                }
+                for (const chamfer::Item &it : items)
+                    if (it.id == edges[i].edge) {
+                        double s[9];
+                        if (chamfer::section(shape, it, s, edges[i].at))
+                            out[i].assign(s, s + 9);
+                        break;
+                    }
+            }
+        } catch (Standard_Failure &) {
+        }
+        return out;
+    }
+
     BodyId translate(BodyId body, double x, double y, double z) override {
         gp_Trsf move;
         move.SetTranslation(gp_Vec(x, y, z));
@@ -1701,6 +2194,8 @@ public:
             // Many programs write a hole as two half cylinders: one face and one rim is what a
             // person means by it. The surfaces themselves don't change.
             const TopoDS_Shape refined = refine::sameSurfaces(shape);
+            if (!mergeable(refined.IsNull() ? shape : refined))
+                return keep(refined.IsNull() ? shape : refined);     // OpenCascade's merge would crash on it
             ShapeUpgrade_UnifySameDomain unify(refined.IsNull() ? shape : refined, true, true, false);
             unify.Build();
             return keep(unify.Shape());
@@ -1845,6 +2340,8 @@ private:
     std::unordered_map<BodyId, TopoDS_Shape> m_bodies;
     std::unordered_map<BodyId, TopoDS_Shape> m_usable;    // each body as Booleans use it (usable)
     std::unordered_set<BodyId> m_sound;                    // bodies already checked sound in full (soundSolid, no face of no area)
+    bool m_chamfering = false;   // combineAt is cutting for a chamfer (see mergeable)
+    bool m_sweepEdges = false;   // GB-055: the set's edges all run through (see chamfer)
     std::string m_whyNot; // why the last extrude or combine that gave 0 couldn't be done, for the person
     std::unordered_map<BodyId, meshsolid::Mesh> m_imported;    // the triangles an imported mesh came in as
     BodyId m_lastId = 0;

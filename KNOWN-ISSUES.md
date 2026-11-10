@@ -67,3 +67,30 @@ Cause: after the STEP round trip one spline wall's boundary curves run past the 
 Not the inch change, the merge change or the touching tolerance: the cut fails with all three turned off, and the current build makes the same cut (whole model projected onto the base, up to the top face at −0.1 in and −1 mm) on the mesh-converted body in 0.8–1.0 s, 23,593 and 22,395 mm³ left. OpenCascade's own repairs (`ShapeFix_Shape`, `ShapeFix_Face`, rebuilding the boundary curves, every `read.surfacecurve.mode`) leave the wall as it is.
 
 Resolution: none yet. Options: repair such walls on import, write STEP that reads back cleanly, or check a cut against an exact overlap when the body's mesh and exact volume disagree.
+
+## OpenCascade's own chamfer and fillet hand back shapes that pass its check but are wrong
+
+Status: worked around in OmaMake, first seen 2026-11-08, some cases still open.
+
+Problem: OpenCascade 7.9's `BRepFilletAPI_MakeChamfer` / `MakeFillet` can report success and return a solid its own check calls valid but that is the wrong shape. Seen: two rounds that overlap on the face between them came back half again as big as the body; an edge whose bevel runs into a hole or a neighbouring fillet kept material that should have gone (21.6 and 116.7 mm³); a chamfer or round between two cones came back as one approximated spline face, slightly off round; a chamfer carried on along edges tangent to the picked one. Cutting a cone with another cone round the same axis can also lose one of them.
+
+Resolution (OmaMake side): every result's volume is checked against what the operation can do (a cut no bigger than the body). Edges OpenCascade gets wrong, whole rims, edges whose band runs off the faces beside it, and sizes too big for the space run through OmaMake's own exact cut instead: the cross-section swept along the edge, and rims round one axis joined into one turned section, so cuts that meet form a ridge or a sphere. A size within the sketch solver's rounding (2.5e-10 mm) of a rim's radius is taken as exactly that radius.
+
+Still open: on curved faces where a bevel leaves the surface at once, OmaMake can't yet tell that it runs off the face, so OpenCascade's own result is used there.
+
+## Merging faces on a torus turned fillets inside out (fixed in 0.52)
+
+Status: fixed in OmaMake, first seen 2026-11-09.
+
+Problem: after a chamfer cut through the fillets round a row of holes, the fillets showed inside out and the chamfer seemed to pass through them, while OpenCascade's check still called the body valid. OmaMake's own clean-up, which joins faces lying on one surface, rebuilt a cut torus face from its outline, and on a torus that outline encloses the rest of the ring.
+
+Resolution: that clean-up now joins faces only on planes, cylinders and cones, and a joined face must have the same area as its pieces. Spheres, tori and free-form faces are left to OpenCascade's `ShapeUpgrade_UnifySameDomain`. Files saved before the fix keep their saved body until that step is done again.
+
+## Not done yet, or not tested much (0.52)
+
+- Variable-radius fillets; a chamfer and a fillet in one step; Chamfer and Fillet on the Lite engine.
+- A corner (point) fillet on a corner of a box leaves small flats rather than a smooth corner blend; a corner where more than three faces meet gets nearly, not exactly, equal angles.
+- The drag arrow doesn't move to a better side when the view is turned.
+- A large file opens with the window blank for several seconds and a short pause after it appears.
+- The light look hasn't been checked with the new Chamfer and Fillet symbols or the Timeline's progress fill.
+

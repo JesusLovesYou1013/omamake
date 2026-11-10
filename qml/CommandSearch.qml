@@ -57,11 +57,11 @@ Item {
         "Sketch Scale": "scale", "Blend Curve": "blend", "Move/Copy": "movecopy",
         "Parameters": "fx", "Project": "project", "Create Sketch": "sketch", "Toggle Construction": "construction",
         // model tools
-        "Extrude": "extrude"
+        "Extrude": "extrude", "Chamfer": "chamfermodel"
     })
     // The symbol a row shows: a family's row shows its default kind's.
     function symbolFor(m) {
-        return symbols[m.family && m.def ? m.def.name : m.name] || ""
+        return m.sym || symbols[m.family && m.def ? m.def.name : m.name] || ""
     }
 
     // How well a command's name fits what's typed (0: not at all). Best first: the name starts
@@ -224,7 +224,6 @@ Item {
                     font.pixelSize: 18
                     focus: search.open
                     onTextChanged: search.current = 0
-                    Keys.onEscapePressed: search.open = false
                     Keys.onUpPressed: search.current = Math.max(0, search.current - 1)
                     Keys.onDownPressed: search.current = Math.min(search.matches.length - 1, search.current + 1)
                     Keys.onReturnPressed: search.run(search.current)
@@ -274,9 +273,11 @@ Item {
                         visible: symbol !== ""
                         kind: symbol
                         ink: theme.accent
-                        scale: 1.5                       // half again as large, easier to make out (owner t52u)
+                        full: true                       // GB-060 sizing standard: artwork fills the box
+                        width: 27                        // half again as large, easier to make out (owner t52u),
+                        height: 27                       // painted at that size, crisp (GB-059)
                         anchors.left: parent.left
-                        anchors.leftMargin: 17 + (modelData.depth ? 24 : 0)
+                        anchors.leftMargin: 12.5 + (modelData.depth ? 24 : 0)
                         anchors.verticalCenter: parent.verticalCenter
                     }
                     Column {

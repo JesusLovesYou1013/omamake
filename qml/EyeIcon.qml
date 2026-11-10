@@ -6,13 +6,17 @@ Canvas {
     id: eye
     property bool open: true
     property color ink: "white"
+    // Drawn in 18 x 12 units, scaled to `width` (GB-060 sizing standard: 22 wide on the Timeline, as
+    // wide as the Fillet / Chamfer symbols beside it).
     width: 18
-    height: 12
+    height: width * 12 / 18
+    onWidthChanged: requestPaint()
     onInkChanged: requestPaint()
     onOpenChanged: requestPaint()
     onPaint: {
         const ctx = getContext("2d")
         ctx.reset()
+        ctx.scale(width / 18, width / 18)
         const c = "rgb(" + Math.round(ink.r * 255) + "," + Math.round(ink.g * 255) + "," + Math.round(ink.b * 255) + ")"
         ctx.strokeStyle = c
         ctx.fillStyle = c

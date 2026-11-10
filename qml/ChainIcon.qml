@@ -9,6 +9,7 @@ Canvas {
     property color ink: "white"
     width: 18
     height: 18
+    onWidthChanged: requestPaint()
     onInkChanged: requestPaint()
     onBrokenChanged: requestPaint()
     onPaint: {
@@ -30,6 +31,7 @@ Canvas {
             c.stroke()
         }
         c.translate(width / 2, height / 2)
+        c.scale(Math.min(width, height) / 18, Math.min(width, height) / 18)   // drawn in 18, scaled to its size (GB-060)
         c.rotate(-Math.PI / 4)
         stadium(-off)
         stadium(off)

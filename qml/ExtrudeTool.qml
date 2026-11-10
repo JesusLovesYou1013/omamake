@@ -64,7 +64,7 @@ Item {
         if (adding || (!areas.length && picking < 0)) {
             if (!isArea(part)) {
                 say(adding ? "Only profiles and flat faces can be extruded; without Ctrl or Shift, a click picks the object to extrude up to."
-                           : "Click a profile or a flat face to extrude first.")
+                           : "Click a profile or a flat face to extrude first.", 0)
                 return
             }
             selection.selected = picked ? selection.selected.filter(p => !selection.same(p, part))
@@ -72,7 +72,7 @@ Item {
             return
         }
         if (picked) {
-            say("That's being extruded. Ctrl or Shift and click takes it away.")
+            say("That's being extruded. Ctrl or Shift and click takes it away.", 0)
             return
         }
         setTarget(picking >= 0 ? picking : 0, part)
@@ -83,11 +83,11 @@ Item {
         if (side === 0) { target1 = part; extent1 = "object" } else { target2 = part; extent2 = "object" }
         const f = doc.extrudeFrame(spec())
         if (!f.ok) {
-            say(f.why)
+            say(f.why, 0)
             if (side === 0) { target1 = was.t; extent1 = was.e } else { target2 = was.t; extent2 = was.e }
             return
         }
-        say(targetName(part) + ": the distance box is now how far past it (negative stops short)")
+        say(targetName(part) + ": the distance box is now how far past it (negative stops short)", 0)
     }
     property var lastSelected: []                 // the areas as they were, for a click that's turned away
     property var keepSelected: []                 // the areas, put back after that click
@@ -186,14 +186,14 @@ Item {
             tool[key] = lenText(-(r.ok ? r.mm : 25.4))
             if (!doc.extrudeFrame(spec()).ok) {
                 tool[key] = was
-                say("No body lies the other way to go through.")
+                say("No body lies the other way to go through.", 0)
             }
             return
         }
         picking = e === "object" ? side : -1
         if (e === "object") {
             keepSelected = selection.selected.slice()
-            say("Click a face, edge or point to extrude up to (Esc goes back to the distance)")
+            say("Click a face, edge or point to extrude up to (Esc goes back to the distance)", 0)
         }
         if (side === 0) extent1 = e; else extent2 = e
         // All, first time: the way there are bodies to go through (Fusion's arrow starts that way too).
@@ -235,7 +235,7 @@ Item {
             return
         const next = gather()
         if (next.length > 1 && !doc.extrudeFrame(Object.assign(spec(), { areas: next })).ok) {
-            say("That isn't on the same plane as the rest, so it wasn't added. To extrude up to it, choose To Object, then click it.")
+            say("That isn't on the same plane as the rest, so it wasn't added. To extrude up to it, choose To Object, then click it.", 0)
             selection.selected = lastSelected     // comes back here
             return
         }
@@ -311,7 +311,7 @@ Item {
         if (!ready)
             pickOnlyProfile()
         if (!ready)
-            say("Click a profile or a flat face to extrude; Ctrl or Shift adds more. Then a plain click picks what to extrude up to.")
+            say("Click a profile or a flat face to extrude; Ctrl or Shift adds more. Then a plain click picks what to extrude up to.", 0)
         Qt.callLater(() => { d1Field.forceActiveFocus(); d1Field.selectAll() })
     }
     function cancel() {
@@ -335,7 +335,7 @@ Item {
         if (!ready) { cancel(); return }
         const r = doc.extrudeInBackground(spec())
         if (!r.ok) {
-            say(r.why)
+            say(r.why, 0)
             return
         }
         open = false
@@ -369,7 +369,7 @@ Item {
         }
         frame = doc.extrudeFrame(spec())
         if (!frame.ok)
-            say(frame.why)
+            say(frame.why, 0)
         replan.restart()
         drawPreview()
     }
@@ -620,7 +620,6 @@ Item {
             visible: !dist.fixedText
             onTextEdited: dist.edited(text)
             onAccepted: tool.done()
-            Keys.onEscapePressed: tool.cancel()
         }
         Text {
             anchors.right: parent.right
@@ -822,8 +821,7 @@ Item {
                 clip: true
                 onTextEdited: { if (ext.side === 0) tool.taper1Text = text; else tool.taper2Text = text }
                 onAccepted: tool.done()
-                Keys.onEscapePressed: tool.cancel()
-            }
+                }
         }
     }
     Column {

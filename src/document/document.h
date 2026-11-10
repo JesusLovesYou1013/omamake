@@ -41,6 +41,7 @@ class Document : public QObject {
     Q_PROPERTY(int sketchReadyFrom READ sketchReadyFrom NOTIFY walkChanged)
     Q_PROPERTY(bool sketchWalkDone READ sketchWalkDone NOTIFY walkChanged)
     Q_PROPERTY(int modelBuiltTo READ modelBuiltTo NOTIFY buildChanged)
+    Q_PROPERTY(int modelBuildingTo READ modelBuildingTo NOTIFY buildChanged)
     Q_PROPERTY(int modelReadyFrom READ modelReadyFrom NOTIFY buildChanged)
     Q_PROPERTY(bool modelBuildDone READ modelBuildDone NOTIFY buildChanged)
     Q_PROPERTY(QVariantMap browser READ browser NOTIFY structureChanged)
@@ -48,6 +49,8 @@ class Document : public QObject {
     Q_PROPERTY(QString filePath READ filePath NOTIFY fileChanged)
     Q_PROPERTY(bool importing READ importing NOTIFY importChanged)
     Q_PROPERTY(bool working READ working NOTIFY workingChanged)
+    // Chamfer's preview is what's drawn (not the model under Ctrl/Shift): hover and picks go by it (GB-050).
+    Q_PROPERTY(bool chamferPreviewShown READ chamferPreviewShown WRITE setChamferPreviewShown NOTIFY chamferPreviewShownChanged)
     Q_PROPERTY(QString importStage READ importStage NOTIFY importChanged)
     Q_PROPERTY(QString importName READ importName NOTIFY importChanged)
 
@@ -121,6 +124,10 @@ public:
     // modelReadyFrom: from which history length on the marker can go back now (the file's steps: once all are
     // built); modelBuildDone: nothing more is coming (built, or it couldn't be: buildWhy says why).
     int modelBuiltTo() const { return m_builtTo; }
+    // modelBuildingTo (GB-062): how far the background rebuild itself has got (the history length of the step it last
+    // made again; -1: not building). Only for the Timeline's progress fill: the steps can't be gone back over until
+    // they're all here (modelBuiltTo / modelReadyFrom).
+    int modelBuildingTo() const { return m_buildingTo; }
     int modelReadyFrom() const { return m_buildDone && m_buildWhy.isEmpty() ? 0 : std::min(m_loaded, int(m_actions.size())); }
     bool modelBuildDone() const { return m_buildDone; }
     Q_INVOKABLE QString buildWhy() const { return m_buildWhy; }
@@ -157,6 +164,8 @@ public:
     // through: Select Through, edges and corners behind the model count too (owner, 2026-11-02).
     Q_INVOKABLE QVariantMap pick(QVector3D origin, QVector3D direction, float pointReach, float edgeReach, bool through = false) const;
     Q_INVOKABLE int faceTotal() const { return int(m_mesh.faceCount); }
+    // A body's exact volume in mm³ (0 when it isn't one), for tests and checks.
+    Q_INVOKABLE double volumeOf(int body) const { return m_bodies.count(body) ? m_engine->volume(omamake::BodyId(body)) : 0; }
 
     // Shapes that show parts of the model (hover or selection): faces as copies of their
     // triangles, edges as thin tubes, points as small balls. parts: [{kind, index}, ...].
@@ -187,6 +196,47 @@ public:
     Q_INVOKABLE QVariantMap extrudeFrame(const QVariantMap &spec);
     Q_INVOKABLE void fillExtrudePreview(MeshGeometry *target, MeshGeometry *wire, const QVariantMap &spec, int side);
     Q_INVOKABLE void fillExtrudeCutaway(MeshGeometry *target, const QVariantMap &spec, int side);
+    // Model Chamfer (owner, 2026-11-08: everything Fusion's has, and where Fusion gives up it does its best).
+    // spec: {corner: "chamfer" | "miter" | "blend",
+    //        sets: [{type: "equal" | "two" | "angle", d1, d2 (mm), angle (degrees, from d1's face), flip, chain,
+    //                edges: [edgeRef], faces: [faceRef], features: [{step, summary, edges: [edgeRef]}]}]}
+    // A ref names a part by its body and its number in that body, with where it was (`at`, mm) so an
+    // edge is found again even if the numbering moved. chamfer does it as ONE history item.
+    Q_INVOKABLE QVariantMap chamfer(const QVariantMap &spec);
+    // The same off the main thread; the answer comes as chamferFinished.
+    Q_INVOKABLE QVariantMap chamferInBackground(const QVariantMap &spec);
+    // A picked part (the model's mesh numbering) as a ref; {} when it isn't a body's.
+    Q_INVOKABLE QVariantMap edgeRef(int edge) const;
+    Q_INVOKABLE QVariantMap faceRef(int face) const;
+    // A corner (point) as Chamfer / Fillet keep it (GB-053): {body, point (its number in the body), at}.
+    Q_INVOKABLE QVariantMap pointRef(int point) const;
+    // The edges a spec would chamfer, in the model's mesh numbering (for drawing them picked), per set: [[edge...]...].
+    Q_INVOKABLE QVariantList chamferPicked(const QVariantMap &spec) const;
+    // Where each set's bevel sits, for its boxes and arrow: per set {ok, edge:[x,y,z], end1:[...], end2:[...]} (mm).
+    Q_INVOKABLE QVariantList chamferFrame(const QVariantMap &spec) const;
+    // A Timeline step's edges, as Fusion's Features selection takes them (the edges its faces made): [edgeRef].
+    Q_INVOKABLE QVariantList featureEdgeRefs(int step) const;
+    // The newest Timeline step (an extrude or a chamfer) that made this face (or edge): {ok, step, summary, edges}.
+    Q_INVOKABLE QVariantMap featureAt(const QString &kind, int index) const;
+    // The model as the chamfer would leave it, worked out off the main thread on an engine of its own;
+    // drawn into faces/edges when ready (chamferPreviewReady). Each call drops any older one still running.
+    Q_INVOKABLE void chamferPreview(const QVariantMap &spec, MeshGeometry *faces, MeshGeometry *edges);
+    // The preview put away (Chamfer closed, or nothing to preview): one still running is dropped, and picks
+    // are drawn on the model as it is again.
+    Q_INVOKABLE void dropChamferPreview();
+    // The Timeline's marker part way across an Extrude, Chamfer or Fillet step (GB-057, owner pt159u: "dragging
+    // back and forth will live show us the fillet or chamfer being applied in real time"; GB-058, pt160u: "it means
+    // to basically represent the actual object in real time, in real space"): the design is as it was before the
+    // step (the newest `actions` actions taken back), and the step is shown as real solids part way: a Chamfer /
+    // Fillet with all its sizes times the fraction, an Extrude grown to that fraction of its length (capped).
+    // rewindFramesBegin starts working out its frames (1/N .. N/N) off the main thread, on an engine of its own,
+    // nearest the marker first; false when the step is none of those (the plane split stands in). rewindFramesShow
+    // draws the ready frame nearest `fraction` (never past it from the one drawn) into faces/edges and returns its
+    // number (0: none; the design as it is shows). A frame coming in says rewindFrameReady. rewindFramesState
+    // (probes): {key, total, ready, shown, volumes: [mm^3 per frame, 0 not ready]}.
+    Q_INVOKABLE bool rewindFramesBegin(int actions);
+    Q_INVOKABLE int rewindFramesShow(double fraction, MeshGeometry *faces, MeshGeometry *edges);
+    Q_INVOKABLE QVariantMap rewindFramesState() const;
     // Find in Window (Fusion's name; owner, 2026-10-30): how to bring a Browser row's things
     // (`key`: a body, sketch, component, folder or origin part) back into full view. `from` is
     // the way the camera looks from now (scene coordinates, pivot → camera), `halfAngle` the
@@ -240,21 +290,22 @@ public:
     Q_INVOKABLE QVariantMap shownSketchPoints(int sketch) const;
 
     // Fusion's Line: one straight line, an action in the sketch's own history. from and to
-    // are a point id (to join a line already there) or {u, v} for a new point. Returns
+    // are {point: id} (to join a line already there) or {u, v} for a new point. Returns
     // {line, from, to} (the point ids used), or {} if the two ends are the same point.
-    // from / to: a point id, or {u, v} for a new point; a new point may carry what it was
+    // from / to: {point: id}, or {u, v} for a new point (typed as maps so QML's objects arrive
+    // converted on every Qt version); a new point may carry what it was
     // snapped onto (owner, 2026-10-30), held there by a constraint made with the line:
     // on: "origin" (Coincident with the Origin), "midpoint" with line: id (Midpoint), or "line"
     // with line: id (on that line or axis, free to slide along it).
     // hold: "horizontal" / "vertical" when the line was snapped level / upright, else "".
     // construction: the line is a construction line (Toggle Construction).
-    Q_INVOKABLE QVariantMap addSketchLine(int sketch, const QVariant &from, const QVariant &to,
+    Q_INVOKABLE QVariantMap addSketchLine(int sketch, const QVariantMap &from, const QVariantMap &to,
                                           const QString &hold = QString(), bool construction = false);
 
     // Fusion's 2-Point Rectangle: four lines square to the sketch's axes between two
-    // opposite corners (point id or {u, v}), held as a rectangle by Perpendicular and
+    // opposite corners ({point: id} or {u, v}), held as a rectangle by Perpendicular and
     // Parallel only, so it can be turned (owner, 2026-10-30). One action. Returns {lines: [4 ids]}, or {} if it's flat.
-    Q_INVOKABLE QVariantMap addSketchRectangle(int sketch, const QVariant &corner, const QVariant &opposite,
+    Q_INVOKABLE QVariantMap addSketchRectangle(int sketch, const QVariantMap &corner, const QVariantMap &opposite,
                                                bool construction = false);
 
     // Any drawing or modifying tool's work in one go (owner, 2026-10-30: all of Fusion's sketch
@@ -290,6 +341,7 @@ public:
     // drag can be tried the way the pointer does it. kind: press, move, release.
     Q_INVOKABLE void testMouse(QObject *window, const QString &kind, double x, double y);
     Q_INVOKABLE void testKey(QObject *window, int key, const QString &text = QString(), int modifiers = 0);
+    Q_INVOKABLE void testHeld(int modifiers);
     Q_INVOKABLE bool beginSketchTextSlide(int sketch, int curve, double u, double v);
     Q_INVOKABLE bool slideSketchText(int sketch, int curve, double u, double v);
     Q_INVOKABLE bool endSketchTextSlide(int sketch);
@@ -491,6 +543,13 @@ public:
     Q_INVOKABLE void fitSurfaces();
     bool importing() const { return m_importing; }
     bool working() const { return m_working; }
+    bool chamferPreviewShown() const { return m_chamferPreviewShown; }
+    void setChamferPreviewShown(bool on) {
+        if (on != m_chamferPreviewShown) {
+            m_chamferPreviewShown = on;
+            emit chamferPreviewShownChanged();
+        }
+    }
     QString importStage() const { return m_importStage; }
     QString importName() const { return m_importName; }
     // Load (Fusion's Open; owner, 2026-10-30): reads an .omamake file back into this window, in place
@@ -519,6 +578,10 @@ signals:
     void importChanged();
     void workingChanged();
     void extrudeFinished(const QVariantMap &result);
+    void chamferFinished(const QVariantMap &result);
+    void chamferPreviewReady(bool ok, const QString &note);
+    void rewindFrameReady(int frame);
+    void chamferPreviewShownChanged();
     void importFinished(const QString &why, double seconds, int faces, int triangles);
     void fitFinished(const QString &why, double seconds, int cylinders, int cones, int spheres, int trianglesLeft, double worstMm);
 
@@ -604,6 +667,64 @@ private:
     ExtrudeResult computeExtrudeTrying(ExtrudeJob job) const;
     QString writeExtrudeLog(const ExtrudeResult &r, const QVariantMap &spec, const QString &said) const;
     QVariantMap applyExtrude(ExtrudeResult &&r, const QVariantMap &spec);
+    struct ChamferJob {
+        std::map<int, std::vector<omamake::ChamferEdge>> perBody;   // body -> its edges, numbered in that body
+        std::map<int, std::map<int, QString>> where;                // body -> edge -> how a person finds it
+        std::map<int, QString> names;                               // body -> its name
+        omamake::ChamferCorner corner = omamake::ChamferCorner::Chamfer;
+        int lost = 0;                                               // picked parts that aren't there any more
+        bool round = false;                                         // Fillet's sets (radius / chord), not Chamfer's
+    };
+    bool readChamfer(const QVariantMap &spec, ChamferJob &job, QString &why) const;
+    int findEdge(int body, int edge, const QVariantList &at) const;
+    int findPoint(int body, int point, const QVariantList &at) const;
+    static QJsonObject chamferBodies(const QJsonObject &spec, const std::function<int(int)> &id);
+    struct ChamferResult {
+        std::vector<std::pair<int, int>> swaps;
+        std::map<int, omamake::Mesh> meshes;
+        QStringList ranThrough, skipped, notes;
+        int edges = 0, points = 0;
+    };
+    ChamferResult computeChamfer(const ChamferJob &job) const;
+    QVariantMap applyChamfer(ChamferResult &&r, const QVariantMap &spec, int lost);
+    int m_previewGen = 0;
+    // Chamfer's preview, so picks are drawn on the model as the chamfer would leave it (fillParts), not as it
+    // is (owner, 2026-11-09): per chamfered body, its mesh after the chamfer, and per face of that mesh a spot
+    // inside it and which way it faces (to know it as the body's face it was, trimmed back by the bevels).
+    struct ChamferLook {
+        omamake::Mesh mesh;
+        std::vector<QVector3D> spot, facing;
+        // Worked out when first needed (Document::mapLook): each of the preview's faces as the body's face it
+        // is what's left of (-1: a bevel), and each of the body's edges as the preview's edges along it (none:
+        // the chamfer takes it away). Body-local numbers.
+        mutable bool mapped = false;
+        mutable std::vector<int> faceOf;
+        mutable std::vector<std::vector<int>> edgesOf;
+    };
+    bool m_chamferPreviewShown = false;
+    void mapLook(int body, const ChamferLook &look) const;
+    std::map<int, ChamferLook> m_chamferLook;
+    // The model with some bodies' meshes in place of their own (Chamfer's preview, the rewind's frames).
+    // `extra`: one more mesh drawn with them (a rewind frame's own solid).
+    omamake::Mesh modelWith(const std::map<int, omamake::Mesh> &instead, const omamake::Mesh *extra = nullptr) const;
+    // GB-057 / GB-058: the rewind's frames, for the step named by m_rewindKey.
+    struct RewindWork {
+        std::atomic<bool> stop{false};
+        std::atomic<int> want{0};
+    };
+    struct RewindFrame {
+        omamake::Mesh model;
+        double volume = 0;
+    };
+    std::shared_ptr<RewindWork> m_rewindWork;
+    QString m_rewindKey;
+    int m_rewindTotal = 0;
+    int m_rewindShown = 0;
+    std::map<int, RewindFrame> m_rewindFrames;
+    static ChamferLook lookOf(omamake::Mesh mesh);
+    // The look drawn in place of the body that owns part `index` (owner: m_faceBody or m_edgeBody), and the
+    // part's number in that body; null when its body isn't being previewed.
+    const ChamferLook *lookFor(const std::vector<int> &owner, int index, int &local) const;
     const omamake::Mesh &bodyMesh(int id) const;
     std::map<int, std::vector<std::pair<int, int>>> m_extrudeKeep;   // per extrude: (old solid, solid it became), for undo
     int m_extrudeToken = 1;
@@ -764,6 +885,7 @@ private:
     std::set<int> m_builtOwned;            // solids loaded for m_built: never let go of by undo
     int m_loaded = 0;                      // the steps that came from the file
     int m_builtTo = -1;
+    int m_buildingTo = -1;                 // modelBuildingTo (GB-062)
     bool m_buildDone = true, m_buildStarted = false;
     QString m_buildWhy;
     int m_buildGen = 0;                    // which opening a result from the thread belongs to

@@ -66,6 +66,17 @@ void Document::fill(MeshGeometry *faces, MeshGeometry *edges) const {
         edges->setMesh(m_mesh);
 }
 
+// Model Chamfer and Model Fillet are one pipeline (GB-051): a spec whose sets are Fillet's ("radius" / "chord")
+// rounds, and its Timeline step is a "fillet"; everything else about the two steps is the same.
+static bool filletSpec(const QVariantMap &spec) {
+    for (const QVariant &v : spec.value(QStringLiteral("sets")).toList()) {
+        const QString type = v.toMap().value(QStringLiteral("type")).toString();
+        return type == QLatin1String("radius") || type == QLatin1String("chord");
+    }
+    return spec.value(QStringLiteral("feature")).toString() == QLatin1String("fillet");
+}
+static bool edgeStep(const QString &type) { return type == QLatin1String("chamfer") || type == QLatin1String("fillet"); }
+
 namespace {
 
 // Fit Curved Surfaces keeps every point of the source within this share of its surface's radius
@@ -864,8 +875,8 @@ QString Document::openFrom(const QString &path) {
         if (haveSolids) {
             const auto id = [&solidOf](int was) { return solidOf.count(was) ? solidOf.at(was) : (was > 0 ? -was : was); };
             const auto ids = [&id](const QJsonArray &list) { QJsonArray out; for (const QJsonValue &v : list) out.append(id(v.toInt())); return out; };
-            if (kind == QLatin1String("extrude") || kind == QLatin1String("cube") || kind == QLatin1String("import_step")
-                || kind == QLatin1String("import_mesh")) {
+            if (kind == QLatin1String("extrude") || edgeStep(kind) || kind == QLatin1String("cube")
+                || kind == QLatin1String("import_step") || kind == QLatin1String("import_mesh")) {
                 if (a.contains(QStringLiteral("body")))
                     a.insert(QStringLiteral("body"), id(a.value(QStringLiteral("body")).toInt()));
                 a.insert(QStringLiteral("created"), ids(a.value(QStringLiteral("created")).toArray()));
@@ -878,6 +889,8 @@ QString Document::openFrom(const QString &path) {
                     spec.insert(QStringLiteral("skip1"), ids(spec.value(QStringLiteral("skip1")).toArray()));
                     spec.insert(QStringLiteral("skip2"), ids(spec.value(QStringLiteral("skip2")).toArray()));
                     a.insert(QStringLiteral("spec"), spec);
+                } else if (edgeStep(kind)) {
+                    a.insert(QStringLiteral("spec"), chamferBodies(a.value(QStringLiteral("spec")).toObject(), id));
                 }
             } else if (kind == QLatin1String("visibility") && a.value(QStringLiteral("key")).toString().startsWith(QLatin1Char('b'))) {
                 a.insert(QStringLiteral("key"), QStringLiteral("b%1").arg(id(a.value(QStringLiteral("key")).toString().mid(1).toInt())));
@@ -1259,7 +1272,7 @@ bool Document::undoInto(std::vector<Redo> &into, QJsonObject &undone) {
         m_bodyFile = before.file;
         refreshMesh();
         emit changed();
-    } else if (type == QLatin1String("extrude")) {
+    } else if (type == QLatin1String("extrude") || edgeStep(type)) {
         const auto kept = m_extrudeKeep.find(last.value(QStringLiteral("token")).toInt());
         if (kept == m_extrudeKeep.end())
             return false;                    // made before this file was opened: the old solids aren't kept
@@ -1864,9 +1877,41 @@ struct Document::Arrived {
     QString why;                            // set: it stopped (states only before `stoppedAt`)
 };
 
+// A chamfer's spec with every body it names (edges, faces, features' edges) passed through `id`.
+QJsonObject Document::chamferBodies(const QJsonObject &spec, const std::function<int(int)> &id) {
+    const auto refs = [&id](const QJsonArray &list) {
+        QJsonArray out;
+        for (const QJsonValue &v : list) {
+            QJsonObject ref = v.toObject();
+            ref.insert(QStringLiteral("body"), id(ref.value(QStringLiteral("body")).toInt()));
+            out.append(ref);
+        }
+        return out;
+    };
+    QJsonObject out = spec;
+    QJsonArray sets;
+    for (const QJsonValue &v : spec.value(QStringLiteral("sets")).toArray()) {
+        QJsonObject set = v.toObject();
+        set.insert(QStringLiteral("edges"), refs(set.value(QStringLiteral("edges")).toArray()));
+        set.insert(QStringLiteral("faces"), refs(set.value(QStringLiteral("faces")).toArray()));
+        if (set.contains(QStringLiteral("points")))
+            set.insert(QStringLiteral("points"), refs(set.value(QStringLiteral("points")).toArray()));
+        QJsonArray features;
+        for (const QJsonValue &f : set.value(QStringLiteral("features")).toArray()) {
+            QJsonObject feature = f.toObject();
+            feature.insert(QStringLiteral("edges"), refs(feature.value(QStringLiteral("edges")).toArray()));
+            features.append(feature);
+        }
+        set.insert(QStringLiteral("features"), features);
+        sets.append(set);
+    }
+    out.insert(QStringLiteral("sets"), sets);
+    return out;
+}
+
 bool Document::changesBodies(const QJsonObject &a) {
     const QString type = a.value(QStringLiteral("type")).toString();
-    return type == QLatin1String("extrude") || type == QLatin1String("import_step") || type == QLatin1String("import_mesh")
+    return type == QLatin1String("extrude") || edgeStep(type) || type == QLatin1String("import_step") || type == QLatin1String("import_mesh")
         || type == QLatin1String("fit_surfaces") || type == QLatin1String("cube")
         || (type == QLatin1String("visibility") && a.value(QStringLiteral("key")).toString().startsWith(QLatin1Char('b')));
 }
@@ -1888,6 +1933,7 @@ void Document::cancelBuild() {
     m_buildDone = true;
     m_buildWhy.clear();
     m_builtTo = -1;
+    m_buildingTo = -1;
     m_loaded = 0;
 }
 
@@ -1982,9 +2028,26 @@ void Document::startBuild() {
             out->states[count] = std::move(b);
         };
         snap(0, {});
+        // How far it has got, told to the Timeline's progress fill (GB-062) at most every 120 ms.
+        QElapsedTimer told;
+        told.start();
+        const auto tell = [&self, gen](int count) {
+            if (self.isNull())
+                return;
+            QMetaObject::invokeMethod(self.data(), [self, gen, count] {
+                if (self.isNull() || self->m_buildGen != gen || self->m_buildDone)
+                    return;
+                self->m_buildingTo = std::max(self->m_buildingTo, count);
+                emit self->buildChanged();
+            }, Qt::QueuedConnection);
+        };
         for (const Step &s : plan) {
             if (*cancel)
                 return;
+            if (told.elapsed() > 120) {
+                told.restart();
+                tell(s.count - 1);
+            }
             if (!out->why.isEmpty())
                 break;
             const QJsonObject &a = s.action;
@@ -2063,6 +2126,32 @@ void Document::startBuild() {
                     if (now == int(from))
                         now = int(body);
                 r.swapBody(int(from), body);
+            } else if (edgeStep(type)) {
+                bool lost = false;
+                const QJsonObject spec = chamferBodies(a.value(QStringLiteral("spec")).toObject(), [&](int was) {
+                    const auto found = toR.find(was);
+                    lost = lost || found == toR.end();
+                    return found == toR.end() ? 0 : found->second;
+                });
+                if (lost) {
+                    fail(type == QLatin1String("fillet") ? QStringLiteral("a filleted body that can't be followed") : QStringLiteral("a chamfered body that can't be followed"));
+                    continue;
+                }
+                const QVariantMap done = r.chamfer(spec.toVariantMap());
+                if (!done.value(QStringLiteral("ok")).toBool()) {
+                    fail((type == QLatin1String("fillet") ? QStringLiteral("a fillet couldn't be made again: ") : QStringLiteral("a chamfer couldn't be made again: ")) + done.value(QStringLiteral("why")).toString());
+                    continue;
+                }
+                const auto &swaps = r.m_extrudeKeep.at(r.m_extrudeToken - 1);
+                for (const QJsonValue &v : a.value(QStringLiteral("swaps")).toArray()) {
+                    const QJsonArray pair = v.toArray();
+                    const auto from = toR.find(pair[0].toInt());
+                    if (from == toR.end())
+                        continue;
+                    for (const auto &[old, now] : swaps)
+                        if (old == from->second)
+                            toR[pair[1].toInt()] = now;
+                }
             } else if (type == QLatin1String("extrude")) {
                 for (const auto &[id, named] : s.sketches) {
                     const auto found = r.m_sketches.find(id);
@@ -2112,6 +2201,8 @@ void Document::startBuild() {
             if (out->why.isEmpty() && changesBodies(a))
                 snap(s.count, at);
         }
+        if (!plan.empty())
+            tell(plan.back().count);
         // The solids the states use: the last state's bodies are the file's own; the others travel as bytes.
         out->finalBodies = r.m_bodies;
         if (!out->why.isEmpty())
@@ -2763,6 +2854,7 @@ void Document::refreshMesh() {
         first = false;
     }
     m_bvh.clear();
+    m_chamferLook.clear();              // numbered as the model was
     m_boundsMin = QVector3D(m_mesh.min[0], m_mesh.min[1], m_mesh.min[2]);
     m_boundsMax = QVector3D(m_mesh.max[0], m_mesh.max[1], m_mesh.max[2]);
 }
@@ -2899,18 +2991,49 @@ int Document::faceAt(QVector3D origin, QVector3D direction) const {
 
 QVariantMap Document::pick(QVector3D origin, QVector3D direction, float pointReach, float edgeReach, bool through) const {
     const QVector3D d = direction.normalized();
+    // Under Chamfer's preview a previewed body is picked as the preview draws it (owner, 2026-11-09, GB-050):
+    // its faces hide what's behind them, a part the chamfer takes away can't be hovered or picked, and an edge
+    // it trims is picked along what's left of it. Each previewed body's first face / edge / point number.
+    std::map<int, std::array<int, 3>> previewed;
+    if (m_chamferPreviewShown)
+        for (const auto &[body, look] : m_chamferLook) {
+            mapLook(body, look);
+            const auto first = [&](const std::vector<int> &owner) {
+                const auto it = std::find(owner.begin(), owner.end(), body);
+                return it == owner.end() ? -1 : int(it - owner.begin());
+            };
+            previewed[body] = {first(m_faceBody), first(m_edgeBody), first(m_pointBody)};
+        }
+    const auto underPreview = [&](const std::vector<int> &owner, std::size_t i) {
+        return !previewed.empty() && i < owner.size() && previewed.count(owner[i]);
+    };
 
     // The nearest solid surface along the ray hides anything behind it.
     float hitT = INFINITY;
-    std::uint32_t hitFace = 0;
+    int hitFace = 0;
     const std::size_t triCount = m_mesh.indices.size() / 3;
     for (std::size_t t = 0; t < triCount; ++t) {
+        if (underPreview(m_faceBody, m_mesh.triangleFace[t]))
+            continue;
         const float h = rayTriangle(origin, d, at(m_mesh.positions, m_mesh.indices[t * 3]),
                                     at(m_mesh.positions, m_mesh.indices[t * 3 + 1]),
                                     at(m_mesh.positions, m_mesh.indices[t * 3 + 2]));
         if (h < hitT) {
             hitT = h;
-            hitFace = m_mesh.triangleFace[t];
+            hitFace = int(m_mesh.triangleFace[t]);
+        }
+    }
+    for (const auto &[body, first] : previewed) {
+        const ChamferLook &look = m_chamferLook.at(body);
+        const omamake::Mesh &m = look.mesh;
+        for (std::size_t t = 0; t < m.indices.size() / 3; ++t) {
+            const float h = rayTriangle(origin, d, at(m.positions, m.indices[t * 3]), at(m.positions, m.indices[t * 3 + 1]),
+                                        at(m.positions, m.indices[t * 3 + 2]));
+            if (h < hitT) {
+                hitT = h;
+                const int was = m.triangleFace[t] < look.faceOf.size() ? look.faceOf[m.triangleFace[t]] : -1;
+                hitFace = was >= 0 && first[0] >= 0 ? first[0] + was : -1;     // -1: a bevel, not a face of the body
+            }
         }
     }
     auto visible = [&](float t, float reach) { return through || t <= hitT + reach * 2; };
@@ -2927,6 +3050,15 @@ QVariantMap Document::pick(QVector3D origin, QVector3D direction, float pointRea
     float bestT = INFINITY;
     for (std::size_t i = 0; i < m_mesh.points.size() / 3; ++i) {
         const QVector3D p = at(m_mesh.points, i);
+        if (underPreview(m_pointBody, i)) {     // a corner of the body: only where the preview still has one
+            const ChamferLook &look = m_chamferLook.at(m_pointBody[i]);
+            const float reach = 0.003f * QVector3D(look.mesh.max[0] - look.mesh.min[0], look.mesh.max[1] - look.mesh.min[1], look.mesh.max[2] - look.mesh.min[2]).length();
+            bool kept = false;
+            for (std::size_t k = 0; !kept && k < look.mesh.points.size() / 3; ++k)
+                kept = (at(look.mesh.points, k) - p).length() <= reach;
+            if (!kept)
+                continue;
+        }
         const float t = QVector3D::dotProduct(p - origin, d);
         const float reach = std::max(t, 1.0f) * pointReach;
         if (t > 0 && (origin + d * t - p).length() <= reach && visible(t, reach) && t < bestT) {
@@ -2940,26 +3072,39 @@ QVariantMap Document::pick(QVector3D origin, QVector3D direction, float pointRea
     // The nearest to the pointer wins; edges about as near (an edge exactly behind another, seen
     // end-on, with Select Through on) go to the one nearer the camera (owner, 2026-11-02).
     float bestGap = INFINITY, bestEdgeT = INFINITY;
+    std::vector<const std::vector<float> *> lines;
     for (std::size_t e = 0; e < m_mesh.edges.size(); ++e) {
-        const auto &line = m_mesh.edges[e];
-        for (std::size_t i = 0; i + 1 < line.size() / 3; ++i) {
-            const auto [t, gap] = raySegment(origin, d, at(line, i), at(line, i + 1));
-            const float reach = std::max(t, 1.0f) * edgeReach;
-            if (gap > reach || !visible(t, reach))
-                continue;
-            const float score = gap / reach;
-            if (score < bestGap - 0.05f || (score < bestGap + 0.05f && t < bestEdgeT)) {
-                best = int(e);
-                bestGap = std::min(bestGap, score);
-                bestEdgeT = t;
+        lines.assign(1, &m_mesh.edges[e]);
+        if (underPreview(m_edgeBody, e)) {     // along what the preview leaves of it, or not at all
+            const auto &[body, first] = *previewed.find(m_edgeBody[e]);
+            const ChamferLook &look = m_chamferLook.at(body);
+            const std::size_t local = e - std::size_t(first[1]);
+            lines.clear();
+            if (local < look.edgesOf.size())
+                for (const int k : look.edgesOf[local])
+                    lines.push_back(&look.mesh.edges[std::size_t(k)]);
+        }
+        for (const std::vector<float> *drawn : lines) {
+            const auto &line = *drawn;
+            for (std::size_t i = 0; i + 1 < line.size() / 3; ++i) {
+                const auto [t, gap] = raySegment(origin, d, at(line, i), at(line, i + 1));
+                const float reach = std::max(t, 1.0f) * edgeReach;
+                if (gap > reach || !visible(t, reach))
+                    continue;
+                const float score = gap / reach;
+                if (score < bestGap - 0.05f || (score < bestGap + 0.05f && t < bestEdgeT)) {
+                    best = int(e);
+                    bestGap = std::min(bestGap, score);
+                    bestEdgeT = t;
+                }
             }
         }
     }
     if (best >= 0)
         return result("edge", best);
 
-    if (std::isfinite(hitT))
-        return result("face", int(hitFace));
+    if (std::isfinite(hitT) && hitFace >= 0)
+        return result("face", hitFace);
     return result("", -1);
 }
 
@@ -3280,6 +3425,136 @@ QVariantMap Document::facePlane(int face) const {
     return plane;
 }
 
+namespace {
+
+float diagonal(const omamake::Mesh &m) {
+    return QVector3D(m.max[0] - m.min[0], m.max[1] - m.min[1], m.max[2] - m.min[2]).length();
+}
+
+// Whether a spot facing this way lies on a face of a mesh (one of its facets faces the same way and the spot
+// drops onto it from within reach): how a face of Chamfer's preview is known as the face of the body it was.
+// `face` -1: any face; the first that has it (else -1).
+int faceHolding(const omamake::Mesh &m, int face, const QVector3D &p, const QVector3D &facing, float reach) {
+    for (std::size_t t = 0; t < m.indices.size() / 3; ++t) {
+        if (face >= 0 && m.triangleFace[t] != std::uint32_t(face))
+            continue;
+        const QVector3D a = at(m.positions, m.indices[t * 3]), b = at(m.positions, m.indices[t * 3 + 1]),
+                        c = at(m.positions, m.indices[t * 3 + 2]);
+        const QVector3D n = QVector3D::crossProduct(b - a, c - a).normalized();
+        if (QVector3D::dotProduct(n, facing) < 0.9f)       // a bevel faces well away from the faces it cut
+            continue;
+        const float off = QVector3D::dotProduct(p - a, n);
+        if (std::abs(off) > reach)
+            continue;
+        // Where the spot drops onto the facet, in its corners' shares (a little slack: a round face's
+        // facets don't sit exactly where the preview's do).
+        const QVector3D u = b - a, v = c - a, w = p - n * off - a;
+        const float uu = QVector3D::dotProduct(u, u), uv = QVector3D::dotProduct(u, v), vv = QVector3D::dotProduct(v, v);
+        const float wu = QVector3D::dotProduct(w, u), wv = QVector3D::dotProduct(w, v);
+        const float den = uu * vv - uv * uv;
+        if (den <= 0)
+            continue;
+        const float s = (vv * wu - uv * wv) / den, r = (uu * wv - uv * wu) / den;
+        if (s >= -0.05f && r >= -0.05f && s + r <= 1.05f)
+            return int(m.triangleFace[t]);
+    }
+    return -1;
+}
+bool onFace(const omamake::Mesh &m, std::uint32_t face, const QVector3D &p, const QVector3D &facing, float reach) {
+    return faceHolding(m, int(face), p, facing, reach) >= 0;
+}
+
+// Whether a polyline runs along another: its two ends and its middle all within reach of it.
+bool alongLine(const std::vector<float> &line, const std::vector<float> &on, float reach) {
+    const auto near = [&](const QVector3D &p) {
+        for (std::size_t k = 0; k + 1 < on.size() / 3; ++k) {
+            const QVector3D a = at(on, k), ab = at(on, k + 1) - a;
+            const float len2 = ab.lengthSquared();
+            const float s = len2 > 0 ? std::clamp(QVector3D::dotProduct(p - a, ab) / len2, 0.f, 1.f) : 0.f;
+            if ((a + ab * s - p).length() <= reach)
+                return true;
+        }
+        return false;
+    };
+    const std::size_t n = line.size() / 3;
+    return n >= 2 && near(at(line, 0)) && near(at(line, n - 1)) && near((at(line, (n - 1) / 2) + at(line, n / 2)) / 2);
+}
+
+} // namespace
+
+Document::ChamferLook Document::lookOf(omamake::Mesh mesh) {
+    // Each face's biggest facet gives its spot (the middle) and facing.
+    ChamferLook look;
+    look.spot.resize(mesh.faceCount);
+    look.facing.resize(mesh.faceCount);
+    std::vector<float> biggest(mesh.faceCount, -1);
+    for (std::size_t t = 0; t < mesh.indices.size() / 3; ++t) {
+        const std::uint32_t f = mesh.triangleFace[t];
+        const QVector3D a = at(mesh.positions, mesh.indices[t * 3]), b = at(mesh.positions, mesh.indices[t * 3 + 1]),
+                        c = at(mesh.positions, mesh.indices[t * 3 + 2]);
+        const QVector3D cross = QVector3D::crossProduct(b - a, c - a);
+        const float area = cross.length();
+        if (f < mesh.faceCount && area > biggest[f]) {
+            biggest[f] = area;
+            look.spot[f] = (a + b + c) / 3;
+            look.facing[f] = cross / area;
+        }
+    }
+    look.mesh = std::move(mesh);
+    return look;
+}
+
+void Document::mapLook(int body, const ChamferLook &look) const {
+    if (look.mapped)
+        return;
+    look.mapped = true;
+    const omamake::Mesh &before = bodyMesh(body);
+    const float faceReach = 0.02f * diagonal(before), edgeReach = 0.003f * diagonal(before);
+    look.faceOf.assign(look.mesh.faceCount, -1);
+    for (std::uint32_t f = 0; f < look.mesh.faceCount; ++f)
+        look.faceOf[f] = faceHolding(before, -1, look.spot[f], look.facing[f], faceReach);
+    // Boxes round each line first, so only lines that could lie along each other are compared (hover asks
+    // for this on the first move after each new preview; a big model has hundreds of edges either side).
+    const auto boxOf = [](const std::vector<float> &line) {
+        std::array<float, 6> b{INFINITY, INFINITY, INFINITY, -INFINITY, -INFINITY, -INFINITY};
+        for (std::size_t i = 0; i + 2 < line.size(); i += 3)
+            for (int k = 0; k < 3; ++k) {
+                b[k] = std::min(b[k], line[i + k]);
+                b[k + 3] = std::max(b[k + 3], line[i + k]);
+            }
+        return b;
+    };
+    std::vector<std::array<float, 6>> lookBoxes;
+    for (const auto &e : look.mesh.edges)
+        lookBoxes.push_back(boxOf(e));
+    look.edgesOf.assign(before.edges.size(), {});
+    for (std::size_t was = 0; was < before.edges.size(); ++was) {
+        const auto w = boxOf(before.edges[was]);
+        for (std::size_t e = 0; e < look.mesh.edges.size(); ++e) {
+            const auto &b = lookBoxes[e];
+            bool inside = true;      // the preview's line lies within the body's line's box (plus reach)
+            for (int k = 0; k < 3 && inside; ++k)
+                inside = b[k] >= w[k] - edgeReach && b[k + 3] <= w[k + 3] + edgeReach;
+            if (inside && alongLine(look.mesh.edges[e], before.edges[was], edgeReach))
+                look.edgesOf[was].push_back(int(e));
+        }
+    }
+}
+
+const Document::ChamferLook *Document::lookFor(const std::vector<int> &owner, int index, int &local) const {
+    // Only while the preview is what's drawn: under Ctrl/Shift the model as it is shows, and its own parts light.
+    if (!m_chamferPreviewShown || m_chamferLook.empty() || index < 0 || std::size_t(index) >= owner.size())
+        return nullptr;
+    const auto found = m_chamferLook.find(owner[std::size_t(index)]);
+    if (found == m_chamferLook.end())
+        return nullptr;
+    int first = index;
+    while (first > 0 && owner[std::size_t(first - 1)] == owner[std::size_t(index)])
+        --first;
+    local = index - first;
+    return &found->second;
+}
+
 void Document::fillParts(MeshGeometry *target, const QVariantList &parts, float edgeRadius, QVector3D eye, float perMm, bool lean) const {
     auto radiusAt = [&](const QVector3D &p) { return perMm > 0 ? (p - eye).length() * perMm : edgeRadius; };
     if (!target)
@@ -3289,32 +3564,61 @@ void Document::fillParts(MeshGeometry *target, const QVariantList &parts, float 
         out.min[i] = std::numeric_limits<float>::max();
         out.max[i] = std::numeric_limits<float>::lowest();
     }
-    std::set<std::uint32_t> faces;
+    // Faces to light, per mesh: the model's, or Chamfer's preview where it's drawn in a body's place
+    // (there a face is lit as what's left of it, so the shape as it was never flashes up).
+    std::map<const omamake::Mesh *, std::set<std::uint32_t>> faces;
     for (const QVariant &v : parts) {
         const QVariantMap part = v.toMap();
         const QString kind = part.value(QStringLiteral("kind")).toString();
         const int index = part.value(QStringLiteral("index")).toInt();
         if (kind == QLatin1String("face") && index >= 0 && std::uint32_t(index) < m_mesh.faceCount) {
-            faces.insert(std::uint32_t(index));
+            int local = 0;
+            if (const ChamferLook *look = lookFor(m_faceBody, index, local)) {
+                const omamake::Mesh &before = bodyMesh(m_faceBody[std::size_t(index)]);
+                const float reach = 0.02f * diagonal(before);
+                for (std::uint32_t f = 0; f < look->mesh.faceCount; ++f)
+                    if (onFace(before, std::uint32_t(local), look->spot[f], look->facing[f], reach))
+                        faces[&look->mesh].insert(f);
+            } else {
+                faces[&m_mesh].insert(std::uint32_t(index));
+            }
         } else if (kind == QLatin1String("body")) {         // a whole body: all of its faces
             for (std::uint32_t f = 0; f < m_mesh.faceCount; ++f)
                 if (m_faceBody[f] == index)
-                    faces.insert(f);
+                    faces[&m_mesh].insert(f);
         } else if (kind == QLatin1String("edge") && index >= 0 && std::size_t(index) < m_mesh.edges.size()) {
-            const auto &line = m_mesh.edges[std::size_t(index)];
-            // lean (the Project highlight, hundreds of edges): 5-sided tubes, a ball only at the two ends.
-            const std::size_t last = line.size() / 3 - 1;
-            for (std::size_t k = 0; k + 1 < line.size() / 3; ++k) {
-                const float r = radiusAt(at(line, k + 1));
-                if (lean) {
-                    addTube(out, at(line, k), at(line, k + 1), r, 5);
-                    if (k == 0)
-                        addBall(out, at(line, k), r, 3, 6);
-                    if (k + 1 == last)
-                        addBall(out, at(line, k + 1), r, 3, 6);
-                } else {
-                    addTube(out, at(line, k), at(line, k + 1), r);
-                    addBall(out, at(line, k + 1), r);   // smooth joints
+            // Under Chamfer's preview, the preview's edges that run where this one ran (one the chamfer
+            // trims is lit as long as it'll be); one the chamfer takes away isn't there, so isn't lit (owner,
+            // 2026-11-09, GB-050: the cylinder's top rim, gone under the preview, flashed up as the pointer
+            // went by). Under Ctrl/Shift the model as it is shows, and its edges light as they are.
+            std::vector<const std::vector<float> *> lines;
+            int local = 0;
+            if (const ChamferLook *look = lookFor(m_edgeBody, index, local)) {
+                mapLook(m_edgeBody[std::size_t(index)], *look);
+                if (std::size_t(local) < look->edgesOf.size())
+                    for (const int e : look->edgesOf[std::size_t(local)])
+                        lines.push_back(&look->mesh.edges[std::size_t(e)]);
+                if (lines.empty())
+                    continue;
+            }
+            if (lines.empty())
+                lines.push_back(&m_mesh.edges[std::size_t(index)]);
+            for (const std::vector<float> *drawn : lines) {
+                const auto &line = *drawn;
+                // lean (the Project highlight, hundreds of edges): 5-sided tubes, a ball only at the two ends.
+                const std::size_t last = line.size() / 3 - 1;
+                for (std::size_t k = 0; k + 1 < line.size() / 3; ++k) {
+                    const float r = radiusAt(at(line, k + 1));
+                    if (lean) {
+                        addTube(out, at(line, k), at(line, k + 1), r, 5);
+                        if (k == 0)
+                            addBall(out, at(line, k), r, 3, 6);
+                        if (k + 1 == last)
+                            addBall(out, at(line, k + 1), r, 3, 6);
+                    } else {
+                        addTube(out, at(line, k), at(line, k + 1), r);
+                        addBall(out, at(line, k + 1), r);   // smooth joints
+                    }
                 }
             }
         } else if (kind == QLatin1String("point") && index >= 0 && std::size_t(index) < m_mesh.points.size() / 3) {
@@ -3344,19 +3648,20 @@ void Document::fillParts(MeshGeometry *target, const QVariantList &parts, float 
             }
         }
     }
-    const std::size_t triCount = m_mesh.indices.size() / 3;
-    for (std::size_t t = 0; t < triCount && !faces.empty(); ++t) {
-        if (!faces.count(m_mesh.triangleFace[t]))
-            continue;
-        // Lifted a hair off the surface: a copy in exactly the same place would lose the depth test.
-        const std::uint32_t *idx = &m_mesh.indices[t * 3];
-        QVector3D v[3], n[3];
-        for (int k = 0; k < 3; ++k) {
-            n[k] = at(m_mesh.normals, idx[k]);
-            v[k] = at(m_mesh.positions, idx[k]);
-            v[k] += n[k] * radiusAt(v[k]) * 0.3f;
+    for (const auto &[mesh, which] : faces) {
+        for (std::size_t t = 0; t < mesh->indices.size() / 3; ++t) {
+            if (!which.count(mesh->triangleFace[t]))
+                continue;
+            // Lifted a hair off the surface: a copy in exactly the same place would lose the depth test.
+            const std::uint32_t *idx = &mesh->indices[t * 3];
+            QVector3D v[3], n[3];
+            for (int k = 0; k < 3; ++k) {
+                n[k] = at(mesh->normals, idx[k]);
+                v[k] = at(mesh->positions, idx[k]);
+                v[k] += n[k] * radiusAt(v[k]) * 0.3f;
+            }
+            addTriangle(out, v[0], v[1], v[2], n[0], n[1], n[2]);
         }
-        addTriangle(out, v[0], v[1], v[2], n[0], n[1], n[2]);
     }
     if (out.positions.empty())
         for (int i = 0; i < 3; ++i)
@@ -3392,14 +3697,16 @@ QString Document::sketchPartName(const Named &sketch, QChar kind, int id) const 
     return id == SketchGeometry::XAxis ? QStringLiteral("the sketch's horizontal axis") : QStringLiteral("the sketch's vertical axis");
 }
 
-// A point id as given, or a new point at {u, v} (its id added to created).
+// A point already there (its id, or {point: id}), or a new point at {u, v} (its id added to created).
+// Only ever handed values that crossed from QML as QVariantMap / QVariantList parameters, which Qt
+// converts the same way on every version (a bare QVariant parameter may hold a QJSValue instead).
 int Document::sketchPoint(Named &sketch, const QVariant &at, QJsonArray &created) {
     SketchGeometry &g = sketch.geometry;
-    if (at.typeId() != QMetaType::QVariantMap) {
-        const int id = at.toInt();
+    const QVariantMap uv = at.toMap();
+    if (uv.isEmpty() || uv.contains(QStringLiteral("point"))) {
+        const int id = uv.isEmpty() ? at.toInt() : uv.value(QStringLiteral("point")).toInt();
         return g.points.count(id) ? id : 0;
     }
-    const QVariantMap uv = at.toMap();
     const int id = g.nextPoint++;
     g.points[id] = {uv.value(QStringLiteral("u")).toDouble(), uv.value(QStringLiteral("v")).toDouble()};
     created.append(id);
@@ -3479,7 +3786,7 @@ QVariantMap Document::sketchGeometry(int sketch) const {
 }
 
 void Document::holdSnap(SketchGeometry &g, int point, const QVariant &at, const QJsonArray &created, QJsonArray &constraints) {
-    if (at.typeId() != QMetaType::QVariantMap || !created.contains(point))
+    if (!created.contains(point))      // only a point this action made is held where it snapped
         return;
     const QVariantMap m = at.toMap();
     const QString on = m.value(QStringLiteral("on")).toString();
@@ -3504,7 +3811,7 @@ void Document::holdSnap(SketchGeometry &g, int point, const QVariant &at, const 
     constraints.append(id);
 }
 
-QVariantMap Document::addSketchLine(int sketch, const QVariant &from, const QVariant &to, const QString &hold,
+QVariantMap Document::addSketchLine(int sketch, const QVariantMap &from, const QVariantMap &to, const QString &hold,
                                     bool construction) {
     const auto found = m_sketches.find(sketch);
     if (found == m_sketches.end())
@@ -3546,7 +3853,7 @@ QVariantMap Document::addSketchLine(int sketch, const QVariant &from, const QVar
     return {{QStringLiteral("line"), line}, {QStringLiteral("from"), a}, {QStringLiteral("to"), b}};
 }
 
-QVariantMap Document::addSketchRectangle(int sketch, const QVariant &corner, const QVariant &opposite, bool construction) {
+QVariantMap Document::addSketchRectangle(int sketch, const QVariantMap &corner, const QVariantMap &opposite, bool construction) {
     const auto found = m_sketches.find(sketch);
     if (found == m_sketches.end())
         return {};
@@ -5366,9 +5673,33 @@ void Document::testKey(QObject *window, int key, const QString &text, int modifi
     auto *w = qobject_cast<QQuickWindow *>(window);
     if (!w)
         return;
-    // Through the window system path, as a real keyboard does, so shortcuts (Enter) fire too.
+    // The keys held as the window system would say (ModifierKeys asks it): a key typed with Ctrl/Shift holds
+    // them; Ctrl or Shift's own press and release ("down" / "up" for only that half) set and clear theirs; and
+    // testHeld sets them alone, as a release that never came.
+    QObject *app = QCoreApplication::instance();
+    const int held = app->property("omamakeTestModifiers").toInt();
+    const int bit = key == Qt::Key_Control ? int(Qt::ControlModifier) : key == Qt::Key_Shift ? int(Qt::ShiftModifier) : 0;
+    if (bit && (text == QLatin1String("down") || text == QLatin1String("up"))) {
+        const bool press = text == QLatin1String("down");
+        app->setProperty("omamakeTestModifiers", press ? held | bit : held & ~bit);
+        QWindowSystemInterface::handleKeyEvent<QWindowSystemInterface::SynchronousDelivery>(w, press ? QEvent::KeyPress : QEvent::KeyRelease, key,
+                                                                                           Qt::KeyboardModifiers(modifiers), QString());
+        return;
+    }
+    // Through the window system path, as a real keyboard does, so shortcuts (Enter) fire too. A real keyboard
+    // reaches only the focused window, and a window's Shortcuts (E, Shift+F...) fire only there; the test
+    // window is shown unfocused, so it's given the focus first (GB-055).
+    if (QGuiApplication::focusWindow() != w)
+        QWindowSystemInterface::handleFocusWindowChanged<QWindowSystemInterface::SynchronousDelivery>(w, Qt::ActiveWindowFocusReason);
     QWindowSystemInterface::handleKeyEvent<QWindowSystemInterface::SynchronousDelivery>(w, QEvent::KeyPress, key, Qt::KeyboardModifiers(modifiers), text);
     QWindowSystemInterface::handleKeyEvent<QWindowSystemInterface::SynchronousDelivery>(w, QEvent::KeyRelease, key, Qt::KeyboardModifiers(modifiers), text);
+    app->setProperty("omamakeTestModifiers", bit ? held & ~bit : modifiers & int(Qt::ControlModifier | Qt::ShiftModifier));
+}
+
+// Test-only: the keys the window system says are held, alone, with no key event (a release that never came).
+void Document::testHeld(int modifiers) {
+    if (qEnvironmentVariableIsSet("OMAMAKE_TEST_INPUT"))
+        QCoreApplication::instance()->setProperty("omamakeTestModifiers", modifiers);
 }
 
 // Changes a text's words, font, size or look (owner, 2026-11-02): `props` holds any of text, font,
@@ -8949,4 +9280,908 @@ QVariantMap Document::extrudeFrame(const QVariantMap &spec) {
     const double reach1 = job.sides[0].to.front(), reach2 = job.sides.size() > 1 ? -job.sides[1].to.front() : 0;
     return {{QStringLiteral("ok"), true}, {QStringLiteral("normal"), normal}, {QStringLiteral("anchors"), anchors},
             {QStringLiteral("reach1"), reach1}, {QStringLiteral("reach2"), reach2}};
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Model Chamfer (owner, 2026-11-08): Fusion's whole Chamfer (selection sets, Equal Distance, Two Distances,
+// Distance and Angle, edges, faces or features, Flip, Tangent Chain, Corner Type Chamfer/Miter/Blend), and where
+// Fusion gives up it does its best: a chamfer too big for the faces beside it runs on through (the engine's
+// chamfer.cpp); only an edge even that can't build is left sharp, and the step gets a yellow flag naming it.
+
+namespace {
+
+// The polyline's point halfway along its length.
+std::array<double, 3> lineMiddle(const std::vector<float> &l) {
+    std::array<double, 3> out{0, 0, 0};
+    if (l.size() < 3)
+        return out;
+    double total = 0;
+    for (std::size_t k = 0; k + 5 < l.size(); k += 3)
+        total += std::hypot(l[k + 3] - l[k], l[k + 4] - l[k + 1], l[k + 5] - l[k + 2]);
+    double left = total / 2;
+    for (std::size_t k = 0; k + 5 < l.size(); k += 3) {
+        const double piece = std::hypot(l[k + 3] - l[k], l[k + 4] - l[k + 1], l[k + 5] - l[k + 2]);
+        if (piece >= left && piece > 0) {
+            const double f = left / piece;
+            for (int i = 0; i < 3; ++i)
+                out[std::size_t(i)] = l[k + std::size_t(i)] + f * (l[k + 3 + std::size_t(i)] - l[k + std::size_t(i)]);
+            return out;
+        }
+        left -= piece;
+    }
+    return {l[0], l[1], l[2]};
+}
+
+// How far p is from the polyline.
+double lineGap(const std::vector<float> &l, const double p[3]) {
+    double best = std::numeric_limits<double>::max();
+    if (l.size() == 3)
+        return std::hypot(l[0] - p[0], l[1] - p[1], l[2] - p[2]);
+    for (std::size_t k = 0; k + 5 < l.size(); k += 3) {
+        const double a[3] = {l[k], l[k + 1], l[k + 2]}, b[3] = {l[k + 3], l[k + 4], l[k + 5]};
+        double ab[3], ap[3], uu = 0, up = 0;
+        for (int i = 0; i < 3; ++i) {
+            ab[i] = b[i] - a[i];
+            ap[i] = p[i] - a[i];
+            uu += ab[i] * ab[i];
+            up += ab[i] * ap[i];
+        }
+        const double t = uu > 0 ? std::clamp(up / uu, 0.0, 1.0) : 0;
+        best = std::min(best, std::hypot(ap[0] - t * ab[0], ap[1] - t * ab[1], ap[2] - t * ab[2]));
+    }
+    return best;
+}
+
+QString inchesAt(const std::array<double, 3> &p) {
+    const auto in = [](double mm) { return QString::number(std::round(mm / 25.4 * 1000) / 1000, 'f', 3); };
+    return QStringLiteral("(%1, %2, %3 in)").arg(in(p[0]), in(p[1]), in(p[2]));
+}
+
+QVariantList xyz(const double *p) { return {p[0], p[1], p[2]}; }
+
+} // namespace
+
+QVariantMap Document::edgeRef(int edge) const {
+    const int body = bodyOfPart(QStringLiteral("edge"), edge);
+    if (!body || std::size_t(edge) >= m_mesh.edges.size())
+        return {};
+    int first = edge;
+    while (first > 0 && m_edgeBody[std::size_t(first - 1)] == body)
+        --first;
+    const std::array<double, 3> mid = lineMiddle(m_mesh.edges[std::size_t(edge)]);
+    return {{QStringLiteral("body"), body}, {QStringLiteral("edge"), edge - first}, {QStringLiteral("at"), xyz(mid.data())}};
+}
+
+QVariantMap Document::faceRef(int face) const {
+    const int body = bodyOfPart(QStringLiteral("face"), face);
+    if (!body)
+        return {};
+    int first = face;
+    while (first > 0 && m_faceBody[std::size_t(first - 1)] == body)
+        --first;
+    return {{QStringLiteral("body"), body}, {QStringLiteral("face"), face - first}};
+}
+
+QVariantMap Document::pointRef(int point) const {
+    const int body = bodyOfPart(QStringLiteral("point"), point);
+    if (!body || point < 0 || std::size_t(point) * 3 + 2 >= m_mesh.points.size())
+        return {};
+    int first = point;
+    while (first > 0 && m_pointBody[std::size_t(first - 1)] == body)
+        --first;
+    const double at[3] = {m_mesh.points[std::size_t(point) * 3], m_mesh.points[std::size_t(point) * 3 + 1], m_mesh.points[std::size_t(point) * 3 + 2]};
+    return {{QStringLiteral("body"), body}, {QStringLiteral("point"), point - first}, {QStringLiteral("at"), xyz(at)}};
+}
+
+// The point a ref names: its number when the corner there is still where it was, else the corner that is.
+int Document::findPoint(int body, int point, const QVariantList &at) const {
+    if (!m_bodies.count(body))
+        return -1;
+    const omamake::Mesh &m = bodyMesh(body);
+    const int count = int(m.points.size() / 3);
+    if (at.size() != 3)
+        return point >= 0 && point < count ? point : -1;
+    double size = 0;
+    for (int k = 0; k < 3; ++k)
+        size = std::max(size, double(m.max[k] - m.min[k]));
+    const double near = 1e-4 * size + 1e-3;
+    const auto gap = [&](int i) {
+        return std::hypot(m.points[std::size_t(i) * 3] - at[0].toDouble(), m.points[std::size_t(i) * 3 + 1] - at[1].toDouble(),
+                          m.points[std::size_t(i) * 3 + 2] - at[2].toDouble());
+    };
+    if (point >= 0 && point < count && gap(point) <= near)
+        return point;
+    int best = -1;
+    double bestGap = near;
+    for (int i = 0; i < count; ++i)
+        if (gap(i) <= bestGap) {
+            bestGap = gap(i);
+            best = i;
+        }
+    return best;
+}
+
+// The edge a ref names: its number when the edge there still passes where it was, else the edge that does.
+int Document::findEdge(int body, int edge, const QVariantList &at) const {
+    if (!m_bodies.count(body))
+        return -1;
+    const omamake::Mesh &m = bodyMesh(body);
+    if (at.size() != 3)
+        return edge >= 0 && std::size_t(edge) < m.edges.size() ? edge : -1;
+    const double p[3] = {at[0].toDouble(), at[1].toDouble(), at[2].toDouble()};
+    double size = 0;
+    for (int k = 0; k < 3; ++k)
+        size = std::max(size, double(m.max[k] - m.min[k]));
+    const double near = 1e-4 * size + 1e-3;
+    if (edge >= 0 && std::size_t(edge) < m.edges.size() && lineGap(m.edges[std::size_t(edge)], p) <= near)
+        return edge;
+    int best = -1;
+    double bestGap = near;
+    for (std::size_t i = 0; i < m.edges.size(); ++i) {
+        const double g = lineGap(m.edges[i], p);
+        if (g <= bestGap) {
+            bestGap = g;
+            best = int(i);
+        }
+    }
+    return best;
+}
+
+bool Document::readChamfer(const QVariantMap &spec, ChamferJob &job, QString &why) const {
+    const QString corner = spec.value(QStringLiteral("corner")).toString();
+    job.corner = corner == QLatin1String("miter") ? omamake::ChamferCorner::Miter
+               : corner == QLatin1String("blend") ? omamake::ChamferCorner::Blend : omamake::ChamferCorner::Chamfer;
+    const QVariantList sets = spec.value(QStringLiteral("sets")).toList();
+    std::map<int, std::set<int>> taken;          // an edge in two sets: the first set's
+    for (int k = 0; k < sets.size(); ++k) {
+        const QVariantMap set = sets[k].toMap();
+        const QString type = set.value(QStringLiteral("type")).toString();
+        const int kind = type == QLatin1String("two") ? 1 : type == QLatin1String("angle") ? 2 : type == QLatin1String("radius") ? 3
+                       : type == QLatin1String("chord") ? 4 : 0;
+        if (k == 0)
+            job.round = kind >= 3;
+        else if (job.round != (kind >= 3)) {
+            why = QStringLiteral("A step's sets are all chamfers or all fillets.");
+            return false;
+        }
+        const double d1 = set.value(QStringLiteral("d1")).toDouble();
+        const double d2 = kind == 1 ? set.value(QStringLiteral("d2")).toDouble() : d1;
+        const double angle = set.value(QStringLiteral("angle"), 45.0).toDouble();
+        if (!(d1 > 0) || (kind == 1 && !(d2 > 0))) {
+            why = kind == 3 ? QStringLiteral("A fillet's radius must be more than 0.") : kind == 4 ? QStringLiteral("A fillet's chord length must be more than 0.")
+                            : QStringLiteral("A chamfer's distance must be more than 0.");
+            return false;
+        }
+        if (kind == 2 && !(angle > 0 && angle < 90)) {
+            why = QStringLiteral("A chamfer's angle must be between 0 and 90 degrees.");
+            return false;
+        }
+        std::map<int, std::vector<int>> picked;
+        const auto addRef = [&](const QVariant &v) {
+            const QVariantMap ref = v.toMap();
+            const int body = ref.value(QStringLiteral("body")).toInt();
+            const int e = findEdge(body, ref.value(QStringLiteral("edge"), -1).toInt(), ref.value(QStringLiteral("at")).toList());
+            if (e < 0) {
+                ++job.lost;
+                return;
+            }
+            picked[body].push_back(e);
+        };
+        for (const QVariant &v : set.value(QStringLiteral("edges")).toList())
+            addRef(v);
+        for (const QVariant &v : set.value(QStringLiteral("faces")).toList()) {
+            const QVariantMap ref = v.toMap();
+            const int body = ref.value(QStringLiteral("body")).toInt();
+            const std::vector<int> around = m_bodies.count(body) ? m_engine->faceEdges(omamake::BodyId(body), ref.value(QStringLiteral("face")).toInt())
+                                                                 : std::vector<int>{};
+            if (around.empty())
+                ++job.lost;
+            for (const int e : around)
+                picked[body].push_back(e);
+        }
+        for (const QVariant &f : set.value(QStringLiteral("features")).toList())
+            for (const QVariant &v : f.toMap().value(QStringLiteral("edges")).toList())
+                addRef(v);
+        // Points (GB-053): each by itself (no chains), after the edges.
+        std::map<int, std::vector<int>> points;
+        for (const QVariant &v : set.value(QStringLiteral("points")).toList()) {
+            const QVariantMap ref = v.toMap();
+            const int body = ref.value(QStringLiteral("body")).toInt();
+            const int p = findPoint(body, ref.value(QStringLiteral("point"), -1).toInt(), ref.value(QStringLiteral("at")).toList());
+            if (p < 0) {
+                ++job.lost;
+                continue;
+            }
+            points[body].push_back(p);
+        }
+        for (auto &[body, list] : points) {
+            const omamake::Mesh &m = bodyMesh(body);
+            for (const int p : list) {
+                if (!taken[body].insert(-2 - p).second)
+                    continue;
+                omamake::ChamferEdge c;
+                c.point = p;
+                c.set = k;
+                c.kind = kind;
+                c.d1 = d1;
+                c.d2 = d1;
+                c.angle = angle;
+                job.perBody[body].push_back(c);
+                if (std::size_t(p) * 3 + 2 < m.points.size()) {
+                    const std::array<double, 3> at{m.points[std::size_t(p) * 3], m.points[std::size_t(p) * 3 + 1], m.points[std::size_t(p) * 3 + 2]};
+                    job.where[body][-1 - p] = inchesAt(at);
+                }
+            }
+            job.names[body] = m_bodies.count(body) ? m_bodies.at(body).name : QStringLiteral("a body");
+        }
+        const bool chain = set.value(QStringLiteral("chain"), true).toBool();
+        for (auto &[body, list] : picked) {
+            if (chain)
+                list = m_engine->tangentChain(omamake::BodyId(body), list);
+            const omamake::Mesh &m = bodyMesh(body);
+            for (const int e : list) {
+                if (!taken[body].insert(e).second)
+                    continue;
+                omamake::ChamferEdge c;
+                c.edge = e;
+                c.set = k;
+                c.kind = kind;
+                c.d1 = d1;
+                c.d2 = d2;
+                c.angle = angle;
+                c.flip = set.value(QStringLiteral("flip")).toBool();
+                job.perBody[body].push_back(c);
+                if (std::size_t(e) < m.edges.size())
+                    job.where[body][e] = inchesAt(lineMiddle(m.edges[std::size_t(e)]));
+            }
+            job.names[body] = m_bodies.count(body) ? m_bodies.at(body).name : QStringLiteral("a body");
+        }
+    }
+    if (job.perBody.empty()) {
+        why = job.lost ? QStringLiteral("The picked edges aren't on the model any more.") : (job.round ? QStringLiteral("Pick the edges (or points) to fillet.") : QStringLiteral("Pick the edges (or points) to chamfer."));
+        return false;
+    }
+    return true;
+}
+
+Document::ChamferResult Document::computeChamfer(const ChamferJob &job) const {
+    ChamferResult r;
+    for (const auto &[body, edges] : job.perBody) {
+        for (const auto &e : edges)
+            ++(e.point >= 0 ? r.points : r.edges);
+        omamake::ChamferReport rep;
+        const omamake::BodyId made = m_engine->chamfer(omamake::BodyId(body), edges, job.corner, rep);
+        const QString name = job.names.count(body) ? job.names.at(body) : QStringLiteral("a body");
+        const auto where = [&](int e) {
+            QString at = QStringLiteral("?");
+            const auto b = job.where.find(body);
+            if (b != job.where.end()) {
+                const auto w = b->second.find(e);
+                if (w != b->second.end())
+                    at = w->second;
+            }
+            return name + (e < 0 ? QStringLiteral("'s point at ") : QStringLiteral("'s edge at ")) + at;
+        };
+        if (!made) {
+            for (const auto &e : edges)
+                r.skipped << where(e.point >= 0 ? -1 - e.point : e.edge);
+            r.notes << (job.round ? QStringLiteral("%1 couldn't be filleted: %2.") : QStringLiteral("%1 couldn't be chamfered: %2.")).arg(name, QString::fromStdString(rep.note.empty() ? m_engine->whyNot() : rep.note));
+            continue;
+        }
+        r.swaps.push_back({body, int(made)});
+        r.meshes[int(made)] = m_engine->mesh(made);
+        for (const int e : rep.ranThrough)
+            r.ranThrough << where(e);
+        for (const int e : rep.skipped)
+            r.skipped << where(e);
+        if (!rep.note.empty())
+            r.notes << QString::fromStdString(rep.note);
+    }
+    return r;
+}
+
+QVariantMap Document::applyChamfer(ChamferResult &&r, const QVariantMap &spec, int lost) {
+    const bool round = filletSpec(spec);
+    QString issue;
+    if (!r.skipped.isEmpty())
+        issue = QStringLiteral("Left sharp (couldn't be built even running through): %1.").arg(r.skipped.join(QStringLiteral("; ")));
+    if (lost)
+        issue += (issue.isEmpty() ? QString() : QStringLiteral(" ")) + QStringLiteral("%1 picked part(s) weren't on the model any more.").arg(lost);
+    if (r.swaps.empty()) {
+        QString why = r.notes.isEmpty() ? (round ? QStringLiteral("Nothing could be filleted.") : QStringLiteral("Nothing could be chamfered.")) : r.notes.join(QLatin1Char(' '));
+        return {{QStringLiteral("ok"), false}, {QStringLiteral("why"), why + QStringLiteral(" Nothing was changed.")}};
+    }
+    for (auto &[id, mesh] : r.meshes)
+        m_meshCache[id] = std::move(mesh);
+    for (const auto &[was, now] : r.swaps)
+        swapBody(was, omamake::BodyId(now));
+    const int token = m_extrudeToken++;
+    m_extrudeKeep[token] = r.swaps;
+    QJsonArray swaps;
+    for (const auto &[was, now] : r.swaps)
+        swaps.append(QJsonArray{was, now});
+    QJsonObject action{{QStringLiteral("type"), round ? QStringLiteral("fillet") : QStringLiteral("chamfer")}, {QStringLiteral("token"), token},
+                       {QStringLiteral("created"), QJsonArray{}}, {QStringLiteral("components"), QJsonArray{}},
+                       {QStringLiteral("swaps"), swaps}, {QStringLiteral("body"), r.swaps.front().second},
+                       {QStringLiteral("spec"), QJsonObject::fromVariantMap(spec)}};
+    if (!issue.isEmpty()) {
+        action.insert(QStringLiteral("issue"), QStringLiteral("yellow"));
+        action.insert(QStringLiteral("issue_text"), issue);
+    }
+    // The summary: each set's edges and size, as a person set them (inches, as the app shows them).
+    QStringList parts;
+    const auto in = [](double mm) { return QString::number(mm / 25.4, 'g', 4) + QStringLiteral(" in"); };
+    const QVariantList sets = spec.value(QStringLiteral("sets")).toList();
+    for (const QVariant &v : sets) {
+        const QVariantMap s = v.toMap();
+        const QString type = s.value(QStringLiteral("type")).toString();
+        const double d1 = s.value(QStringLiteral("d1")).toDouble();
+        parts << (type == QLatin1String("chord") ? QStringLiteral("chord ") + in(d1)
+                  : type == QLatin1String("two") ? in(d1) + QStringLiteral(" × ") + in(s.value(QStringLiteral("d2")).toDouble())
+                  : type == QLatin1String("angle") ? in(d1) + QStringLiteral(" at %1°").arg(s.value(QStringLiteral("angle")).toDouble())
+                                                   : in(d1));
+    }
+    const QString corner = spec.value(QStringLiteral("corner")).toString();
+    QString what = QStringLiteral("%1 edge%2").arg(r.edges).arg(r.edges == 1 ? "" : "s");
+    if (r.points)
+        what = (r.edges ? what + QStringLiteral(" and ") : QString()) + QStringLiteral("%1 point%2").arg(r.points).arg(r.points == 1 ? "" : "s");
+    QString summary = (round ? QStringLiteral("Fillet: %1, %2") : QStringLiteral("Chamfer: %1, %2")).arg(what, parts.join(QStringLiteral("; ")));
+    if (corner == QLatin1String("miter") || corner == QLatin1String("blend"))
+        summary += corner == QLatin1String("miter") ? QStringLiteral(", Miter corners") : QStringLiteral(", Blend corners");
+    record(action, summary);
+    refreshMesh();
+    emit changed();
+    emit structureChanged();
+    QStringList note;
+    if (!r.ranThrough.isEmpty())
+        note << (round ? QStringLiteral("Too big for the faces beside them, so the round runs on through: %1.")
+                       : QStringLiteral("Too big for the faces beside them, so the slope runs on through: %1.")).arg(r.ranThrough.join(QStringLiteral("; ")));
+    if (!issue.isEmpty())
+        note << issue;
+    note << r.notes;
+    return {{QStringLiteral("ok"), true}, {QStringLiteral("note"), note.join(QLatin1Char(' '))},
+            {QStringLiteral("warn"), !issue.isEmpty()}};
+}
+
+QVariantMap Document::chamfer(const QVariantMap &spec) {
+    if (m_working)
+        return {{QStringLiteral("ok"), false}, {QStringLiteral("why"), QStringLiteral("Still working on the last one.")}};
+    ChamferJob job;
+    QString why;
+    if (!readChamfer(spec, job, why))
+        return {{QStringLiteral("ok"), false}, {QStringLiteral("why"), why}};
+    return applyChamfer(computeChamfer(job), spec, job.lost);
+}
+
+QVariantMap Document::chamferInBackground(const QVariantMap &spec) {
+    if (m_working || m_importing)
+        return {{QStringLiteral("ok"), false}, {QStringLiteral("why"), QStringLiteral("Still working on the last one.")}};
+    ChamferJob job;
+    QString why;
+    if (!readChamfer(spec, job, why))
+        return {{QStringLiteral("ok"), false}, {QStringLiteral("why"), why}};
+    ++m_previewGen;                     // a preview still running is no use now
+    m_working = true;
+    emit workingChanged();
+    QThread *worker = QThread::create([this, job = std::move(job), spec] {
+        QElapsedTimer clock;
+        clock.start();
+        ChamferResult r = computeChamfer(job);
+        const double seconds = clock.elapsed() / 1000.0;
+        QMetaObject::invokeMethod(this, [this, r = std::move(r), spec, seconds, lost = job.lost]() mutable {
+            m_working = false;
+            emit workingChanged();
+            QVariantMap result = applyChamfer(std::move(r), spec, lost);
+            result.insert(QStringLiteral("seconds"), seconds);
+            emit chamferFinished(result);
+        }, Qt::QueuedConnection);
+    });
+    connect(worker, &QThread::finished, worker, &QObject::deleteLater);
+    worker->start();
+    return {{QStringLiteral("ok"), true}};
+}
+
+QVariantList Document::chamferPicked(const QVariantMap &spec) const {
+    QVariantList out;
+    for (const QVariant &v : spec.value(QStringLiteral("sets")).toList()) {
+        QVariantMap one;
+        one.insert(QStringLiteral("sets"), QVariantList{v});
+        ChamferJob job;
+        QString why;
+        QVariantList edges;
+        if (readChamfer(one, job, why))
+            for (const auto &[body, list] : job.perBody) {
+                int first = -1;
+                for (std::size_t i = 0; i < m_edgeBody.size(); ++i)
+                    if (m_edgeBody[i] == body) {
+                        first = int(i);
+                        break;
+                    }
+                if (first >= 0)
+                    for (const auto &c : list)
+                        if (c.point < 0)
+                            edges << first + c.edge;
+            }
+        out << QVariant(edges);
+    }
+    return out;
+}
+
+QVariantList Document::chamferFrame(const QVariantMap &spec) const {
+    QVariantList out;
+    for (const QVariant &v : spec.value(QStringLiteral("sets")).toList()) {
+        QVariantMap one;
+        one.insert(QStringLiteral("sets"), QVariantList{v});
+        ChamferJob job;
+        QString why;
+        QVariantMap frame{{QStringLiteral("ok"), false}};
+        if (readChamfer(one, job, why)) {
+            const auto &[body, list] = *job.perBody.begin();
+            // The set's first picked edge (the one its boxes sit on), worked out with the set's own sizes, `at`
+            // along it (halfway unless the set says); with "candidates": n, the same at n spots along it too,
+            // for ChamferTool to put the boxes on the one in front (owner, 2026-11-09, GB-050).
+            // Candidates on each of the set's edges (a picked face's rims: the one nearer the eye may be either).
+            const QVariantMap set = v.toMap();
+            omamake::ChamferEdge first = list.front();
+            // atEdge: an edge's number, or -2 - a point's (GB-053); -1 none.
+            const auto atOf = [](const omamake::ChamferEdge &c) { return c.point >= 0 ? -2 - c.point : c.edge; };
+            const int onEdge = set.value(QStringLiteral("atEdge"), -1).toInt();
+            for (const omamake::ChamferEdge &c : list)
+                if (onEdge != -1 && atOf(c) == onEdge)
+                    first = c;
+            first.at = set.value(QStringLiteral("at"), 0.5).toDouble();
+            const int n = std::clamp(set.value(QStringLiteral("candidates"), 0).toInt(), 0, 64);
+            std::vector<omamake::ChamferEdge> ask{first};
+            const std::size_t edges = std::min<std::size_t>(list.size(), 12);
+            const int each = n > 0 ? std::max(4, n * 3 / int(edges + 2)) : 0;
+            for (std::size_t i = 0; i < edges; ++i)
+                for (int k = 0; k < (list[i].point >= 0 ? std::min(each, 1) : each); ++k) {     // a point: one spot
+                    omamake::ChamferEdge c = list[i];
+                    c.at = (k + 0.5) / each;
+                    ask.push_back(c);
+                }
+            const std::vector<std::vector<double>> s = m_engine->chamferSections(omamake::BodyId(body), ask);
+            if (!s.empty() && s[0].size() == 9)
+                frame = {{QStringLiteral("ok"), true}, {QStringLiteral("at"), first.at}, {QStringLiteral("atEdge"), atOf(first)}, {QStringLiteral("edge"), xyz(&s[0][0])},
+                         {QStringLiteral("end1"), xyz(&s[0][3])}, {QStringLiteral("end2"), xyz(&s[0][6])}, {QStringLiteral("point"), first.point >= 0}};
+            if (n > 0) {
+                QVariantList spots;
+                for (std::size_t k = 1; k < s.size(); ++k)
+                    if (s[k].size() == 9)
+                        spots << QVariantMap{{QStringLiteral("ok"), true}, {QStringLiteral("at"), ask[k].at}, {QStringLiteral("atEdge"), atOf(ask[k])}, {QStringLiteral("edge"), xyz(&s[k][0])},
+                                             {QStringLiteral("end1"), xyz(&s[k][3])}, {QStringLiteral("end2"), xyz(&s[k][6])}, {QStringLiteral("point"), ask[k].point >= 0}};
+                frame.insert(QStringLiteral("candidates"), spots);
+            }
+        }
+        out << frame;
+    }
+    return out;
+}
+
+QVariantList Document::featureEdgeRefs(int step) const {
+    QVariantList out;
+    if (step < 0 || step >= m_actions.size())
+        return out;
+    const QJsonObject a = m_actions[step].toObject();
+    // What the step made from what (solid pairs): kept for undo while it is this session's, else the
+    // opened file's rebuilt states either side of it, paired by body name (a changed body keeps its name).
+    std::vector<std::pair<int, int>> pairs;
+    const auto kept = m_extrudeKeep.find(a.value(QStringLiteral("token")).toInt(-1));
+    if (kept != m_extrudeKeep.end() && a.contains(QStringLiteral("token"))) {
+        pairs = kept->second;
+        for (const QJsonValue &c : a.value(QStringLiteral("created")).toArray())
+            pairs.push_back({0, c.toInt()});
+    } else if (const Built *before = builtAt(step), *after = builtAt(step + 1); before && after) {
+        for (const auto &[id, named] : after->bodies) {
+            if (before->bodies.count(id))
+                continue;
+            int was = 0;
+            for (const auto &[bid, bn] : before->bodies)
+                if (bn.name == named.name && !after->bodies.count(bid))
+                    was = bid;
+            pairs.push_back({was, id});
+        }
+    }
+    std::set<std::pair<int, int>> seen;
+    for (const auto &[body, named] : m_bodies) {
+        const omamake::Mesh &m = bodyMesh(body);
+        for (const auto &[was, now] : pairs)
+            for (const int e : m_engine->featureEdges(omamake::BodyId(body), omamake::BodyId(was), omamake::BodyId(now)))
+                if (std::size_t(e) < m.edges.size() && seen.insert({body, e}).second)
+                    out << QVariantMap{{QStringLiteral("body"), body}, {QStringLiteral("edge"), e},
+                                       {QStringLiteral("at"), xyz(lineMiddle(m.edges[std::size_t(e)]).data())}};
+    }
+    return out;
+}
+
+void Document::chamferPreview(const QVariantMap &spec, MeshGeometry *faces, MeshGeometry *edges) {
+    const int gen = ++m_previewGen;
+    ChamferJob job;
+    QString why;
+    if (m_working || m_importing || !readChamfer(spec, job, why)) {
+        emit chamferPreviewReady(false, why);           // the last preview (and its look) stay up
+        return;
+    }
+    // Its own engine, so the window's stays free: the bodies go across as their exact solids (the same
+    // numbering of edges and faces), and only what the chamfer leaves comes back, as meshes.
+    std::map<int, std::string> solids;
+    for (const auto &[body, list] : job.perBody)
+        solids[body] = m_engine->saveBody(omamake::BodyId(body));
+    const bool lite = m_engine->name().rfind("Lite", 0) == 0;
+    QPointer<Document> self(this);
+    QPointer<MeshGeometry> f(faces), e(edges);
+    QThread *worker = QThread::create([self, gen, lite, job = std::move(job), solids = std::move(solids), f, e] {
+        auto engine = lite ? omamake::makeLiteEngine() : omamake::makeHeavyEngine();
+        std::map<int, ChamferLook> made;
+        QStringList notes;
+        bool any = false;
+        for (const auto &[body, list] : job.perBody) {
+            const omamake::BodyId here = engine->loadBody(solids.at(body));
+            if (!here)
+                continue;
+            engine->mesh(here);
+            omamake::ChamferReport rep;
+            const omamake::BodyId c = engine->chamfer(here, list, job.corner, rep);
+            if (c) {
+                made[body] = lookOf(engine->mesh(c));
+                any = true;
+            } else if (!engine->whyNot().empty()) {
+                notes << QString::fromStdString(engine->whyNot());
+            }
+            if (!rep.skipped.empty())
+                notes << QStringLiteral("%1 edge(s) on %2 would be left sharp").arg(rep.skipped.size()).arg(job.names.count(body) ? job.names.at(body) : QString());
+            if (!rep.ranThrough.empty())
+                notes << QStringLiteral("%1 edge(s) on %2 run on through").arg(rep.ranThrough.size()).arg(job.names.count(body) ? job.names.at(body) : QString());
+        }
+        if (self.isNull())
+            return;
+        QMetaObject::invokeMethod(self.data(), [self, gen, made = std::move(made), notes, any, f, e]() mutable {
+            if (self.isNull() || self->m_previewGen != gen)
+                return;
+            if (!any) {
+                // Nothing could be built (the bevels would take the whole body, say): the last preview stays up,
+                // with why (owner, 2026-11-09).
+                emit self->chamferPreviewReady(false, notes.join(QStringLiteral("; ")));
+                return;
+            }
+            // The whole model as it would be: the chamfered bodies' meshes in place of their own.
+            std::map<int, omamake::Mesh> instead;
+            for (const auto &[body, look] : made)
+                instead[body] = look.mesh;
+            const omamake::Mesh out = self->modelWith(instead);
+            if (f)
+                f->setMesh(out);
+            if (e)
+                e->setMesh(out);
+            self->m_chamferLook = std::move(made);
+            emit self->chamferPreviewReady(any, notes.join(QStringLiteral("; ")));
+        }, Qt::QueuedConnection);
+    });
+    connect(worker, &QThread::finished, worker, &QObject::deleteLater);
+    worker->setPriority(QThread::LowPriority);
+    worker->start();
+}
+
+void Document::dropChamferPreview() {
+    ++m_previewGen;
+    m_chamferLook.clear();
+}
+
+omamake::Mesh Document::modelWith(const std::map<int, omamake::Mesh> &instead, const omamake::Mesh *extra) const {
+    omamake::Mesh out = emptyMesh();
+    std::vector<const omamake::Mesh *> parts;
+    for (const auto &[body, named] : m_bodies) {
+        if (m_shownSet && !m_shown.count(body))
+            continue;
+        const auto mine = instead.find(body);
+        parts.push_back(mine != instead.end() ? &mine->second : &bodyMesh(body));
+    }
+    if (extra)
+        parts.push_back(extra);
+    for (const omamake::Mesh *p : parts) {
+        const omamake::Mesh &one = *p;
+        const auto base = std::uint32_t(out.positions.size() / 3);
+        out.positions.insert(out.positions.end(), one.positions.begin(), one.positions.end());
+        out.normals.insert(out.normals.end(), one.normals.begin(), one.normals.end());
+        for (const std::uint32_t i : one.indices)
+            out.indices.push_back(base + i);
+        out.edgeLines.insert(out.edgeLines.end(), one.edgeLines.begin(), one.edgeLines.end());
+        if (one.positions.empty())
+            continue;
+        for (int k = 0; k < 3; ++k) {
+            out.min[k] = std::min(out.min[k], one.min[k]);
+            out.max[k] = std::max(out.max[k], one.max[k]);
+        }
+    }
+    finish(out);
+    return out;
+}
+
+// The Timeline's rewind part way across a step (GB-057 Chamfer / Fillet, GB-058 Extrude): the step worked out
+// again on the design as it was before it (which the design is while the marker is there), at a fraction f of
+// itself, as real solids, frame by frame off the main thread:
+// - Chamfer / Fillet: every size times f (angles kept).
+// - Extrude: the design after it within the slab it fills along its direction, grown to f of its span, and the
+//   design before it outside that slab, joined: a solid of partial length (join, cut, new body, both sides), its
+//   end capped where it has got to.
+namespace {
+constexpr int kRewindFrames = 48;
+}
+
+bool Document::rewindFramesBegin(int actions) {
+    if (actions < 1 || std::size_t(actions) > m_future.size())
+        return false;
+    const Redo &after = m_future[m_future.size() - std::size_t(actions)];
+    const QJsonObject last = after.action.toObject();
+    const QString type = last.value(QStringLiteral("type")).toString();
+    const bool extrude = type == QLatin1String("extrude");
+    if (!extrude && !edgeStep(type))
+        return false;
+    const QString key = QString::number(m_actions.size()) + QLatin1Char('/') + QString::number(actions) + QLatin1Char('/')
+                        + QString::fromUtf8(QJsonDocument(last).toJson(QJsonDocument::Compact));
+    if (key == m_rewindKey && m_rewindWork)
+        return true;
+    if (m_rewindWork)
+        m_rewindWork->stop = true;
+    m_rewindWork.reset();
+    m_rewindFrames.clear();
+    m_rewindShown = 0;
+    m_rewindKey = key;
+    m_rewindTotal = 0;
+    if (m_working || m_importing)
+        return false;
+    // What the worker needs: the bodies as solids (the same numbering of edges and faces), and the step.
+    std::map<int, std::string> solids;
+    ChamferJob job;
+    std::vector<int> was, now;                    // Extrude: the bodies it changed, before and after
+    omamake::Placement place;
+    double u0 = -1e5, u1 = 1e5, v0 = -1e5, v1 = 1e5, low = 0, high = 0;
+    if (extrude) {
+        for (const auto &entry : m_bodies)
+            if (!after.bodies.count(entry.first))
+                was.push_back(entry.first);
+        for (const auto &entry : after.bodies)
+            if (!m_bodies.count(entry.first))
+                now.push_back(entry.first);
+        const QVariantMap st = rewindStep(actions);
+        if (now.empty() && was.empty())
+            return false;
+        if (!st.contains(QStringLiteral("axis")) || !(st.value(QStringLiteral("high")).toDouble() > st.value(QStringLiteral("low")).toDouble())) {
+            qInfo().noquote() << "rewind: the extrude's direction and length can't be told";
+            return false;
+        }
+        const QVector3D o = st.value(QStringLiteral("origin")).value<QVector3D>(), n = st.value(QStringLiteral("axis")).value<QVector3D>();
+        QVector3D x, y;
+        if (st.contains(QStringLiteral("box"))) {
+            x = st.value(QStringLiteral("xAxis")).value<QVector3D>();
+            y = st.value(QStringLiteral("yAxis")).value<QVector3D>();
+            const QVariantList b = st.value(QStringLiteral("box")).toList();
+            u0 = b[0].toDouble(); u1 = b[1].toDouble(); v0 = b[2].toDouble(); v1 = b[3].toDouble();
+        } else {
+            x = QVector3D::crossProduct(n, std::abs(n.z()) < 0.9f ? QVector3D(0, 0, 1) : QVector3D(1, 0, 0)).normalized();
+            y = QVector3D::crossProduct(n, x).normalized();
+        }
+        for (int k = 0; k < 3; ++k) {
+            place.origin[k] = o[k];
+            place.x[k] = x[k];
+            place.y[k] = y[k];
+        }
+        low = st.value(QStringLiteral("low")).toDouble();
+        high = st.value(QStringLiteral("high")).toDouble();
+        for (const int id : was)
+            solids[id] = m_engine->saveBody(omamake::BodyId(id));
+        for (const int id : now)
+            solids[id] = m_engine->saveBody(omamake::BodyId(id));    // kept (parked) while its step can be shown
+    } else {
+        // A reopened file's earlier designs are built again with their bodies numbered anew (load), while the
+        // step keeps the numbers it was saved with: its bodies are then the ones it replaced (here now, gone
+        // after it), taken in the order they were made.
+        QJsonObject spec = last.value(QStringLiteral("spec")).toObject();
+        std::set<int> named;
+        chamferBodies(spec, [&named](int b) { named.insert(b); return b; });
+        std::vector<int> missing, replaced;
+        for (const int b : named)
+            if (!m_bodies.count(b))
+                missing.push_back(b);
+        if (!missing.empty()) {
+            for (const auto &entry : m_bodies)
+                if (!after.bodies.count(entry.first) && !named.count(entry.first))
+                    replaced.push_back(entry.first);
+            std::sort(missing.begin(), missing.end(), [](int a, int b) { return std::abs(a) < std::abs(b); });
+            if (replaced.size() == missing.size()) {
+                std::map<int, int> to;
+                for (std::size_t i = 0; i < missing.size(); ++i)
+                    to[missing[i]] = replaced[i];
+                spec = chamferBodies(spec, [&to](int b) { return to.count(b) ? to.at(b) : b; });
+            }
+        }
+        QString why;
+        if (!readChamfer(spec.toVariantMap(), job, why) || job.perBody.empty()) {
+            qInfo().noquote() << "rewind: the step's" << type << "can't be worked out again:" << why;
+            return false;
+        }
+        for (const auto &[body, list] : job.perBody)
+            solids[body] = m_engine->saveBody(omamake::BodyId(body));
+    }
+    for (const auto &[id, bytes] : solids)
+        if (bytes.empty())
+            return false;
+    const bool lite = m_engine->name().rfind("Lite", 0) == 0;
+    auto work = std::make_shared<RewindWork>();
+    work->want = kRewindFrames / 2;
+    m_rewindWork = work;
+    m_rewindTotal = kRewindFrames;
+    QPointer<Document> self(this);
+    QThread *worker = QThread::create([=, job = std::move(job), solids = std::move(solids)] {
+        auto engine = lite ? omamake::makeLiteEngine() : omamake::makeHeavyEngine();
+        std::map<int, omamake::BodyId> here;
+        for (const auto &[body, solid] : solids)
+            if (const omamake::BodyId b = engine->loadBody(solid)) {
+                engine->mesh(b);
+                here[body] = b;
+            }
+        if (here.size() != solids.size())
+            return;
+        // One frame: the bodies whose meshes it replaces (an empty mesh: that body isn't drawn), and what it adds.
+        const auto frame = [&](double f, std::map<int, omamake::Mesh> &instead, omamake::Mesh &extra, double &volume) {
+            if (!extrude) {
+                for (const auto &[body, list] : job.perBody) {
+                    std::vector<omamake::ChamferEdge> grown = list;
+                    for (omamake::ChamferEdge &e : grown) {     // every size alike; angles stay
+                        e.d1 *= f;
+                        e.d2 *= f;
+                    }
+                    omamake::ChamferReport rep;
+                    const omamake::BodyId c = engine->chamfer(here.at(body), grown, job.corner, rep);
+                    if (!c)
+                        return false;
+                    instead[body] = engine->mesh(c);
+                    volume += engine->volume(c);
+                    engine->release(c);
+                }
+                return true;
+            }
+            // The slab it has filled: over its areas' box, from its plane out to f of its span (each way). On the
+            // side that starts at the plane it reaches a little back past it, where before and after are alike,
+            // so no face of the slab lies in a face of the body.
+            const double m = 0.05 * std::max(1.0, high - low);
+            const double from = low < 0 ? f * low : -m, to = high > 0 ? f * high : m;
+            omamake::Profile rect;
+            rect.loops.push_back({{u0, v0}, {u1, v0}, {u1, v1}, {u0, v1}});
+            const omamake::BodyId slab = engine->extrudeOn(rect, place, from, to, 0);
+            if (!slab)
+                return false;
+            std::vector<omamake::BodyId> pieces;
+            for (const int id : now)
+                if (const omamake::BodyId p = engine->combine(here.at(id), {slab}, omamake::Combine::Intersect))
+                    pieces.push_back(p);
+            for (const int id : was)
+                if (const omamake::BodyId p = engine->combine(here.at(id), {slab}, omamake::Combine::Cut))
+                    pieces.push_back(p);
+            engine->release(slab);
+            for (const int id : was)
+                instead[id] = omamake::Mesh();                 // drawn as part of the frame
+            if (pieces.empty())
+                return true;
+            omamake::BodyId whole = pieces.size() == 1 ? pieces.front()
+                                  : engine->combine(pieces.front(), std::vector<omamake::BodyId>(pieces.begin() + 1, pieces.end()), omamake::Combine::Join);
+            if (!whole)
+                return false;
+            extra = engine->mesh(whole);
+            volume = engine->volume(whole);
+            for (const omamake::BodyId p : pieces)
+                if (p != whole)
+                    engine->release(p);
+            engine->release(whole);
+            return true;
+        };
+        std::vector<bool> done(kRewindFrames + 1, false);
+        for (int count = 0; count < kRewindFrames && !work->stop; ++count) {
+            // The frame nearest the marker that isn't worked out yet.
+            const int want = std::clamp(int(work->want), 1, kRewindFrames);
+            int i = -1;
+            for (int d = 0; i < 0 && d <= kRewindFrames; ++d)
+                for (const int c : {want - d, want + d})
+                    if (i < 0 && c >= 1 && c <= kRewindFrames && !done[c])
+                        i = c;
+            if (i < 0)
+                break;
+            done[i] = true;
+            std::map<int, omamake::Mesh> instead;
+            omamake::Mesh extra;
+            double volume = 0;
+            const bool ok = frame(double(i) / kRewindFrames, instead, extra, volume);
+            if (self.isNull() || work->stop)
+                return;
+            if (!ok)
+                continue;                                  // that size can't be built: the frames beside it stand in
+            QMetaObject::invokeMethod(self.data(), [self, work, i, volume, instead = std::move(instead), extra = std::move(extra)]() {
+                if (self.isNull() || self->m_rewindWork != work)
+                    return;
+                self->m_rewindFrames[i] = RewindFrame{self->modelWith(instead, &extra), volume};
+                emit self->rewindFrameReady(i);
+            }, Qt::QueuedConnection);
+        }
+    });
+    connect(worker, &QThread::finished, worker, &QObject::deleteLater);
+    worker->setPriority(QThread::LowPriority);
+    worker->start();
+    return true;
+}
+
+int Document::rewindFramesShow(double fraction, MeshGeometry *faces, MeshGeometry *edges) {
+    if (!m_rewindWork || m_rewindTotal <= 0)
+        return 0;
+    const int want = std::clamp(int(std::lround(fraction * m_rewindTotal)), 0, m_rewindTotal);
+    m_rewindWork->want = std::max(1, want);
+    // Only ever toward the marker (GB-058, "slowly scrubbing back and forth can sometimes make it act a little
+    // bit jittery"): of the ready frames from the one drawn up to the marker's, the one nearest the marker;
+    // never one past it, so the cut doesn't run ahead and come back while frames are still coming in. The
+    // design as it is counts as frame 0.
+    const int from = m_rewindShown;
+    int best = from;
+    const int lo = std::min(from, want), hi = std::max(from, want);
+    if (want == 0)
+        best = 0;
+    for (auto it = m_rewindFrames.lower_bound(lo); it != m_rewindFrames.end() && it->first <= hi; ++it)
+        if (std::abs(it->first - want) < std::abs(best - want))
+            best = it->first;
+    if (best > 0 && !m_rewindFrames.count(best))
+        best = 0;
+    if (best > 0 && best != m_rewindShown) {
+        const omamake::Mesh &m = m_rewindFrames.at(best).model;
+        if (faces)
+            faces->setMesh(m);
+        if (edges)
+            edges->setMesh(m);
+    }
+    m_rewindShown = best;
+    return best;
+}
+
+QVariantMap Document::rewindFramesState() const {
+    QVariantList volumes;
+    for (int i = 0; i <= m_rewindTotal; ++i) {
+        const auto f = m_rewindFrames.find(i);
+        volumes << (f != m_rewindFrames.end() ? f->second.volume : 0.0);
+    }
+    return {{QStringLiteral("key"), !m_rewindKey.isEmpty()}, {QStringLiteral("total"), m_rewindTotal},
+            {QStringLiteral("ready"), int(m_rewindFrames.size())}, {QStringLiteral("shown"), m_rewindShown},
+            {QStringLiteral("volumes"), volumes}};
+}
+
+QVariantMap Document::featureAt(const QString &kind, int index) const {
+    const QVariantMap no{{QStringLiteral("ok"), false}, {QStringLiteral("why"), QStringLiteral("No extrude, chamfer or fillet made that; click a face one of them made.")}};
+    int body = 0;
+    std::vector<int> want;
+    if (kind == QLatin1String("face")) {
+        const QVariantMap ref = faceRef(index);
+        body = ref.value(QStringLiteral("body")).toInt();
+        if (body)
+            want = m_engine->faceEdges(omamake::BodyId(body), ref.value(QStringLiteral("face")).toInt());
+    } else if (kind == QLatin1String("edge")) {
+        const QVariantMap ref = edgeRef(index);
+        body = ref.value(QStringLiteral("body")).toInt();
+        if (body)
+            want = {ref.value(QStringLiteral("edge")).toInt()};
+    }
+    if (!body || want.empty())
+        return no;
+    for (int step = int(m_actions.size()) - 1; step >= 0; --step) {
+        const QJsonObject a = m_actions[step].toObject();
+        const QString type = a.value(QStringLiteral("type")).toString();
+        if (type != QLatin1String("extrude") && !edgeStep(type))
+            continue;
+        const QVariantList refs = featureEdgeRefs(step);
+        std::set<int> mine;
+        for (const QVariant &v : refs) {
+            const QVariantMap r = v.toMap();
+            if (r.value(QStringLiteral("body")).toInt() == body)
+                mine.insert(r.value(QStringLiteral("edge")).toInt());
+        }
+        if (std::all_of(want.begin(), want.end(), [&mine](int e) { return mine.count(e) > 0; }))
+            return {{QStringLiteral("ok"), true}, {QStringLiteral("step"), step},
+                    {QStringLiteral("summary"), a.value(QStringLiteral("summary")).toString()}, {QStringLiteral("edges"), refs}};
+    }
+    return no;
 }

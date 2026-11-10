@@ -48,6 +48,8 @@ Item {
     // The design's row of an opened file: its steps built again in the background, oldest first (Document
     // modelBuiltTo): the history length up to which they're built (-1: nothing being built).
     property int builtCount: -1
+    // An opened file being built again (GB-062): the build fill is the progress bar.
+    readonly property bool building: builtCount >= 0 && !readyDone
     readonly property int builtItem: {
         if (builtCount < 0 || readyDone)
             return 0
@@ -107,6 +109,10 @@ Item {
 
     readonly property int dot: 12
     readonly property int pitch: 26           // dot to dot
+    // The size every step symbol is drawn at (GB-060 standard, owner pt162u: Fillet / Chamfer's size
+    // "would be the standard size for sizing going forward"): SketchIcon (full), EyeIcon, ChainIcon, the
+    // move cross. Hover grows them 1.18 (to the pitch, 26, no overlap).
+    readonly property int icon: 22
     readonly property string sketchName: {
         const made = history.find(a => a.type === "sketch" && a.id === sketchId)
         return made ? made.name : ""
@@ -133,6 +139,10 @@ Item {
             return "fx"
         if (a.type === "extrude")
             return "extrude"
+        if (a.type === "chamfer")
+            return "chamfermodel"
+        if (a.type === "fillet")
+            return "filletmodel"
         if (a.type === "fix")
             return String(a.summary || "").startsWith("Unfixed") ? "unfix" : "fix"
         return ""
@@ -167,7 +177,7 @@ Item {
                            issue: a.issue || "", issueText: a.issue_text || "", step: a.step, future: !!a.future })
             else
                 out.push({ summary: a.summary, sym: timeline.symbolOf(a), eye: a.type === "visibility" ? (a.shown ? "open" : "shut") : "",
-                           step: a.step, future: !!a.future })
+                           issue: a.issue || "", issueText: a.issue_text || "", step: a.step, future: !!a.future })
         }
         return out
     }
@@ -296,11 +306,19 @@ Item {
             height: 30
             radius: height / 2
             visible: timeline.actions.length > 0
-            color: Qt.rgba(timeline.theme.panelBg.r, timeline.theme.panelBg.g, timeline.theme.panelBg.b, 0.55)
+            // GB-061 (owner pt163u: "once it's fully filled, basically defaults back to a much darker background
+            // color, so these glyphs stand out more"): while steps are still being worked out the fills below
+            // show progress over the usual see-through track; once everything is (`settled`) the fills fade out
+            // and the track fades to the theme's window background, nearly opaque: the darkest the theme has
+            // (light in a light theme), so the symbols in the accent colour stand out most.
+            readonly property bool settled: timeline.readyDone && timeline.readyItem === 0
+            color: settled ? Qt.rgba(timeline.theme.windowBg.r, timeline.theme.windowBg.g, timeline.theme.windowBg.b, 0.94)
+                           : Qt.rgba(timeline.theme.panelBg.r, timeline.theme.panelBg.g, timeline.theme.panelBg.b, 0.55)
+            Behavior on color { ColorAnimation { duration: 350; easing.type: Easing.OutCubic } }
             border.color: Qt.rgba(timeline.theme.border.r, timeline.theme.border.g, timeline.theme.border.b, 0.6)
 
             // The ready fill: from the first item that can be reached to the end, faint while the rest is still
-            // being worked out, stronger once it all can be.
+            // being worked out; once it all can be, it fades away (GB-061) and the track goes dark instead.
             Rectangle {
                 id: readyFill
                 objectName: "timelineReady"
@@ -312,24 +330,30 @@ Item {
                 radius: track.radius
                 visible: timeline.items.length > 0
                 color: timeline.dotColor
-                opacity: timeline.readyDone && timeline.readyItem === 0 ? 0.26 : 0.13
+                // Gone once it's all ready (GB-061; was 0.26 then), and while an opened file is being built again (GB-062):
+                // then the build fill alone is the progress bar, over the plain dark track.
+                opacity: track.settled || timeline.building ? 0 : 0.13
                 Behavior on x { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
                 Behavior on opacity { NumberAnimation { duration: 300 } }
             }
-            // The opened file's steps being built again: a fainter fill growing from the oldest end. When it
-            // meets the ready fill they all become ready and the whole row fills.
+            // The opened file's steps being built again: a fill growing from the oldest end as the rebuild gets on
+            // (Document modelBuildingTo, GB-062), over the plain track; when it's all done the track settles dark (GB-061).
             Rectangle {
                 id: builtFill
                 objectName: "timelineBuilt"
+                // Under the steps built when the whole row is on show; when it's longer than the track (it scrolls), the
+                // share of all the steps built (GB-062: else it filled the track at the last step in view, 49 of 116).
+                readonly property bool overflow: list.contentWidth > list.width + 1
                 readonly property real toX: timeline.builtItem === 0 ? 0
+                                            : overflow ? track.width * timeline.builtItem / Math.max(1, timeline.items.length)
                                             : list.x - track.x + timeline.slotX(timeline.builtItem) - list.contentX
                 x: 0
                 width: Math.max(0, Math.min(track.width, toX))
                 height: track.height
                 radius: track.radius
-                visible: timeline.items.length > 0 && !timeline.readyDone && timeline.builtCount >= 0 && width > 0
+                visible: timeline.items.length > 0 && timeline.building && width > 0
                 color: timeline.dotColor
-                opacity: 0.07
+                opacity: 0.16                          // GB-062: the progress bar on its own (was 0.07 over the ready fill)
                 Behavior on width { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
             }
         }
@@ -479,10 +503,12 @@ Item {
                 ChainIcon {
                     visible: !!slot.modelData.link || !!slot.modelData.breaks
                     anchors.centerIn: parent
+                    width: timeline.icon
+                    height: timeline.icon
                     broken: !!slot.modelData.breaks
                     ink: timeline.dotColor
                     opacity: slot.modelData.linkBroken ? 0.5 : 1
-                    scale: slot.hot ? 1.35 : 1
+                    scale: slot.hot ? 1.18 : 1
                     Behavior on scale { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
                 }
 
@@ -490,9 +516,12 @@ Item {
                 SketchIcon {
                     visible: !!slot.modelData.sym
                     anchors.centerIn: parent
+                    width: timeline.icon
+                    height: timeline.icon
+                    full: true
                     kind: slot.modelData.sym || ""
                     ink: timeline.dotColor
-                    scale: slot.hot ? 1.35 : 1
+                    scale: slot.hot ? 1.18 : 1
                     Behavior on scale { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
                 }
 
@@ -500,9 +529,10 @@ Item {
                 EyeIcon {
                     visible: !!slot.modelData.eye
                     anchors.centerIn: parent
+                    width: timeline.icon
                     open: slot.modelData.eye === "open"
                     ink: timeline.dotColor
-                    scale: slot.hot ? 1.35 : 1
+                    scale: slot.hot ? 1.18 : 1
                     Behavior on scale { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
                 }
 
@@ -512,15 +542,16 @@ Item {
                     visible: !!slot.modelData.move
                     anchors.centerIn: parent
                     anchors.horizontalCenterOffset: slot.modelData.folded ? -6 : 0
-                    width: 18
-                    height: 18
-                    scale: slot.hot ? 1.35 : 1
+                    width: timeline.icon
+                    height: timeline.icon
+                    scale: slot.hot ? 1.18 : 1
                     Behavior on scale { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
                     property color ink: timeline.dotColor
                     onInkChanged: requestPaint()
                     onPaint: {
                         const c = getContext("2d")
                         c.reset()
+                        c.scale(width / 18, height / 18)          // drawn in 18, scaled to the standard size (GB-060)
                         c.strokeStyle = ink
                         c.fillStyle = ink
                         c.lineWidth = 1.6

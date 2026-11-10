@@ -4,6 +4,7 @@
 #include "theme/omarchytheme.h"
 #include "theme/transparency.h"
 #include "view/meshgeometry.h"
+#include "view/modifierkeys.h"
 
 #include <QDir>
 #include <QGuiApplication>
@@ -43,6 +44,7 @@ int main(int argc, char *argv[]) {
     qmlRegisterType<MeshGeometry>("OmaMake", 1, 0, "MeshGeometry");
 
     Transparency transparency;
+    ModifierKeys modifierKeys;
     OmarchyTheme omarchyTheme;
     DialogLook dialogLook;
     // The engine (owner, 2026-10-30): Heavy (OpenCascade, exact surfaces) unless OMAMAKE_ENGINE=lite.
@@ -56,6 +58,7 @@ int main(int argc, char *argv[]) {
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("doc"), &document);
     engine.rootContext()->setContextProperty(QStringLiteral("transparency"), &transparency);
+    engine.rootContext()->setContextProperty(QStringLiteral("modifierKeys"), &modifierKeys);
     engine.rootContext()->setContextProperty(QStringLiteral("omarchyTheme"), &omarchyTheme);
     engine.rootContext()->setContextProperty(QStringLiteral("dialogLook"), &dialogLook);
     // Where Save As starts: Documents/OmaMake, or OMAMAKE_SAVE_DIR (test windows run with a

@@ -1373,7 +1373,7 @@ QtObject {
             return
         }
         // A point already drawn by its id; a new one where it goes, with what it snapped onto.
-        const end = p => p.point ? p.point : { u: p.u, v: p.v, on: p.on || "", line: p.line || 0, arc: p.arc || 0 }
+        const end = p => p.point ? { point: p.point } : { u: p.u, v: p.v, on: p.on || "", line: p.line || 0, arc: p.arc || 0 }
         if (tool === "line") {
             const made = doc.addSketchLine(sketch.sketchId, end(start), end(at), at.hold || "", construction)
             if (!made.line)
