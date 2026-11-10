@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/">
+        <file alias="icons/omamake.png">icons/hicolor/256x256/apps/omamake.png</file>
+    </qresource>
+</RCC>

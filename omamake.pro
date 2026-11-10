@@ -16,6 +16,10 @@ LIBS += -lmanifold
 INCLUDEPATH += /usr/include/opencascade
 LIBS += -lTKernel -lTKMath -lTKG2d -lTKG3d -lTKGeomBase -lTKBRep -lTKGeomAlgo -lTKTopAlgo -lTKPrim -lTKFeat -lTKFillet -lTKOffset -lTKBO -lTKBool -lTKHLR -lTKMesh -lTKShHealing -lTKDESTEP -lTKDESTL -lTKXSBase
 
+# The app's icon (owner, GB-064): the window icon, built in; resources/icons/hicolor/ holds the sizes the
+# desktop entry's Icon=omamake finds once installed (resources/icons/omamake.png is the full-size source).
+RESOURCES += resources/omamake.qrc
+
 # The QML files are read from the source tree at startup (no compile for UI changes).
 DEFINES += OMAMAKE_SOURCE_QML_DIR=\\\"$$PWD/qml\\\"
 # Failed operations' logs go in this folder's logs/ (dev builds; gitignored).

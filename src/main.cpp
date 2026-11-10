@@ -8,6 +8,7 @@
 
 #include <QDir>
 #include <QGuiApplication>
+#include <QIcon>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QRegularExpression>
@@ -40,6 +41,8 @@ int main(int argc, char *argv[]) {
     QGuiApplication app(argc, argv);
     QGuiApplication::setApplicationName(QStringLiteral("OmaMake"));
     QGuiApplication::setDesktopFileName(QStringLiteral("omamake"));
+    // The app's icon (owner, GB-064). On Wayland the bar and launcher take it from omamake.desktop (Icon=omamake).
+    QGuiApplication::setWindowIcon(QIcon(QStringLiteral(":/icons/omamake.png")));
 
     qmlRegisterType<MeshGeometry>("OmaMake", 1, 0, "MeshGeometry");
 
