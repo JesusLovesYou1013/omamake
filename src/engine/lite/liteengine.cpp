@@ -112,7 +112,7 @@ public:
         return 0;
     }
 
-    BodyId fitSurfaces(BodyId, double, FitResult &, std::string &why, const std::function<void(const char *)> &) override {
+    BodyId fitSurfaces(BodyId, double, MeshStyle, FitResult &, std::string &why, const std::function<void(const char *)> &) override {
         why = "Curved surfaces need the Heavy engine.";
         return 0;
     }

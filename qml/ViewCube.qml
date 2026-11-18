@@ -45,7 +45,8 @@ Item {
         const z1 = p[0] * Math.sin(yr) + p[2] * Math.cos(yr)
         const y2 = p[1] * Math.cos(pr) + z1 * Math.sin(pr)
         const z2 = -p[1] * Math.sin(pr) + z1 * Math.cos(pr)
-        return { x: x1 * half, y: -y2 * half, z: z2 }
+        const rr = nav.roll * Math.PI / 180, x3 = x1 * Math.cos(rr) - y2 * Math.sin(rr), y3 = x1 * Math.sin(rr) + y2 * Math.cos(rr)
+        return { x: x3 * half, y: -y3 * half, z: z2 }
     }
 
     function screenOf(f) {
@@ -76,6 +77,7 @@ Item {
         target: cube.nav
         function onYawChanged() { canvas.requestPaint() }
         function onPitchChanged() { canvas.requestPaint() }
+        function onRollChanged() { canvas.requestPaint() }
     }
     Connections {
         target: cube.theme

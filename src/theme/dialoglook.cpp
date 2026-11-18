@@ -1,4 +1,5 @@
 #include "dialoglook.h"
+#include "view/esckeys.h"
 
 #include <dlfcn.h>
 
@@ -21,6 +22,12 @@ F symbol(const char *library, const char *name)
 
 void DialogLook::setDark(bool dark)
 {
+    // Every file dialog opens just after this: GTK's keys are watched from the first one on, and a dialog
+    // starts its own Esc count afresh (GB-081, esckeys.h).
+    if (EscKeys *esc = EscKeys::instance()) {
+        esc->watchGtkDialogs();
+        esc->reset();
+    }
     const auto settingsDefault = symbol<void *(*)()>("libgtk-3.so.0", "gtk_settings_get_default");
     const auto objectSet = symbol<void (*)(void *, const char *, ...)>("libgobject-2.0.so.0", "g_object_set");
     void *settings = settingsDefault ? settingsDefault() : nullptr;

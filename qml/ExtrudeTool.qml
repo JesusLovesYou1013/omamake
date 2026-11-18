@@ -13,10 +13,11 @@ Item {
     required property var selection              // Selection.qml
     required property var previewA                // MeshGeometry for side 1's pushed shape, B for side 2
     required property var previewB
+    required property var regionMask              // RegionMask: the cut's region for the body's shader
+    required property var cutFaces                // MeshGeometry: the bodies as the cut leaves them (faces)
+    required property var cutEdges                // and their edge lines
     required property var wireA                   // the same shapes as outlines (MeshGeometry with lines)
     required property var wireB
-    required property var cutA                    // the exact region a cut removes, drawn strongly after a pause
-    required property var cutB
     property var project: p => Qt.point(0, 0)     // a 3D point on the screen (Main.toScreen)
     property int fadeMs: 250
 
@@ -115,28 +116,61 @@ Item {
     function opOf(side) {
         return plan && plan.sides && plan.sides[side] ? plan.sides[side].op : "new"
     }
-    // Cuts are red, everything that adds (new body, join, new component) is blue.
+    // A side that cuts (or intersects) a body it reaches, one not left out with the body boxes (GB-084).
+    function reaches(side) {
+        const sd = plan && plan.ok && plan.sides ? plan.sides[side] : null
+        if (!sd || (sd.op !== "cut" && sd.op !== "intersect"))
+            return false
+        const skip = side === 0 ? skip1 : skip2
+        return (sd.hits || []).some(h => skip.indexOf(h.body) < 0)
+    }
+    // While a cut shows, the bodies inside its volume are drawn as the cut will leave them (GB-084 second
+    // correction: the pocket's walls and floor, solid; the first correction's see-through copy showed the
+    // body's inside instead). The result is made on a worker (Document::fillExtrudeCutResult, newest only);
+    // the region (Document::extrudeRegion: where Main swaps the bodies for it) is set only when that result is
+    // in, for the spec it was made for, so the body as it is stays until then and never flashes. After OK
+    // both stay until the cut body is in (the preview stays until then too).
+    readonly property bool cutShown: cutFinishing || (open && ready && (reaches(0) || (mode !== "one" && reaches(1))))
+    property bool cutFinishing: false
+    readonly property var noRegion: ({ on: false })
+    property var region: noRegion
+    property string cutAsked: ""                  // the spec last sent for a result (the same one isn't made twice)
+    property real cutResultMs: 0                  // the worker's time for the last result (probes)
+    function drawRegion() {
+        if (cutFinishing)
+            return                                // after OK: kept until the cut body is in
+        const cuts = side => open && ready && opOf(side) === "cut" && reaches(side)
+        const any = cuts(0) || (mode !== "one" && cuts(1))
+        const s = any ? spec() : ({})
+        const key = JSON.stringify(s)
+        if (key === cutAsked)
+            return
+        cutAsked = key
+        if (!any)
+            region = noRegion
+        doc.fillExtrudeCutResult(cutFaces, cutEdges, s)
+    }
+    Connections {
+        target: doc
+        function onExtrudeCutResultReady(ok, spec, cutting, ms) {
+            tool.cutResultMs = ms
+            tool.region = ok && (tool.open || tool.cutFinishing) ? doc.extrudeRegion(spec, tool.regionMask, cutting) : tool.noRegion
+        }
+    }
+    // Cuts are red, everything that adds (new body, join, new component) is blue. A cut that reaches a body is
+    // a stronger red, steady: it's the same one shape as the outline, drawn with it (GB-084: a second, separate
+    // red copy came and went as it was worked out again after each change).
     function fillOf(side) {
-        return opOf(side) === "cut" || opOf(side) === "intersect" ? Qt.rgba(0.9, 0.12, 0.12, 0.10) : Qt.rgba(0.2, 0.5, 1.0, 0.14)
+        if (opOf(side) === "cut" || opOf(side) === "intersect")
+            return reaches(side) ? Qt.rgba(0.95, 0.12, 0.12, 0.30) : Qt.rgba(0.9, 0.12, 0.12, 0.10)
+        return Qt.rgba(0.2, 0.5, 1.0, 0.14)
     }
     function lineOf(side) {
         return opOf(side) === "cut" || opOf(side) === "intersect" ? Qt.rgba(1.0, 0.2, 0.2, 1) : Qt.rgba(0.3, 0.62, 1.0, 1)
     }
-    readonly property color cutColor: Qt.rgba(0.9, 0.1, 0.1, 0.35)
-    function clearCut() {
-        doc.fillExtrudeCutaway(cutA, {}, 0)
-        doc.fillExtrudeCutaway(cutB, {}, 1)
-    }
-    function drawCut() {
-        if (!ready) return
-        for (let s = 0; s < 2; ++s) {
-            const t = s === 0 ? cutA : cutB
-            if (opOf(s) === "cut" && (s === 0 || mode === "two"))
-                doc.fillExtrudeCutaway(t, spec(), s)
-            else
-                doc.fillExtrudeCutaway(t, {}, s)
-        }
-    }
+    // The pointer on (or dragging) an arrow: the view lights nothing under it (Main's hover), so the face beside
+    // the arrow doesn't flash on and off as the pointer wavers over the arrow's edge (GB-084).
+    property int arrowHeld: 0
 
     function parseLen(text) {
         let s = String(text).trim()
@@ -287,7 +321,9 @@ Item {
     function clearPreview() {
         doc.fillExtrudePreview(previewA, wireA, {}, 0)
         doc.fillExtrudePreview(previewB, wireB, {}, 1)
-        clearCut()
+        region = noRegion
+        cutAsked = ""
+        doc.fillExtrudeCutResult(cutFaces, cutEdges, {})
     }
     // Every Extrude starts blank (owner, 2026-11-03): nothing typed or picked last time carries over.
     function blank() {
@@ -314,30 +350,38 @@ Item {
             say("Click a profile or a flat face to extrude; Ctrl or Shift adds more. Then a plain click picks what to extrude up to.", 0)
         Qt.callLater(() => { d1Field.forceActiveFocus(); d1Field.selectAll() })
     }
+    // Picking an object stopped: back to the distance (one Esc, GB-081). True if it was picking.
+    function stopPick() {
+        if (picking < 0)
+            return false
+        const side = picking
+        picking = -1
+        if (!(side === 0 ? target1 : target2)) {
+            if (side === 0) extent1 = "distance"; else extent2 = "distance"
+        }
+        return true
+    }
     function cancel() {
         if (!open)
             return
-        if (picking >= 0) {                      // Esc while picking an object: back to the distance
-            const side = picking
-            picking = -1
-            if (!(side === 0 ? target1 : target2)) {
-                if (side === 0) extent1 = "distance"; else extent2 = "distance"
-            }
+        if (stopPick())                          // Cancel while picking an object: back to the distance first
             return
-        }
         open = false
         cutChoices = null
         tool.clearPreview()
         finished()
     }
     // The solid work runs off the main thread: the options go, the preview stays until the result is in.
+    property double pressedAt: 0                  // when the person pressed Extrude, for the time shown after
     function done() {
         if (!ready) { cancel(); return }
+        pressedAt = Date.now()
         const r = doc.extrudeInBackground(spec())
         if (!r.ok) {
             say(r.why, 0)
             return
         }
+        cutFinishing = cutShown
         open = false
         cutChoices = null
         finished()
@@ -345,14 +389,29 @@ Item {
     Connections {
         target: doc
         function onExtrudeFinished(r) {
+            tool.cutFinishing = false
             tool.clearPreview()
             tool.selection.clear()
             if (!r.ok)
                 tool.say(r.why, tool.readingMs(r.why))
             else {
-                // A note (Fuzzy profile was needed, how far off it may be) stays long enough to read.
-                const text = (r.note ? r.note + " " : "") + "Extruded in " + r.seconds.toFixed(1) + " s"
-                tool.say(text, r.note ? tool.readingMs(text) : 0)
+                // The time shown runs from the press until the new body is drawn and the app answers again:
+                // the first frame put on screen after the result, not only the solid work in the background.
+                const show = () => {
+                    const s = tool.pressedAt > 0 ? (Date.now() - tool.pressedAt) / 1000 : r.seconds
+                    tool.pressedAt = 0
+                    // A note (Fuzzy profile was needed, how far off it may be) stays long enough to read.
+                    const text = (r.note ? r.note + " " : "") + "Extruded in " + s.toFixed(1) + " s"
+                    tool.say(text, r.note ? tool.readingMs(text) : 0)
+                }
+                const w = tool.Window.window
+                if (w && tool.pressedAt > 0) {
+                    const once = () => { w.frameSwapped.disconnect(once); show() }
+                    w.frameSwapped.connect(once)
+                    w.update()
+                } else {
+                    show()
+                }
             }
         }
     }
@@ -360,8 +419,12 @@ Item {
         if (!open)
             return
         areas = gather()
-        while (perText.length < areas.length)
-            perText = perText.concat([d1Text])
+        if (perText.length < areas.length) {    // in one go: each change of perText draws the preview again
+            const more = perText.slice()
+            while (more.length < areas.length)
+                more.push(d1Text)
+            perText = more
+        }
         if (!ready) {
             frame = null; plan = null; cutChoices = null
             tool.clearPreview()
@@ -379,21 +442,40 @@ Item {
         if (!open || !ready)
             return
         replan.restart()
-        clearCut()
         if (extent1 !== "distance" || extent2 !== "distance" || frame === null || !frame.ok)
             frame = doc.extrudeFrame(spec())
+        drawPreviewSoon()
+    }
+    // A drag sends many lengths a frame (a fast mouse more): the first is drawn at once, the rest are
+    // gathered and only the newest is drawn a frame later, so the preview keeps up instead of queueing.
+    property bool previewPending: false
+    function drawPreviewSoon() {
+        if (previewGate.running) {
+            previewPending = true
+            return
+        }
         drawPreview()
+        previewGate.start()
+    }
+    Timer {
+        id: previewGate
+        interval: 16
+        onTriggered: if (tool.previewPending) { tool.previewPending = false; tool.drawPreview(); start() }
     }
     function drawPreview() {
-        if (!ready) return
+        // Only while the tool is open (GB-086): a draw still waiting when Done was hit ran after the cut body
+        // was in, and its face number then named another face of the new body (a cylinder's seam strip, left
+        // in red). After OK the last preview simply stays until the result is in.
+        if (!ready || !open) return
         doc.fillExtrudePreview(previewA, wireA, spec(), 0)
         if (mode === "two")
             doc.fillExtrudePreview(previewB, wireB, spec(), 1)
         else
             doc.fillExtrudePreview(previewB, wireB, {}, 1)
+        drawRegion()
     }
     function replanNow() {
-        if (!ready) return
+        if (!ready || !open) return
         plan = doc.extrudePlan(spec())
         let choices = null, side = 0
         if (plan.ok)
@@ -409,7 +491,7 @@ Item {
             }
         cutChoices = choices
         cutSide = side
-        drawCut()
+        drawRegion()
     }
     function toggleCut(id, on) {
         const key = cutSide === 0 ? "skip1" : "skip2"
@@ -545,6 +627,11 @@ Item {
                 }
                 MouseArea {
                     id: gripArea
+                    // Counted on the tool (arrowHeld): on it or dragging it.
+                    readonly property bool held: containsMouse || pressed
+                    property bool counted: false
+                    onHeldChanged: { if (held !== counted) { tool.arrowHeld += held ? 1 : -1; counted = held } }
+                    Component.onDestruction: if (counted) tool.arrowHeld -= 1
                     anchors.fill: parent
                     anchors.margins: -4
                     hoverEnabled: true

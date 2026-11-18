@@ -2,7 +2,7 @@ import QtQuick
 import "ShapeTools.js" as Shapes
 import "SketchMath.js" as M
 
-// Drawing in the open sketch (Fusion's names; search Alt+Space, Sketch mode):
+// Drawing in the open sketch (Fusion's names; search S or Ctrl+Space, Sketch mode):
 //   Line                click the start, then click each next point: every click ends one line
 //                       and starts the next from there. Clicking the chain's first point
 //                       closes it. Esc stops.

@@ -103,8 +103,13 @@ struct Mesh {
 };
 
 // What Fit Curved Surfaces did.
+// What a mesh is, asked on Import Mesh (owner, 2026-11-10): an ordinary detailed one, a Low Poly
+// styled one (its facets are the look), or a smooth part exported at a low resolution (a coarse mesh).
+enum class MeshStyle { Detailed, LowPoly, LowRes };
+
 struct FitResult {
     int cylinders = 0, cones = 0, spheres = 0;
+    int bowls = 0;              // smooth caps of second degree (a paraboloid dome), one face each
     int trianglesLeft = 0;      // of the source triangles, those still flat facets
     double worstMm = 0;         // the furthest a source point ended up from its surface
 };
@@ -160,6 +165,19 @@ public:
     // faces don't quite meet.
     virtual BodyId combine(BodyId a, const std::vector<BodyId> &tools, Combine op, double fuzzy = 0) = 0;
     BodyId combine(BodyId a, BodyId b, Combine op, double fuzzy = 0) { return combine(a, std::vector<BodyId>{b}, op, fuzzy); }
+    // GB-093 (owner, 2026-11-17): wall clearance for a cut's profile. Every straight step of `profile` (on
+    // `place`, to be pushed from `from` to `to`) that lies on a wall of one of `bodies` (a face along the push
+    // direction, within 0.001 mm all along the step) is moved `gap` mm off that wall into the empty side, as
+    // that wall faces: an outline round a body moves out, a hole's edge moves into the hole, step by step.
+    // Only when the strip it moves across is empty over the whole push (no face of any of `bodies` in it), so
+    // a cut takes away exactly what it did; steps on no wall, arcs and curves stay exact. A step with walls
+    // facing both ways on it (two bodies touching there) stays exact. A line for the log, empty when nothing
+    // moved. The Lite engine leaves the profile as it is.
+    virtual std::string clearWalls(Profile &profile, const Placement &place, double from, double to,
+                                   const std::vector<BodyId> &bodies, double gap) {
+        (void)profile; (void)place; (void)from; (void)to; (void)bodies; (void)gap;
+        return {};
+    }
     // Why the last extrudeOn, extrudeFace or combine that gave 0 couldn't be done, in words for the
     // person ("the result would touch itself along a line or at a point, ..."); empty when the engine
     // can't say.
@@ -199,7 +217,8 @@ public:
     virtual bool flatCurves(BodyId body, int face, const Placement &plane, std::vector<FlatCurve> &curves,
                             std::vector<Point2> &corners) const = 0;
     // Project, exactly: the area these bodies (face -1), or one face of the first (its own index), cover
-    // seen straight down on the plane, as its outlines: the outside first, then any holes, each piece
+    // seen straight down on the plane, as its outlines: the outside first, then any holes (one face only;
+    // the bodies give only the outside of each separate region, GB-095), each piece
     // running round with the area on its left. Built from the exact edges and the curved faces' exact
     // outlines, never the drawing mesh. A face seen edge on covers no area: its edges come back as
     // loose pieces. False and why when it can't (the Lite engine has no exact edges).
@@ -246,17 +265,32 @@ public:
                               const std::function<void(const char *)> &stage) = 0;
 
     // Read an STL or OBJ into a solid, its flat areas one face each. Same rules as importStep.
-    virtual BodyId importMesh(const std::string &path, std::string &why,
-                              const std::function<void(const char *)> &stage) = 0;
+    virtual BodyId importMesh(const std::string &path, std::string &why, const std::function<void(const char *)> &stage) = 0;
     // A new body with facets standing in for a round surface turned into that surface, kept
     // within `share` of its radius; `body` stays as it was. 0 and why if nothing could be fitted.
-    virtual BodyId fitSurfaces(BodyId body, double share, FitResult &result, std::string &why,
+    // `style` is what the person said the mesh is when asked on Fit (MeshStyle): a Low Poly one isn't
+    // fitted (its facets are the look), its near-same-angle facets are joined into flats instead; a Low
+    // Res one is read more loosely.
+    virtual BodyId fitSurfaces(BodyId body, double share, MeshStyle style, FitResult &result, std::string &why,
                                const std::function<void(const char *)> &stage) = 0;
     // Write a body as a STEP file, in mm. False and why if it can't be.
     virtual bool exportStep(BodyId body, const std::string &path, std::string &why) const = 0;
     // A body's exact solid as bytes and back, for the design file. Empty / 0 if not possible.
     virtual std::string saveBody(BodyId body) const = 0;
+    // GB-089: saveBody's work made ready to run on another thread (the recovery file's writer): the solid is taken
+    // now (a body's solid never changes), written when the function runs. Empty: this engine can't save.
+    virtual std::function<std::string()> saveBodyLater(BodyId body) const { (void)body; return {}; }
     virtual BodyId loadBody(const std::string &bytes) = 0;
+    // The triangles an imported mesh came in as travel with its saved bytes: a body loaded from
+    // bytes a mesh's body was saved as fits from that mesh again, not from its own flats meshed
+    // anew (that gave a different fit after undo/redo or reopening). sourceOf names the mesh behind
+    // saved bytes ("" if none), sourceBytes gives it to keep in a file, and addSource ties bytes
+    // read back from a file to it again, before they are loaded.
+    virtual std::string sourceOf(const std::string &bodyBytes) const { (void)bodyBytes; return {}; }
+    virtual std::string sourceBytes(const std::string &source) const { (void)source; return {}; }
+    virtual void addSource(const std::string &bodyBytes, const std::string &source, const std::string &meshBytes) {
+        (void)bodyBytes; (void)source; (void)meshBytes;
+    }
 
     virtual Mesh mesh(BodyId body) const = 0;
     virtual void release(BodyId body) = 0;

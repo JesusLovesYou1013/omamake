@@ -15,4 +15,15 @@ namespace refine {
 // moves. Null if the result doesn't check out; `united` counts the groups joined.
 TopoDS_Shape sameSurfaces(const TopoDS_Shape &shape, int *united = nullptr);
 
+// True if every face that goes all the way round (a cylinder or cone with a wrap-around line) can be
+// cut into triangles to be drawn. OpenCascade's merge can join a hole's two halves into one face that
+// checks out valid yet can't be drawn (hinge_female's countersinks, round 6): a merge that makes such
+// a face isn't used. Each such face is tried alone, as a copy, at a coarse size.
+bool roundsDraw(const TopoDS_Shape &shape);
+
+// OpenCascade's merge (ShapeUpgrade_UnifySameDomain) at the given tolerances, every edge kept that
+// lies between two faces of one cylinder or cone, when merging those would leave a round face that
+// can't be drawn (roundsDraw); everything else merged as usual. Null if the merge failed.
+TopoDS_Shape unifyDrawable(const TopoDS_Shape &shape, double linear, double angular);
+
 } // namespace refine

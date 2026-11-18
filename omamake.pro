@@ -32,6 +32,8 @@ HEADERS += \
     src/document/sketchgeometry.h \
     src/document/profiles.h \
     src/document/projection.h \
+    src/document/recovery.h \
+    src/engine/stop.h \
     src/engine/engine.h \
     src/engine/heavy/meshsolid.h \
     src/engine/heavy/refine.h \
@@ -43,7 +45,9 @@ HEADERS += \
     src/theme/omarchytheme.h \
     src/theme/transparency.h \
     src/view/meshgeometry.h \
-    src/view/modifierkeys.h
+    src/view/modifierkeys.h \
+    src/view/esckeys.h \
+    src/view/regionmask.h
 
 SOURCES += \
     src/main.cpp \
@@ -53,6 +57,8 @@ SOURCES += \
     src/document/sketchgeometry.cpp \
     src/document/profiles.cpp \
     src/document/projection.cpp \
+    src/document/recovery.cpp \
+    src/engine/stop.cpp \
     src/engine/lite/liteengine.cpp \
     src/engine/heavy/heavyengine.cpp \
     src/engine/heavy/meshsolid.cpp \
@@ -65,7 +71,9 @@ SOURCES += \
     src/theme/omarchytheme.cpp \
     src/theme/transparency.cpp \
     src/view/meshgeometry.cpp \
-    src/view/modifierkeys.cpp
+    src/view/modifierkeys.cpp \
+    src/view/esckeys.cpp \
+    src/view/regionmask.cpp
 
 # Qt Quick shaders (2D effects) are compiled to .qsb beside their source, where the QML reads them.
 QSB_SOURCES = $$PWD/qml/shaders/crossfade.frag

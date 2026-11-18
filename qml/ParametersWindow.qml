@@ -110,6 +110,21 @@ Item {
         open = true
         panel.forceActiveFocus()
     }
+    // Esc (Main.escPressed, GB-081): one Esc lets go of the cell or filter being typed in (left as typed, as a
+    // click elsewhere leaves it) or shuts the unit list; two quick ones close the window, as its X does.
+    function escStep() {
+        if (menuRow >= 0) {
+            menuRow = -1
+            return true
+        }
+        const f = win.Window.activeFocusItem
+        if (!f || f === panel)
+            return false
+        if (typeof f.deselect === "function")
+            f.deselect()
+        panel.forceActiveFocus()
+        return true
+    }
     function closeIt(fromOk) {
         menuRow = -1
         if (fromOk && !closable()) {
@@ -275,7 +290,6 @@ Item {
         radius: 10
         color: win.theme.panelBg
         border.color: win.theme.borderStrong
-        Keys.onEscapePressed: win.closeIt(false)
 
         readonly property real inner: width - 32
         function cw(c) { return c === 0 ? inner * 0.20 : c === 1 ? inner * 0.11 : c === 2 ? inner * 0.27 : c === 3 ? inner * 0.13 : inner * 0.29 - 40 }
@@ -326,7 +340,6 @@ Item {
                     color: win.theme.textPrimary; font.pixelSize: 13; clip: true
                     selectionColor: win.theme.selection; selectedTextColor: win.theme.windowBg
                     onTextChanged: win.filterText = text
-                    Keys.onEscapePressed: { text = ""; panel.forceActiveFocus() }
                     Text { visible: !filter.text && !filter.activeFocus; anchors.verticalCenter: parent.verticalCenter
                            text: "Filter all parameters"; color: win.theme.textMuted; font.pixelSize: 13 }
                 }
@@ -443,7 +456,6 @@ Item {
                             Keys.onReturnPressed: win.advance(row.index, 0)
                             Keys.onEnterPressed: win.advance(row.index, 0)
                             Keys.onTabPressed: win.advance(row.index, 0)
-                            Keys.onEscapePressed: win.closeIt(false)
                         }
                     }
                     // Unit
@@ -472,7 +484,6 @@ Item {
                         Keys.onReturnPressed: { win.menuRow = -1; win.advance(row.index, 1) }
                         Keys.onEnterPressed: { win.menuRow = -1; win.advance(row.index, 1) }
                         Keys.onTabPressed: { win.menuRow = -1; win.advance(row.index, 1) }
-                        Keys.onEscapePressed: win.closeIt(false)
                         Keys.onPressed: event => {
                             if (event.text.length === 1 && /[a-zA-Z]/.test(event.text)) {
                                 const ch = event.text.toLowerCase()
@@ -505,7 +516,6 @@ Item {
                             Keys.onReturnPressed: win.advance(row.index, 2)
                             Keys.onEnterPressed: win.advance(row.index, 2)
                             Keys.onTabPressed: win.advance(row.index, 2)
-                            Keys.onEscapePressed: win.closeIt(false)
                         }
                     }
                     // Value (worked out, not typed)
@@ -534,9 +544,6 @@ Item {
                                 if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
                                     if (event.modifiers & Qt.ShiftModifier) insert(cursorPosition, "\n")
                                     else win.finishRow(row.index)
-                                    event.accepted = true
-                                } else if (event.key === Qt.Key_Escape) {
-                                    win.closeIt(false)
                                     event.accepted = true
                                 }
                             }

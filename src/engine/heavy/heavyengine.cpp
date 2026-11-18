@@ -39,7 +39,11 @@
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepLib_ToolTriangulatedShape.hxx>
 #include <BRepBndLib.hxx>
+#include <BRepMesh_Context.hxx>
+#include <BRepMesh_DelaunayBaseMeshAlgo.hxx>
+#include <BRepMesh_FaceDiscret.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
+#include <BRepMesh_MeshAlgoFactory.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
 #include <BRep_Tool.hxx>
@@ -116,6 +120,27 @@
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
+#include <memory>
+#include <mutex>
+#include <cstring>
+#include "engine/stop.h"
+#include <Message_ProgressIndicator.hxx>
+#include <Message_ProgressRange.hxx>
+
+namespace {
+// GB-089: OpenCascade's Boolean asks this, through its progress range, whether to stop. The memory guard's stop
+// (every job) or the starting thread's StopScope deadline (copied here: the Boolean may ask from its own threads).
+class BreakCheck : public Message_ProgressIndicator {
+public:
+    BreakCheck() : m_deadline(omamake::stopDeadline()) {}
+    Standard_Boolean UserBreak() override {
+        return omamake::memoryStopRequested() || std::chrono::steady_clock::now() > m_deadline;
+    }
+    void Show(const Message_ProgressScope &, const Standard_Boolean) override {}
+private:
+    std::chrono::steady_clock::time_point m_deadline;
+};
+} // namespace
 
 namespace omamake {
 namespace {
@@ -259,6 +284,46 @@ static bool hasEmptyFace(const TopoDS_Shape &shape) {
             return true;
     }
     return false;
+}
+
+// GB-094 (owner, 2026-11-17): faces under 0.000001 mm2 a cut left (where a corner of the body lies a hair, under
+// 0.001 mm, off the tool's wall, the cut can't help but leave a sliver triangle there, b205d's hole cut from below:
+// 6e-9 to 7e-7 mm2) folded into the faces beside them by OpenCascade's Shape Healing (ShapeFix_FixSmallFace, as
+// `mended` uses it), with the model's accuracy (0.00001 in) as the most any corner may move and `allowed` as the
+// loosest any edge may get. Null if there were none, or if it did more than that: removed more faces than there
+// were such slivers, or changed the volume by more than a millionth.
+static TopoDS_Shape foldTinyFaces(const TopoDS_Shape &shape, double allowed) {
+    constexpr double kTiny = 1e-6;   // mm2
+    try {
+        int tiny = 0, before = 0;
+        for (TopExp_Explorer f(shape, TopAbs_FACE); f.More(); f.Next(), ++before) {
+            GProp_GProps props;
+            BRepGProp::SurfaceProperties(f.Current(), props);
+            tiny += std::abs(props.Mass()) < kTiny;
+        }
+        if (!tiny)
+            return {};
+        ShapeFix_FixSmallFace small;
+        small.Init(shape);
+        small.SetPrecision(kAccuracy);
+        small.SetMaxTolerance(allowed);
+        small.Perform();
+        const TopoDS_Shape out = small.FixShape();
+        if (out.IsNull())
+            return {};
+        int after = 0;
+        for (TopExp_Explorer f(out, TopAbs_FACE); f.More(); f.Next())
+            ++after;
+        GProp_GProps was, now;
+        BRepGProp::VolumeProperties(shape, was);
+        BRepGProp::VolumeProperties(out, now);
+        const bool narrow = before - after <= tiny && std::abs(now.Mass() - was.Mass()) <= 1e-6 * std::max(1.0, std::abs(was.Mass()));
+        engineLog("engine: sliver faces: %d under 0.000001 mm2; folded: %d face(s) fewer, volume %+.6f mm3, %s\n", tiny, before - after,
+                  now.Mass() - was.Mass(), narrow ? "kept for the checks" : "more than the slivers changed, not used");
+        return narrow ? out : TopoDS_Shape();
+    } catch (const Standard_Failure &) {
+        return {};
+    }
 }
 
 // The loosest edge or corner (mm): how far apart the pieces it joins may lie.
@@ -743,6 +808,7 @@ public:
         m_whyNot.clear();
         if (std::abs(to - from) < 1e-9)
             return 0;
+        std::string where;                              // the piece being made, for the failure log
         try {
             const gp_Pnt o(place.origin[0], place.origin[1], place.origin[2]);
             const gp_Vec x(place.x[0], place.x[1], place.x[2]), y(place.y[0], place.y[1], place.y[2]);
@@ -972,11 +1038,22 @@ public:
                 for (std::size_t r = 0; r < runCount; ++r)
                     vertex[r] = BRepBuilderAPI_MakeVertex(ElSLib::Value(corner[r].X(), corner[r].Y(), pln)).Vertex();
                 auto at3 = [&](double u, double v) { return ElSLib::Value(u, v, pln); };
+                // A corner where two pieces meet without an exact crossing sits on one of them, a hair
+                // off the other: its vertex covers that miss, up to what the profile finder counts as
+                // joined, so the edge it ends can still be made.
+                auto cover = [](const TopoDS_Vertex &v, const gp_Pnt &on) {
+                    const double miss = BRep_Tool::Pnt(v).Distance(on);
+                    if (miss > BRep_Tool::Tolerance(v) && miss <= 1e-4)
+                        BRep_Builder().UpdateVertex(v, 1.5 * miss);
+                };
                 BRepBuilderAPI_MakeWire wire;
                 for (std::size_t r = 0; r < runCount; ++r) {
                     const Run &run = runs[r];
                     const TopoDS_Vertex &va = vertex[r], &vb = vertex[(r + 1) % runCount];
                     const gp_Pnt a = BRep_Tool::Pnt(va), b = BRep_Tool::Pnt(vb);
+                    where = "loop " + std::to_string(i) + ", piece " + std::to_string(r) + " of " + std::to_string(runCount) + " ("
+                        + (run.curve >= 0 ? "curve" : !run.centre ? "line" : run.steps == count ? "circle" : "arc") + ", "
+                        + std::to_string(run.steps) + " step(s), corner to corner " + std::to_string(a.Distance(b)) + " mm)";
                     if (run.curve >= 0) {
                         const Handle(Geom_Curve) c3 = GeomAPI::To3d(flatCurve(run.curve), pln);
                         const bool forward = run.b > run.a;
@@ -995,9 +1072,13 @@ public:
                                 const TopoDS_Vertex vm = BRepBuilderAPI_MakeVertex(c3->Value(mid)).Vertex();
                                 for (const auto &[from, to, v0, v1] : {std::tuple{run.a, mid, va, vm}, std::tuple{mid, run.b, vm, vb}}) {
                                     const bool ahead = to > from;
+                                    cover(v0, c3->Value(from));
+                                    cover(v1, c3->Value(to));
                                     BRepBuilderAPI_MakeEdge half(c3, ahead ? v0 : v1, ahead ? v1 : v0, std::min(from, to), std::max(from, to));
-                                    if (!half.IsDone())
+                                    if (!half.IsDone()) {
+                                        m_whyNot = "a curve of the outline couldn't be made (" + where + ", error " + std::to_string(int(half.Error())) + ")";
                                         return 0;
+                                    }
                                     TopoDS_Edge e = half.Edge();
                                     if (!ahead)
                                         e.Reverse();
@@ -1006,9 +1087,13 @@ public:
                                 continue;
                             }
                         }
+                        cover(va, c3->Value(run.a));
+                        cover(vb, c3->Value(run.b));
                         BRepBuilderAPI_MakeEdge make(c3, forward ? va : vb, forward ? vb : va, std::min(run.a, run.b), std::max(run.a, run.b));
-                        if (!make.IsDone())
+                        if (!make.IsDone()) {
+                            m_whyNot = "a curve of the outline couldn't be made (" + where + ", error " + std::to_string(int(make.Error())) + ")";
                             return 0;
+                        }
                         TopoDS_Edge e = make.Edge();
                         if (!forward)
                             e.Reverse();
@@ -1035,6 +1120,14 @@ public:
                         // anticlockwise if the first step heads that way round the centre
                         const bool ccw = (p.x - c->x) * (q.y - c->y) - (p.y - c->y) * (q.x - c->x) > 0;
                         const gp_Circ circ(gp_Ax2(at3(c->x, c->y), sheet.Direction(), sheet.XDirection()), rad);
+                        {
+                            char said[160];
+                            std::snprintf(said, sizeof said, ", radius %.6f, ends off it by %.2g and %.2g mm", rad,
+                                          std::abs(a.Distance(circ.Location()) - rad), std::abs(b.Distance(circ.Location()) - rad));
+                            where += said;
+                        }
+                        for (const TopoDS_Vertex &v : {va, vb})
+                            cover(v, ElCLib::Value(ElCLib::Parameter(circ, BRep_Tool::Pnt(v)), circ));
                         wire.Add(BRepBuilderAPI_MakeEdge(GC_MakeArcOfCircle(circ, a, b, ccw).Value(), va, vb).Edge());
                     }
                 }
@@ -1042,6 +1135,7 @@ public:
                     m_whyNot = "the profile's outline doesn't close";
                     return 0;
                 }
+                where = "loop " + std::to_string(i) + ": its face";
                 TopoDS_Wire w = wire.Wire();
                 if ((i == 0) != (area(loop) > 0))       // outside anticlockwise, holes clockwise
                     w.Reverse();
@@ -1055,9 +1149,10 @@ public:
                 m_whyNot = "the profile couldn't be made into a face";
                 return 0;
             }
+            where = "pushing the face";
             return pushed(face, n, from, to, taper);
         } catch (const Standard_Failure &failure) {
-            engineLog("engine: extrude not made: %s\n", failure.GetMessageString());
+            engineLog("engine: extrude not made: %s (at %s)\n", failure.GetMessageString(), where.c_str());
             m_whyNot = "the profile couldn't be made into a solid";
             return 0;
         }
@@ -1174,11 +1269,10 @@ public:
                 refined = shape;
             if (!mergeable(refined))
                 return 0;                // OpenCascade's merge would crash on it: left as it is
-            ShapeUpgrade_UnifySameDomain unify(refined, true, true, false);
-            unify.SetLinearTolerance(kMergeLinear);
-            unify.SetAngularTolerance(kMergeAngular);
-            unify.Build();
-            const TopoDS_Shape out = unify.Shape();
+            // A hole's two halves are left apart if joined they couldn't be drawn (refine.h).
+            const TopoDS_Shape out = refine::unifyDrawable(refined, kMergeLinear, kMergeAngular);
+            if (out.IsNull())
+                return 0;
             auto count = [](const TopoDS_Shape &s) { int n = 0; for (TopExp_Explorer e(s, TopAbs_FACE); e.More(); e.Next()) ++n; return n; };
             const int before = count(shape), after = count(out);
             if (after >= before)
@@ -1506,7 +1600,7 @@ public:
     // after the whole extrude failed exactly), and only after this exact Boolean has failed too.
     BodyId combine(BodyId a, const std::vector<BodyId> &with, Combine op, double fuzzy) override {
         const BodyId exact = combineAt(a, with, op, kTouching);
-        if (exact || fuzzy <= kTouching)
+        if (exact || fuzzy <= kTouching || omamake::stopAsked())   // stopped (GB-089): no second Boolean
             return exact;
         const std::string exactWhy = m_whyNot;
         engineLog("engine: the exact one couldn't be built (%s); Fuzzy profile is on: trying again with points %.4g mm apart taken as one\n",
@@ -1554,7 +1648,14 @@ public:
             // ending 0.000003 mm short of a face left sliver walls and a line round where it met
             // (owner, 2026-11-03). Far under any tolerance that shows or exports.
             job->SetFuzzyValue(fuzz);
-            job->Build();
+            // GB-089: built with a progress range whose break check stops it (time limit or the memory guard).
+            Handle(BreakCheck) breakCheck = new BreakCheck;
+            job->Build(breakCheck->Start());
+            if (omamake::stopAsked()) {
+                say("stopped (time limit or low memory)");
+                m_whyNot = "it was stopped before it finished";
+                return 0;
+            }
             if (!job->IsDone() || job->HasErrors() || job->Shape().IsNull()) {
                 say("failed");
                 m_whyNot = "the shapes couldn't be worked out where they meet";
@@ -1595,6 +1696,11 @@ public:
             TopoDS_Shape result = job->Shape();
             if (const TopoDS_Shape exact = exactSections(result, first, tools); !exact.IsNull())
                 result = exact;
+            if (omamake::stopAsked()) {     // GB-089: between the Boolean's own steps too
+                say("stopped (time limit or low memory)");
+                m_whyNot = "it was stopped before it finished";
+                return 0;
+            }
             // Faces left lying in one surface become one, as in Fusion: a filled hole otherwise leaves
             // its rim drawn as a circle on the face (owner, 2026-11-03). FreeCAD's way first
             // (refine.h): every group of faces on exactly one plane, cylinder or cone made one face;
@@ -1606,11 +1712,9 @@ public:
                 merged = refined;
             TopoDS_Shape unified = merged;
             if (mergeable(merged, m_chamfering)) {
-                ShapeUpgrade_UnifySameDomain unify(merged, true, true, false);
-                unify.SetLinearTolerance(kMergeLinear);
-                unify.SetAngularTolerance(kMergeAngular);
-                unify.Build();
-                unified = unify.Shape();
+                // A hole's two halves are left apart if joined they couldn't be drawn (refine.h).
+                if (const TopoDS_Shape drawable = refine::unifyDrawable(merged, kMergeLinear, kMergeAngular); !drawable.IsNull())
+                    unified = drawable;
             } else {
                 engineLog("engine: %s: an edge lacks its curve on a face, so faces weren't merged (OpenCascade's merge would crash)\n", names[int(op)]);
             }
@@ -1622,11 +1726,39 @@ public:
             double allowed = std::max(kAccuracy, loosest(first));
             for (TopTools_ListIteratorOfListOfShape it(tools); it.More(); it.Next())
                 allowed = std::max(allowed, loosest(it.Value()));
-            enum class Flaw { None, Unsound, Empty, Loose };
+            enum class Flaw { None, Unsound, Empty, Loose, Gone };
             double worst = 0;
-            // Worst first, as the reason given: loosened (the cause: a sliver face or a crack can come
-            // of it), then a face of no area, then anything else unsound.
+            // Nothing at all left is right only for a cut whose tools cover the whole body: the
+            // empty result otherwise passed every check here (no faces, so nothing unsound), and a
+            // 2 mm cut of a converted hinge said "done" with the body gone (round 5). Asked once, of
+            // the volume the body and the tools share against the body's own.
+            int gone = -1;
+            auto takenAway = [&]() {
+                if (gone < 0) {
+                    gone = 0;
+                    if (op == Combine::Cut) {
+                        BRepAlgoAPI_Common shared;
+                        shared.SetArguments(arguments);
+                        shared.SetTools(tools);
+                        shared.SetRunParallel(true);
+                        shared.SetFuzzyValue(fuzz);
+                        shared.Build();
+                        GProp_GProps body, common;
+                        BRepGProp::VolumeProperties(first, body);
+                        if (shared.IsDone() && !shared.HasErrors()) {
+                            BRepGProp::VolumeProperties(shared.Shape(), common);
+                            gone = std::abs(common.Mass() - body.Mass()) <= 1e-6 * std::max(1.0, std::abs(body.Mass()));
+                        }
+                    }
+                }
+                return gone == 1;
+            };
+            // Worst first, as the reason given: nothing left where something should be, loosened (the
+            // cause: a sliver face or a crack can come of it), then a face of no area, then anything
+            // else unsound.
             auto flaw = [&](const TopoDS_Shape &shape) {
+                if (!TopExp_Explorer(shape, TopAbs_SOLID).More() && !takenAway())
+                    return Flaw::Gone;
                 worst = loosest(shape);
                 if (worst > allowed)
                     return Flaw::Loose;
@@ -1634,6 +1766,11 @@ public:
                     return Flaw::Empty;
                 return soundSolid(shape) ? Flaw::None : Flaw::Unsound;
             };
+            if (omamake::stopAsked()) {     // GB-089
+                say("stopped (time limit or low memory)");
+                m_whyNot = "it was stopped before it finished";
+                return 0;
+            }
             const Flaw mergedFlaw = flaw(unified);
             if (mergedFlaw == Flaw::None) {
                 say("done, faces in one surface merged");
@@ -1647,6 +1784,26 @@ public:
                 say("done, faces not merged (the merge spoiled it)");
                 return keepSound(result);
             }
+            // GB-094: refused only for a face of no area: the cut's sliver faces folded in (foldTinyFaces), then
+            // merged and checked in full again, as above.
+            if ((mergedFlaw == Flaw::Empty || unmerged == Flaw::Empty) && !omamake::stopAsked()) {
+                if (const TopoDS_Shape folded = foldTinyFaces(result, allowed); !folded.IsNull()) {
+                    TopoDS_Shape foldedMerged = folded;
+                    if (const TopoDS_Shape refined = refine::sameSurfaces(folded); !refined.IsNull())
+                        foldedMerged = refined;
+                    if (mergeable(foldedMerged, m_chamfering))
+                        if (const TopoDS_Shape drawable = refine::unifyDrawable(foldedMerged, kMergeLinear, kMergeAngular); !drawable.IsNull())
+                            foldedMerged = drawable;
+                    if (flaw(foldedMerged) == Flaw::None) {
+                        say("done, sliver faces folded in and faces in one surface merged");
+                        return keepSound(foldedMerged);
+                    }
+                    if (flaw(folded) == Flaw::None) {
+                        say("done, sliver faces folded in, faces not merged");
+                        return keepSound(folded);
+                    }
+                }
+            }
             {   // The refused result, described for the log (both forms).
                 std::string merged, unmergedReport;
                 describe(unified, merged);
@@ -1655,13 +1812,16 @@ public:
                 engineLog("engine: the refused result, faces not merged:\n%s", unmergedReport.c_str());
             }
             // The reason given is the telling one of the two.
-            auto rank = [](Flaw f) { return f == Flaw::Loose ? 3 : f == Flaw::Empty ? 2 : 1; };
+            auto rank = [](Flaw f) { return f == Flaw::Gone ? 4 : f == Flaw::Loose ? 3 : f == Flaw::Empty ? 2 : 1; };
             if (rank(mergedFlaw) > rank(unmerged)) {
                 unmerged = mergedFlaw;
                 worst = mergedWorst;
             }
             // Said plainly, as Fusion does.
-            if (unmerged == Flaw::Empty) {
+            if (unmerged == Flaw::Gone) {
+                say("nothing came back, though the tools don't cover the whole body; not used");
+                m_whyNot = "the result came back empty, though the cut doesn't take the whole body away";
+            } else if (unmerged == Flaw::Empty) {
                 say("result has a face of no area (parts of one surface meeting along a line), not used");
                 m_whyNot = "the result would touch itself along a line, leaving a face with no area there";
             } else if (unmerged == Flaw::Loose) {
@@ -1682,6 +1842,425 @@ public:
     }
 
     std::string whyNot() const override { return m_whyNot; }
+
+    // GB-093 (owner, 2026-11-17): see engine.h. A cut whose profile was projected from the bodies it cuts
+    // has walls lying on the bodies' own walls; OpenCascade's Boolean then has to settle faces a hair apart
+    // and can leave a sliver solid and a loosened corner (b205d, 2026-11-17: 0.377 mm). Each such step is
+    // moved off its wall into the empty side, so the tool's wall and the body's never coincide. The bodies are
+    // read from their triangles (every shown body has them): a step is on a wall where triangles on one side
+    // of it have an edge along it (a wall straight along the push, or a slanting face whose edge is the
+    // outline, as at a hole's narrowest ring), and it moves only if no triangle at all lies in the strip it
+    // would cross, over the whole push.
+    static bool triangleInBox(const double centre[3], const double half[3], const double (&corner)[3][3]) {
+        // Akenine-Moeller's separating axis test: the box's 3 axes, the triangle's normal, and the 9 crossings.
+        double v[3][3], e[3][3];
+        for (int i = 0; i < 3; ++i)
+            for (int k = 0; k < 3; ++k)
+                v[i][k] = corner[i][k] - centre[k];
+        for (int i = 0; i < 3; ++i)
+            for (int k = 0; k < 3; ++k)
+                e[i][k] = v[(i + 1) % 3][k] - v[i][k];
+        for (int k = 0; k < 3; ++k) {
+            const double lo = std::min({v[0][k], v[1][k], v[2][k]}), hi = std::max({v[0][k], v[1][k], v[2][k]});
+            if (lo > half[k] || hi < -half[k])
+                return false;
+        }
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) {
+                double axis[3] = {0, 0, 0};   // box axis i crossed with edge j
+                const int a = (i + 1) % 3, b = (i + 2) % 3;
+                axis[a] = -e[j][b];
+                axis[b] = e[j][a];
+                double lo = INFINITY, hi = -INFINITY;
+                for (int t = 0; t < 3; ++t) {
+                    const double d = axis[0] * v[t][0] + axis[1] * v[t][1] + axis[2] * v[t][2];
+                    lo = std::min(lo, d);
+                    hi = std::max(hi, d);
+                }
+                const double r = half[0] * std::abs(axis[0]) + half[1] * std::abs(axis[1]) + half[2] * std::abs(axis[2]);
+                if (lo > r || hi < -r)
+                    return false;
+            }
+        const double n[3] = {e[0][1] * e[1][2] - e[0][2] * e[1][1], e[0][2] * e[1][0] - e[0][0] * e[1][2], e[0][0] * e[1][1] - e[0][1] * e[1][0]};
+        const double d = n[0] * v[0][0] + n[1] * v[0][1] + n[2] * v[0][2];
+        return std::abs(d) <= half[0] * std::abs(n[0]) + half[1] * std::abs(n[1]) + half[2] * std::abs(n[2]);
+    }
+
+    std::string clearWalls(Profile &profile, const Placement &place, double from, double to,
+                           const std::vector<BodyId> &bodies, double gap) override {
+        const auto started = std::chrono::steady_clock::now();
+        constexpr double kOn = 0.001;      // a triangle corner this close to a step's line is on it (mm)
+        constexpr double kAcross = 0.05;   // a triangle facing less across the step than this touches it along no wall
+        constexpr double kCell = 1.0;      // the triangles' grid on the sketch (mm)
+        if (gap <= 0 || bodies.empty() || std::abs(to - from) < 1e-9)
+            return {};
+        try {
+            const gp_Pnt o(place.origin[0], place.origin[1], place.origin[2]);
+            const gp_Vec X = gp_Vec(place.x[0], place.x[1], place.x[2]).Normalized();
+            const gp_Vec Y = gp_Vec(place.y[0], place.y[1], place.y[2]).Normalized();
+            const gp_Vec N = X.Crossed(Y).Normalized();
+            const double hlo = std::min(from, to), hhi = std::max(from, to);
+            // Every triangle of the bodies within the push, in the sketch's terms (u, v along it, h along the
+            // push), with its normal out of the material. A face with no triangles is kept as its box: it stops a
+            // move across it and is on no wall. A curved face's triangles stand off it by up to their deflection.
+            struct Tri {
+                double p[3][3] = {};
+                double a = 0, b = 0;           // the outward normal's (u, v) part
+                double pad = 0;
+                bool flat = true, box = false;
+                double lo[3] = {INFINITY, INFINITY, INFINITY}, hi[3] = {-INFINITY, -INFINITY, -INFINITY};
+            };
+            std::vector<Tri> tris;
+            auto into = [&](const gp_Pnt &q, double (&at)[3]) {
+                const gp_Vec r(o, q);
+                at[0] = r.Dot(X);
+                at[1] = r.Dot(Y);
+                at[2] = r.Dot(N);
+            };
+            auto keep = [&](Tri &t, int corners) {
+                for (int i = 0; i < corners; ++i)
+                    for (int k = 0; k < 3; ++k) {
+                        t.lo[k] = std::min(t.lo[k], t.p[i][k]);
+                        t.hi[k] = std::max(t.hi[k], t.p[i][k]);
+                    }
+                if (t.hi[2] < hlo - kOn - t.pad || t.lo[2] > hhi + kOn + t.pad)
+                    return;                     // wholly above or below the push
+                tris.push_back(t);
+            };
+            int bare = 0;
+            for (const BodyId id : bodies) {
+                const auto found = m_bodies.find(id);
+                if (found == m_bodies.end())
+                    continue;
+                TopTools_IndexedMapOfShape all;
+                TopExp::MapShapes(found->second, TopAbs_FACE, all);
+                for (int f = 1; f <= all.Extent(); ++f) {
+                    const TopoDS_Face face = TopoDS::Face(all(f));
+                    TopLoc_Location loc;
+                    const Handle(Poly_Triangulation) mesh = BRep_Tool::Triangulation(face, loc);
+                    if (mesh.IsNull() || mesh->NbTriangles() == 0) {
+                        Bnd_Box box;
+                        BRepBndLib::Add(face, box, false);
+                        if (box.IsVoid())
+                            continue;
+                        ++bare;
+                        double c[6];
+                        box.Get(c[0], c[1], c[2], c[3], c[4], c[5]);
+                        Tri t;
+                        t.box = true;
+                        t.flat = false;
+                        for (int k = 0; k < 8; ++k) {
+                            double at[3];
+                            into(gp_Pnt(c[(k & 1) ? 3 : 0], c[(k & 2) ? 4 : 1], c[(k & 4) ? 5 : 2]), at);
+                            for (int j = 0; j < 3; ++j) {
+                                t.lo[j] = std::min(t.lo[j], at[j]);
+                                t.hi[j] = std::max(t.hi[j], at[j]);
+                            }
+                        }
+                        if (!(t.hi[2] < hlo - kOn || t.lo[2] > hhi + kOn))
+                            tris.push_back(t);
+                        continue;
+                    }
+                    const bool planar = BRepAdaptor_Surface(face, false).GetType() == GeomAbs_Plane;
+                    const gp_Trsf where = loc.Transformation();
+                    const bool reversed = face.Orientation() == TopAbs_REVERSED;
+                    for (int k = 1; k <= mesh->NbTriangles(); ++k) {
+                        int n1, n2, n3;
+                        mesh->Triangle(k).Get(n1, n2, n3);
+                        if (reversed)
+                            std::swap(n2, n3);
+                        const gp_Pnt P1 = mesh->Node(n1).Transformed(where), P2 = mesh->Node(n2).Transformed(where),
+                                     P3 = mesh->Node(n3).Transformed(where);
+                        Tri t;
+                        t.flat = planar;
+                        t.pad = planar ? 0 : mesh->Deflection();
+                        into(P1, t.p[0]);
+                        into(P2, t.p[1]);
+                        into(P3, t.p[2]);
+                        const gp_Vec n = gp_Vec(P1, P2).Crossed(gp_Vec(P1, P3));
+                        if (n.Magnitude() > 1e-18) {
+                            const gp_Vec u = n.Normalized();
+                            t.a = u.Dot(X);
+                            t.b = u.Dot(Y);
+                        }
+                        keep(t, 3);
+                    }
+                }
+            }
+            if (tris.empty())
+                return {};
+            double gu = INFINITY, gv = INFINITY;
+            for (const Tri &t : tris) {
+                gu = std::min(gu, t.lo[0]);
+                gv = std::min(gv, t.lo[1]);
+            }
+            auto cellKey = [](long long iu, long long iv) { return (iu << 32) ^ (iv & 0xffffffffLL); };
+            std::unordered_map<long long, std::vector<int>> grid;
+            for (int k = 0; k < int(tris.size()); ++k) {
+                const Tri &t = tris[k];
+                const long long u0 = (long long)std::floor((t.lo[0] - t.pad - gu) / kCell), u1 = (long long)std::floor((t.hi[0] + t.pad - gu) / kCell);
+                const long long v0 = (long long)std::floor((t.lo[1] - t.pad - gv) / kCell), v1 = (long long)std::floor((t.hi[1] + t.pad - gv) / kCell);
+                for (long long iu = u0; iu <= u1; ++iu)
+                    for (long long iv = v0; iv <= v1; ++iv)
+                        grid[cellKey(iu, iv)].push_back(k);
+            }
+            std::vector<int> seen(tris.size(), -1);
+            int query = 0;
+            std::vector<int> near;
+            auto gather = [&](double ulo, double uhi, double vlo, double vhi) {
+                near.clear();
+                ++query;
+                for (long long iu = (long long)std::floor((ulo - gu) / kCell); iu <= (long long)std::floor((uhi - gu) / kCell); ++iu)
+                    for (long long iv = (long long)std::floor((vlo - gv) / kCell); iv <= (long long)std::floor((vhi - gv) / kCell); ++iv) {
+                        const auto cell = grid.find(cellKey(iu, iv));
+                        if (cell == grid.end())
+                            continue;
+                        for (const int k : cell->second)
+                            if (seen[k] != query) {
+                                seen[k] = query;
+                                near.push_back(k);
+                            }
+                    }
+            };
+            // Whether the strip a step from p to q would move across, toward `side` of it (+1 its left), holds no
+            // triangle of any body: short of the step's ends, and of the push's own ends, by 0.001 mm.
+            auto stripClear = [&](const Point2 &p, const Point2 &q, double side) {
+                const double len = std::hypot(q.x - p.x, q.y - p.y);
+                const double tx = (q.x - p.x) / len, ty = (q.y - p.y) / len, nx = -ty, ny = tx;
+                const double reach = gap + 2 * kOn;
+                gather(std::min(p.x, q.x) - reach, std::max(p.x, q.x) + reach, std::min(p.y, q.y) - reach, std::max(p.y, q.y) + reach);
+                const double half[3] = {std::max(0.0, len / 2 - kOn), gap / 2, std::max(0.0, (hhi - hlo) / 2 - kOn)};
+                const double centre[3] = {len / 2, kOn + gap / 2, (hlo + hhi) / 2};
+                for (const int n : near) {
+                    const Tri &t = tris[n];
+                    if (t.box) {
+                        // its box against the strip's, in the sketch's terms: conservative
+                        const double su[2] = {std::min(p.x, q.x) + std::min(0.0, side * gap * nx), std::max(p.x, q.x) + std::max(0.0, side * gap * nx)};
+                        const double sv[2] = {std::min(p.y, q.y) + std::min(0.0, side * gap * ny), std::max(p.y, q.y) + std::max(0.0, side * gap * ny)};
+                        if (t.lo[0] < su[1] && t.hi[0] > su[0] && t.lo[1] < sv[1] && t.hi[1] > sv[0] && t.lo[2] < hhi - kOn && t.hi[2] > hlo + kOn) {
+                            return false;
+                        }
+                        continue;
+                    }
+                    double c[3][3];
+                    for (int j = 0; j < 3; ++j) {
+                        const double du = t.p[j][0] - p.x, dv = t.p[j][1] - p.y;
+                        c[j][0] = du * tx + dv * ty;
+                        c[j][1] = side * (du * nx + dv * ny);
+                        c[j][2] = t.p[j][2];
+                    }
+                    const double grown[3] = {half[0] + t.pad, half[1] + t.pad, half[2] + t.pad};
+                    if (triangleInBox(centre, grown, c)) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            int steps = 0, onWall = 0, moved = 0, blocked = 0, twoWay = 0, curved = 0, reverted = 0, followed = 0;
+            std::string perLoop;        // "loop:moved/on a wall" for each loop with a step on a wall
+            for (std::size_t i = 0; i < profile.loops.size(); ++i) {
+                std::vector<Point2> &loop = profile.loops[i];
+                const std::size_t count = loop.size();
+                if (count < 3)
+                    continue;
+                const bool arcs = i < profile.centres.size() && profile.centres[i].size() == count;
+                const bool tagged = i < profile.onCurve.size() && profile.onCurve[i].size() == count && i < profile.along.size()
+                                    && profile.along[i].size() == count;
+                std::vector<char> fixed(count, 0);
+                const int movedBefore = moved, onWallBefore = onWall;
+                std::vector<Point2> shift(count, Point2{0, 0});
+                bool any = false;
+                for (std::size_t k = 0; k < count; ++k) {
+                    if ((arcs && !std::isnan(profile.centres[i][k].x)) || (tagged && profile.onCurve[i][k] >= 0)) {
+                        fixed[k] = 1;           // an arc or a curve: built exactly from its ends, left as it is
+                        ++curved;
+                        continue;
+                    }
+                    const Point2 p = loop[k], q = loop[(k + 1) % count];
+                    const double len = std::hypot(q.x - p.x, q.y - p.y);
+                    if (len < 1e-12)
+                        continue;
+                    ++steps;
+                    const double tx = (q.x - p.x) / len, ty = (q.y - p.y) / len, nx = -ty, ny = tx;
+                    const double reach = gap + 2 * kOn;
+                    gather(std::min(p.x, q.x) - reach, std::max(p.x, q.x) + reach, std::min(p.y, q.y) - reach, std::max(p.y, q.y) + reach);
+                    // How much of the step has triangles along it facing left (material on its right: cover[0])
+                    // or right (cover[1]).
+                    double cover[2] = {0, 0};
+                    for (const int n : near) {
+                        const Tri &t = tris[n];
+                        if (t.box || !t.flat)
+                            continue;
+                        const double across = t.a * nx + t.b * ny;
+                        if (std::abs(across) < kAcross)
+                            continue;
+                        const double sign = across > 0 ? 1.0 : -1.0;
+                        int on = 0;
+                        double smin = INFINITY, smax = -INFINITY, hmin = INFINITY, hmax = -INFINITY;
+                        bool behind = true;     // the whole triangle on its material's side of the line
+                        for (int c = 0; c < 3; ++c) {
+                            const double du = t.p[c][0] - p.x, dv = t.p[c][1] - p.y;
+                            const double off = du * nx + dv * ny;
+                            behind = behind && off * sign <= kOn;
+                            if (std::abs(off) < kOn) {
+                                ++on;
+                                const double sAt = du * tx + dv * ty;
+                                smin = std::min(smin, sAt);
+                                smax = std::max(smax, sAt);
+                                hmin = std::min(hmin, t.p[c][2]);
+                                hmax = std::max(hmax, t.p[c][2]);
+                            }
+                        }
+                        if (on < 2 || !behind || hmax < hlo - kOn || hmin > hhi + kOn)
+                            continue;
+                        if (on == 3 && std::min(hmax, hhi) - std::max(hmin, hlo) < 1e-6)
+                            continue;           // a wall only at the push's end
+                        const double overlap = std::min(len, smax) - std::max(0.0, smin);
+                        if (overlap > 0)
+                            cover[sign > 0 ? 1 : 0] += overlap;
+                    }
+                    const double need = std::min(0.5 * len, 0.02);
+                    if (cover[0] < need && cover[1] < need)
+                        continue;
+                    ++onWall;
+                    if (cover[0] >= need && cover[1] >= need) {
+                        ++twoWay;               // walls facing both ways: two bodies meet along it
+                        continue;
+                    }
+                    const double side = cover[1] >= need ? 1.0 : -1.0;   // toward the empty side
+                    const bool clear = stripClear(p, q, side);
+                    if (!clear) {
+                        ++blocked;
+                        continue;
+                    }
+                    shift[k] = {side * gap * nx, side * gap * ny};
+                    any = true;
+                    ++moved;
+                }
+                // A step under 0.005 mm (half the clearance) long, as a corner's two ends projected a hair apart give
+                // where a wall leans a few ten-thousandths of a mm, has too little length to show a wall. Next to a
+                // moved step it moves the same way, if its own strip is empty too; else the tool would come back onto
+                // the body's corner there (A, 2026-11-17: 12 sliver solids of 0 mm3 beside the cut body).
+                for (int pass = 0; pass < 2; ++pass)
+                    for (std::size_t n = 0; n < count; ++n) {
+                        const std::size_t k = pass == 0 ? n : count - 1 - n;
+                        if (fixed[k] || shift[k].x != 0 || shift[k].y != 0)
+                            continue;
+                        const Point2 p = loop[k], q = loop[(k + 1) % count];
+                        const double len = std::hypot(q.x - p.x, q.y - p.y);
+                        if (len < 1e-12 || len >= gap / 2)
+                            continue;
+                        const std::size_t beside = pass == 0 ? (k + count - 1) % count : (k + 1) % count;
+                        if (fixed[beside] || (shift[beside].x == 0 && shift[beside].y == 0))
+                            continue;
+                        const double nx = -(q.y - p.y) / len, ny = (q.x - p.x) / len;
+                        const double along = shift[beside].x * nx + shift[beside].y * ny;
+                        if (std::abs(along) < 1e-12)
+                            continue;
+                        const double side = along > 0 ? 1.0 : -1.0;
+                        if (!stripClear(p, q, side))
+                            continue;
+                        shift[k] = {side * gap * nx, side * gap * ny};
+                        ++followed;
+                        any = true;
+                    }
+                if (onWall > onWallBefore)
+                    perLoop += (perLoop.empty() ? "" : " ") + std::to_string(i) + ":" + std::to_string(moved - movedBefore) + "/"
+                               + std::to_string(onWall - onWallBefore);
+                if (!any)
+                    continue;
+                // The loop again: each corner where the steps either side meet once moved; where they can't meet
+                // near it (parallel, a long spike, or an arc's end that must stay), a short step joins them.
+                std::vector<Point2> pts, centres;
+                std::vector<int> onCurve;
+                std::vector<std::pair<double, double>> along;
+                const Point2 straightCentre{std::nan(""), std::nan("")};
+                auto emit = [&](const Point2 &at, bool own, std::size_t k) {
+                    if (!pts.empty() && std::abs(pts.back().x - at.x) < 1e-12 && std::abs(pts.back().y - at.y) < 1e-12) {
+                        if (own) {              // the same point: it takes the step's own kind
+                            if (arcs) centres.back() = profile.centres[i][k];
+                            if (tagged) { onCurve.back() = profile.onCurve[i][k]; along.back() = profile.along[i][k]; }
+                        }
+                        return;
+                    }
+                    pts.push_back(at);
+                    if (arcs) centres.push_back(own ? profile.centres[i][k] : straightCentre);
+                    if (tagged) {
+                        onCurve.push_back(own ? profile.onCurve[i][k] : -1);
+                        along.push_back(own ? profile.along[i][k] : std::make_pair(0.0, 0.0));
+                    }
+                };
+                for (std::size_t j = 0; j < count; ++j) {
+                    const std::size_t before = (j + count - 1) % count, next = (j + 1) % count;
+                    const Point2 P = loop[j], wp = shift[before], wn = shift[j];
+                    const bool still = wp.x == 0 && wp.y == 0 && wn.x == 0 && wn.y == 0;
+                    if (still) {
+                        emit(P, true, j);
+                        continue;
+                    }
+                    if (!fixed[before] && !fixed[j]) {
+                        const double ax = P.x - loop[before].x, ay = P.y - loop[before].y;
+                        const double bx = loop[next].x - P.x, by = loop[next].y - P.y;
+                        const double cross = ax * by - ay * bx, la = std::hypot(ax, ay), lb = std::hypot(bx, by);
+                        if (std::abs(cross) > 1e-9 * la * lb) {
+                            // (P + wp) + t a = (P + wn) + s b
+                            const double rx = wn.x - wp.x, ry = wn.y - wp.y;
+                            const double t = (rx * by - ry * bx) / cross;
+                            const Point2 meet{P.x + wp.x + t * ax, P.y + wp.y + t * ay};
+                            if (std::hypot(meet.x - P.x, meet.y - P.y) <= 5 * gap) {
+                                emit(meet, true, j);
+                                continue;
+                            }
+                        } else if (std::abs(wp.x - wn.x) < 1e-12 && std::abs(wp.y - wn.y) < 1e-12) {
+                            emit({P.x + wp.x, P.y + wp.y}, true, j);
+                            continue;
+                        }
+                    }
+                    emit({P.x + wp.x, P.y + wp.y}, false, j);
+                    emit({P.x + wn.x, P.y + wn.y}, true, j);
+                }
+                if (pts.size() > 1 && std::abs(pts.front().x - pts.back().x) < 1e-12 && std::abs(pts.front().y - pts.back().y) < 1e-12) {
+                    pts.pop_back();
+                    if (arcs) centres.pop_back();
+                    if (tagged) { onCurve.pop_back(); along.pop_back(); }
+                }
+                // Kept only if the loop still runs the same way round and its area changed by no more than the
+                // strips themselves could (a loop that crossed itself would show here); else left exact.
+                auto area = [](const std::vector<Point2> &l) {
+                    double a = 0;
+                    for (std::size_t k = 0; k < l.size(); ++k)
+                        a += l[k].x * l[(k + 1) % l.size()].y - l[(k + 1) % l.size()].x * l[k].y;
+                    return a / 2;
+                };
+                double perimeter = 0;
+                for (std::size_t k = 0; k < count; ++k)
+                    perimeter += std::hypot(loop[(k + 1) % count].x - loop[k].x, loop[(k + 1) % count].y - loop[k].y);
+                const double was = area(loop), now = area(pts);
+                if (pts.size() < 3 || (was > 0) != (now > 0) || std::abs(now - was) > 1.5 * gap * perimeter + 1e-9) {
+                    ++reverted;
+                    continue;
+                }
+                loop = std::move(pts);
+                if (arcs) profile.centres[i] = std::move(centres);
+                if (tagged) { profile.onCurve[i] = std::move(onCurve); profile.along[i] = std::move(along); }
+            }
+            const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            if (!onWall)
+                return {};
+            char line[700];
+            std::snprintf(line, sizeof line,
+                          "%d of %d straight step(s) on a wall of the %zu body(ies) cut (%zu triangles, %d bare face(s)); %d moved %.3g mm "
+                          "into empty space, %d kept (something within reach beyond it), %d kept (walls facing both ways), %d short step(s) "
+                          "(under 0.005 mm) moved with the step beside them, %d loop(s) left exact (would cross itself); %d arc/curve "
+                          "step(s) not looked at; by loop (0 outer) moved/on a wall: %.200s; %.2f s",
+                          onWall, steps, bodies.size(), tris.size(), bare, moved, gap, blocked, twoWay, followed, reverted, curved,
+                          perLoop.c_str(), took);
+            engineLog("engine: wall clearance: %s\n", line);
+            return line;
+        } catch (const Standard_Failure &) {
+            return {};
+        }
+    }
 
     bool inspect(BodyId body, std::string &report) const override {
         const auto found = m_bodies.find(body);
@@ -2196,13 +2775,18 @@ public:
             const TopoDS_Shape refined = refine::sameSurfaces(shape);
             if (!mergeable(refined.IsNull() ? shape : refined))
                 return keep(refined.IsNull() ? shape : refined);     // OpenCascade's merge would crash on it
-            ShapeUpgrade_UnifySameDomain unify(refined.IsNull() ? shape : refined, true, true, false);
-            unify.Build();
-            return keep(unify.Shape());
+            const TopoDS_Shape unified = refine::unifyDrawable(refined.IsNull() ? shape : refined, Precision::Confusion(), Precision::Angular());
+            return keep(unified.IsNull() ? (refined.IsNull() ? shape : refined) : unified);
         } catch (const Standard_Failure &failure) {
             why = failure.GetMessageString();
             return 0;
         }
+    }
+
+    static meshsolid::Style styleOf(MeshStyle style) {
+        return style == MeshStyle::LowPoly ? meshsolid::Style::LowPoly
+               : style == MeshStyle::LowRes ? meshsolid::Style::LowRes
+                                            : meshsolid::Style::Detailed;
     }
 
     BodyId importMesh(const std::string &path, std::string &why, const std::function<void(const char *)> &stage) override {
@@ -2217,7 +2801,7 @@ public:
                 return 0;
             }
             const BodyId id = keep(shape);
-            m_imported.emplace(id, triangles);
+            m_imported.emplace(id, std::make_shared<const meshsolid::Mesh>(triangles));
             return id;
         } catch (const Standard_Failure &failure) {
             why = failure.GetMessageString();
@@ -2225,24 +2809,30 @@ public:
         }
     }
 
-    BodyId fitSurfaces(BodyId body, double share, FitResult &result, std::string &why, const std::function<void(const char *)> &stage) override {
+    BodyId fitSurfaces(BodyId body, double share, MeshStyle style, FitResult &result, std::string &why, const std::function<void(const char *)> &stage) override {
         try {
             stage("Reading the facets");
             // The file's own triangles if this body is as it came in: the solid's flats have been
             // joined, and meshing them again loses the corners that show where curves are.
             const auto imported = m_imported.find(body);
-            const meshsolid::Mesh triangles = imported != m_imported.end() ? imported->second : meshsolid::fromShape(m_bodies.at(body));
+            const meshsolid::Mesh triangles = imported != m_imported.end() ? *imported->second : meshsolid::fromShape(m_bodies.at(body));
+            if (style == MeshStyle::LowPoly) {
+                const TopoDS_Shape joined = meshsolid::solid(triangles, stage, meshsolid::Style::LowPoly);
+                if (joined.IsNull())
+                    why = "Its facets couldn't be joined into a valid solid; nothing was changed.";
+                return joined.IsNull() ? 0 : keep(joined);
+            }
             meshsolid::FitReport report;
-            const TopoDS_Shape shape = meshsolid::fit(triangles, share, stage, report);
+            const TopoDS_Shape shape = meshsolid::fit(triangles, share, stage, report, styleOf(style));
             if (shape.IsNull()) {
                 why = "The curved surfaces couldn't be joined into a valid solid; nothing was changed.";
                 return 0;
             }
-            if (!report.cylinders && !report.cones && !report.spheres) {
-                why = "No facets here follow a cylinder, cone or sphere closely enough.";
+            if (!report.cylinders && !report.cones && !report.spheres && !report.bowls) {
+                why = "No facets here follow a cylinder, cone, sphere or smooth cap closely enough.";
                 return 0;
             }
-            result = {report.cylinders, report.cones, report.spheres, report.facetsLeft, report.worstMm};
+            result = {report.cylinders, report.cones, report.spheres, report.bowls, report.facetsLeft, report.worstMm};
             return keep(shape);
         } catch (const Standard_Failure &failure) {
             why = failure.GetMessageString();
@@ -2276,7 +2866,28 @@ public:
     std::string saveBody(BodyId body) const override {
         std::ostringstream out(std::ios::binary);
         BinTools::Write(m_bodies.at(body), out, false, false, BinTools_FormatVersion_CURRENT);
-        return out.str();
+        std::string bytes = out.str();
+        if (const auto imported = m_imported.find(body); imported != m_imported.end())
+            Sources::tie(bytes, imported->second);
+        return bytes;
+    }
+
+    std::function<std::string()> saveBodyLater(BodyId body) const override {
+        const auto found = m_bodies.find(body);
+        if (found == m_bodies.end())
+            return {};
+        const TopoDS_Shape shape = found->second;
+        std::shared_ptr<const meshsolid::Mesh> imported;
+        if (const auto it = m_imported.find(body); it != m_imported.end())
+            imported = it->second;
+        return [shape, imported] {
+            std::ostringstream out(std::ios::binary);
+            BinTools::Write(shape, out, false, false, BinTools_FormatVersion_CURRENT);
+            std::string bytes = out.str();
+            if (imported)
+                Sources::tie(bytes, imported);
+            return bytes;
+        };
     }
 
     BodyId loadBody(const std::string &bytes) override {
@@ -2284,10 +2895,33 @@ public:
             std::istringstream in(bytes, std::ios::binary);
             TopoDS_Shape shape;
             BinTools::Read(shape, in);
-            return shape.IsNull() ? 0 : keep(shape);
+            if (shape.IsNull())
+                return 0;
+            const BodyId id = keep(shape);
+            if (auto source = Sources::of(bytes))
+                m_imported.emplace(id, std::move(source));
+            return id;
         } catch (const Standard_Failure &) {
             return 0;
         }
+    }
+
+    std::string sourceOf(const std::string &bodyBytes) const override {
+        const auto source = Sources::of(bodyBytes);
+        return source ? Sources::name(*source) : std::string();
+    }
+
+    std::string sourceBytes(const std::string &source) const override {
+        const auto mesh = Sources::named(source);
+        return mesh ? Sources::write(*mesh) : std::string();
+    }
+
+    void addSource(const std::string &bodyBytes, const std::string &source, const std::string &meshBytes) override {
+        auto mesh = Sources::named(source);
+        if (!mesh)
+            mesh = Sources::read(meshBytes);
+        if (mesh)
+            Sources::tie(bodyBytes, mesh);
     }
 
     Mesh mesh(BodyId body) const override;
@@ -2343,7 +2977,108 @@ private:
     bool m_chamfering = false;   // combineAt is cutting for a chamfer (see mergeable)
     bool m_sweepEdges = false;   // GB-055: the set's edges all run through (see chamfer)
     std::string m_whyNot; // why the last extrude or combine that gave 0 couldn't be done, for the person
-    std::unordered_map<BodyId, meshsolid::Mesh> m_imported;    // the triangles an imported mesh came in as
+    std::unordered_map<BodyId, std::shared_ptr<const meshsolid::Mesh>> m_imported;    // the triangles an imported mesh came in as
+
+    // Saved bytes -> the mesh their body came in as, for every engine in the program (the history's
+    // background rebuild has one of its own). One copy of each mesh, however many saved bytes
+    // stand for its body; a key is the bytes' length and hash, a name the mesh's own.
+    struct Sources {
+        static std::mutex &lock() { static std::mutex m; return m; }
+        static std::unordered_map<std::string, std::shared_ptr<const meshsolid::Mesh>> &byBytes() {
+            static std::unordered_map<std::string, std::shared_ptr<const meshsolid::Mesh>> m;
+            return m;
+        }
+        static std::unordered_map<std::string, std::weak_ptr<const meshsolid::Mesh>> &byName() {
+            static std::unordered_map<std::string, std::weak_ptr<const meshsolid::Mesh>> m;
+            return m;
+        }
+        static std::string key(const std::string &bytes) {
+            return std::to_string(bytes.size()) + ":" + std::to_string(std::hash<std::string>()(bytes));
+        }
+        static std::string name(const meshsolid::Mesh &mesh) {
+            const std::string_view points(reinterpret_cast<const char *>(mesh.points.data()), mesh.points.size() * sizeof mesh.points[0]);
+            const std::string_view triangles(reinterpret_cast<const char *>(mesh.triangles.data()), mesh.triangles.size() * sizeof mesh.triangles[0]);
+            return std::to_string(mesh.points.size()) + "-" + std::to_string(mesh.triangles.size()) + "-"
+                   + std::to_string(std::hash<std::string_view>()(points) ^ (std::hash<std::string_view>()(triangles) * 31));
+        }
+        static void tie(const std::string &bytes, const std::shared_ptr<const meshsolid::Mesh> &mesh) {
+            const std::lock_guard<std::mutex> hold(lock());
+            byBytes()[key(bytes)] = mesh;
+            byName()[name(*mesh)] = mesh;
+        }
+        static std::shared_ptr<const meshsolid::Mesh> of(const std::string &bytes) {
+            const std::lock_guard<std::mutex> hold(lock());
+            const auto found = byBytes().find(key(bytes));
+            return found == byBytes().end() ? nullptr : found->second;
+        }
+        static std::shared_ptr<const meshsolid::Mesh> named(const std::string &source) {
+            const std::lock_guard<std::mutex> hold(lock());
+            const auto found = byName().find(source);
+            return found == byName().end() ? nullptr : found->second.lock();
+        }
+        // "OMAMESH1", the counts, then points (float if every one is exactly a float, as an STL's
+        // are, else double) and triangles.
+        static std::string write(const meshsolid::Mesh &mesh) {
+            bool floats = true;
+            for (const auto &p : mesh.points)
+                for (const double c : p)
+                    floats = floats && double(float(c)) == c;
+            std::string out = "OMAMESH1";
+            const auto put = [&](const void *data, std::size_t size) { out.append(static_cast<const char *>(data), size); };
+            const std::uint64_t counts[3] = {mesh.points.size(), mesh.triangles.size(), floats ? 4u : 8u};
+            put(counts, sizeof counts);
+            for (const auto &p : mesh.points)
+                for (const double c : p) {
+                    if (floats) {
+                        const float f = float(c);
+                        put(&f, sizeof f);
+                    } else {
+                        put(&c, sizeof c);
+                    }
+                }
+            for (const auto &t : mesh.triangles)
+                for (const int i : t) {
+                    const std::int32_t v = i;
+                    put(&v, sizeof v);
+                }
+            return out;
+        }
+        static std::shared_ptr<const meshsolid::Mesh> read(const std::string &bytes) {
+            std::uint64_t counts[3];
+            if (bytes.size() < 8 + sizeof counts || bytes.compare(0, 8, "OMAMESH1") != 0)
+                return nullptr;
+            std::memcpy(counts, bytes.data() + 8, sizeof counts);
+            const std::uint64_t width = counts[2];
+            if ((width != 4 && width != 8) || counts[0] > bytes.size() || counts[1] > bytes.size()
+                || bytes.size() != 8 + sizeof counts + counts[0] * 3 * width + counts[1] * 3 * 4)
+                return nullptr;
+            auto mesh = std::make_shared<meshsolid::Mesh>();
+            mesh->points.resize(counts[0]);
+            mesh->triangles.resize(counts[1]);
+            const char *at = bytes.data() + 8 + sizeof counts;
+            for (auto &p : mesh->points)
+                for (double &c : p) {
+                    if (width == 4) {
+                        float f;
+                        std::memcpy(&f, at, 4);
+                        c = f;
+                    } else {
+                        std::memcpy(&c, at, 8);
+                    }
+                    at += width;
+                }
+            for (auto &t : mesh->triangles)
+                for (int &i : t) {
+                    std::int32_t v;
+                    std::memcpy(&v, at, 4);
+                    at += 4;
+                    if (v < 0 || std::uint64_t(v) >= counts[0])
+                        return nullptr;
+                    i = v;
+                }
+            return mesh;
+        }
+    };
     BodyId m_lastId = 0;
 };
 
@@ -2369,7 +3104,16 @@ Mesh HeavyEngine::mesh(BodyId body) const {
     // A wall pushed straight from a curve (every spline or ellipse side of an extrude) is one of them:
     // it is straight from end to end, so triangles between its edges' points are already as close to it
     // as those points are to the curve. Checking inside it as well filled a 40 ft spline gear's 44
-    // walls with half a million triangles and took 7 s (0.05 s and 2,480 triangles without).
+    // walls with half a million triangles and took 7 s (0.05 s and 2,480 triangles without). So such a
+    // wall is meshed from its edges' points alone, as OpenCascade meshes a plane: even unchecked, its
+    // own mesher first estimated the surface at every knot of the curve, 9.5 s for one wall of a
+    // 4,096-pole projected curve (2026-11-12; 0.00 s this way, every triangle within 0.002 mm of it).
+    struct Walls : IMeshTools_MeshAlgoFactory {
+        Handle(IMeshTools_MeshAlgoFactory) usual = new BRepMesh_MeshAlgoFactory;
+        Handle(IMeshTools_MeshAlgo) GetAlgo(const GeomAbs_SurfaceType type, const IMeshTools_Parameters &p) const override {
+            return type == GeomAbs_SurfaceOfExtrusion ? Handle(IMeshTools_MeshAlgo)(new BRepMesh_DelaunayBaseMeshAlgo) : usual->GetAlgo(type, p);
+        }
+    };
     mesher.MeshAlgo = IMeshTools_MeshAlgoType_Watson;
     for (TopExp_Explorer e(shape, TopAbs_FACE); e.More(); e.Next()) {
         const TopoDS_Face &face = TopoDS::Face(e.Current());
@@ -2378,7 +3122,12 @@ Mesh HeavyEngine::mesh(BodyId body) const {
             continue;
         IMeshTools_Parameters own = mesher;
         own.ControlSurfaceDeflection = BRepAdaptor_Surface(face).GetType() != GeomAbs_SurfaceOfExtrusion;
-        BRepMesh_IncrementalMesh(face, own);
+        Handle(BRepMesh_Context) context = new BRepMesh_Context(own.MeshAlgo);
+        context->SetFaceDiscret(new BRepMesh_FaceDiscret(new Walls));
+        BRepMesh_IncrementalMesh one;
+        one.SetShape(face);
+        one.ChangeParameters() = own;
+        one.Perform(context);
     }
 
     for (int k = 0; k < 3; ++k) {

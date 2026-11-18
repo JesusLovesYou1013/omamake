@@ -96,6 +96,20 @@ struct Points {
 
 } // namespace
 
+// A union-find set's root, every step on the way pointed straight at it. Walked, not recursed: a chain
+// as long as a fine curve has samples ran past the stack (a crash projecting a dense face, 2026-11-12).
+static int rootOf(std::vector<int> &parent, int v) {
+    int r = v;
+    while (parent[r] != r)
+        r = parent[r];
+    while (parent[v] != r) {
+        const int next = parent[v];
+        parent[v] = r;
+        v = next;
+    }
+    return r;
+}
+
 Result find(const std::vector<Path> &paths, double gapMax, double touching, const std::vector<int> &groups) {
     Result result;
 
@@ -105,9 +119,16 @@ Result find(const std::vector<Path> &paths, double gapMax, double touching, cons
     std::vector<bool> closed(paths.size());     // the path comes back to its start
     for (std::size_t k = 0; k < paths.size(); ++k) {
         const Path &path = paths[k];
-        for (std::size_t i = 0; i + 1 < path.size(); ++i)
-            if (gap(path[i], path[i + 1]) > touching)
-                segs.push_back({path[i], path[i + 1], int(k), pieces[k]++, 0, {0, 1}, {}});
+        // Steps shorter than `touching` fold into the next piece, not dropped one by one: a curve
+        // sampled finer than that (a long spline on a tiny edge) would otherwise vanish whole.
+        std::size_t from = 0;
+        for (std::size_t i = 1; i < path.size(); ++i)
+            if (gap(path[from], path[i]) > touching) {
+                segs.push_back({path[from], path[i], int(k), pieces[k]++, 0, {0, 1}, {}});
+                from = i;
+            }
+        if (pieces[k] > 0 && from + 1 < path.size())
+            segs.back().b = path.back();               // the last short stretch joins the last piece
         closed[k] = path.size() > 2 && gap(path.front(), path.back()) <= touching;
     }
     // A curve followed as straight pieces stands up to L·θ/8 off the true curve (θ: how far it
@@ -163,6 +184,7 @@ Result find(const std::vector<Path> &paths, double gapMax, double touching, cons
     // 2. The pieces as a graph: points (joined when touching) and the edges between them.
     Points pts{touching, {}, {}};
     std::vector<std::set<int>> next;
+    std::map<std::pair<int, int>, double> slackOf;   // each edge: how far its curve can bow off it
     for (Segment &s : segs) {
         std::sort(s.cuts.begin(), s.cuts.end());
         int prev = -1;
@@ -174,6 +196,8 @@ Result find(const std::vector<Path> &paths, double gapMax, double touching, cons
             if (prev >= 0 && prev != id) {
                 next[prev].insert(id);
                 next[id].insert(prev);
+                double &k = slackOf[{std::min(prev, id), std::max(prev, id)}];
+                k = std::max(k, s.slack);
             }
             prev = id;
         }
@@ -286,7 +310,7 @@ Result find(const std::vector<Path> &paths, double gapMax, double touching, cons
         auto beside = [&](int a, int b) { return a == b || ownNeighbour(segs[a], segs[b]); };
         std::vector<int> run(found.size());
         std::iota(run.begin(), run.end(), 0);
-        std::function<int(int)> head = [&](int i) { return run[i] == i ? i : run[i] = head(run[i]); };
+        auto head = [&](int i) { return rootOf(run, i); };
         std::map<std::pair<int, int>, std::vector<int>> byPaths;   // only the same two paths can be a run
         for (std::size_t i = 0; i < found.size(); ++i) {
             const int a = segs[found[i].s].path, b = segs[found[i].q].path;
@@ -398,7 +422,7 @@ Result find(const std::vector<Path> &paths, double gapMax, double touching, cons
     }
     std::vector<int> group(n);
     std::iota(group.begin(), group.end(), 0);
-    std::function<int(int)> root = [&](int v) { return group[v] == v ? v : group[v] = root(group[v]); };
+    auto root = [&](int v) { return rootOf(group, v); };
     for (int v = 0; v < n; ++v)
         for (int w : round[v])
             group[root(v)] = root(w);
@@ -415,10 +439,14 @@ Result find(const std::vector<Path> &paths, double gapMax, double touching, cons
             if (walked.count({v, w}))
                 continue;
             Path loop;
+            double around = 0, bow = 0;     // its way round, and that times how far its pieces can bow
             int a = v, b = w;
             for (int guard = 0; guard < 4 * n + 8; ++guard) {
                 walked.insert({a, b});
                 loop.push_back(pts.at[a]);
+                const double step = gap(pts.at[a], pts.at[b]);
+                around += step;
+                bow += step * slackOf[{std::min(a, b), std::max(a, b)}];
                 const auto &at = round[b];
                 const int i = int(std::find(at.begin(), at.end(), a) - at.begin());
                 const int c = at[(i + int(at.size()) - 1) % int(at.size())];
@@ -427,10 +455,16 @@ Result find(const std::vector<Path> &paths, double gapMax, double touching, cons
                 if (a == v && b == w)
                     break;
             }
+            // An area whose sides lie on average closer than `touching` plus how far its pieces can
+            // bow off their true curves (area under that × half its way round) can't be told from
+            // none, by the same allowances that join points and curves above: a face seen nearly
+            // edge on, whose sampled sides zig-zag across each other into slivers no solid can be
+            // made on.
             const double area = signedArea(loop);
-            if (area > touching * touching)
+            const double least = std::max(touching * touching, (touching + (around > 0 ? bow / around : 0)) * around / 2);
+            if (area > least)
                 areas.push_back({loop, area, root(v)});
-            else if (area < -touching * touching)
+            else if (area < -least)
                 outsides.push_back({loop, area, root(v)});
         }
 
@@ -462,26 +496,72 @@ bool contains(const Profile &profile, P p) {
 
 // Manifold's triangulator (the Lite engine's library): outline anticlockwise, holes clockwise,
 // as find() gives them.
-std::vector<int> triangles(const Profile &profile) {
-    manifold::PolygonsIdx polys;
-    int next = 0;
-    auto add = [&](const Path &loop) {
-        manifold::SimplePolygonIdx poly;
-        for (const P &p : loop)
-            poly.push_back({manifold::vec2(p.u, p.v), next++});
-        polys.push_back(std::move(poly));
-    };
-    add(profile.outer);
-    for (const Path &h : profile.holes)
-        add(h);
-    std::vector<int> out;
-    try {
-        for (const manifold::ivec3 &t : manifold::TriangulateIdx(polys))
-            out.insert(out.end(), {t.x, t.y, t.z});
-    } catch (...) {
-        out.clear();
+// The points of a loop that keep it within `tol` of itself (Douglas-Peucker; first and last always kept).
+static std::vector<std::size_t> keptPoints(const Path &loop, double tol) {
+    const std::size_t n = loop.size();
+    if (n < 4)
+        return [&] { std::vector<std::size_t> all(n); for (std::size_t i = 0; i < n; ++i) all[i] = i; return all; }();
+    std::vector<char> keep(n, 0);
+    keep[0] = keep[n - 1] = 1;
+    std::vector<std::pair<std::size_t, std::size_t>> todo{{0, n - 1}};
+    while (!todo.empty()) {
+        const auto [a, b] = todo.back();
+        todo.pop_back();
+        const double dx = loop[b].u - loop[a].u, dy = loop[b].v - loop[a].v, len = std::hypot(dx, dy);
+        double worst = -1;
+        std::size_t at = a;
+        for (std::size_t i = a + 1; i < b; ++i) {
+            const double d = len > 0 ? std::abs((loop[i].u - loop[a].u) * dy - (loop[i].v - loop[a].v) * dx) / len
+                                     : std::hypot(loop[i].u - loop[a].u, loop[i].v - loop[a].v);
+            if (d > worst) { worst = d; at = i; }
+        }
+        if (worst > tol) {
+            keep[at] = 1;
+            todo.push_back({a, at});
+            todo.push_back({at, b});
+        }
     }
+    std::vector<std::size_t> out;
+    for (std::size_t i = 0; i < n; ++i)
+        if (keep[i])
+            out.push_back(i);
     return out;
+}
+
+std::vector<int> triangles(const Profile &profile) {
+    // The shading only: each loop first taken down to the points that keep it within 1e-5 mm of itself
+    // (a spline is drawn at 24 points a pole, and a projected face's outline can be 450 000 points: 8 s to
+    // triangulate, for no difference anyone can see). Numbered as before, so the triangles index the whole
+    // outline; if the triangulator can't take the thinned loops, the whole ones.
+    for (const double tol : {1e-5, 0.0}) {
+        manifold::PolygonsIdx polys;
+        int next = 0;
+        auto add = [&](const Path &loop) {
+            manifold::SimplePolygonIdx poly;
+            if (tol > 0) {
+                for (const std::size_t i : keptPoints(loop, tol))
+                    poly.push_back({manifold::vec2(loop[i].u, loop[i].v), next + int(i)});
+            } else {
+                for (std::size_t i = 0; i < loop.size(); ++i)
+                    poly.push_back({manifold::vec2(loop[i].u, loop[i].v), next + int(i)});
+            }
+            next += int(loop.size());
+            polys.push_back(std::move(poly));
+        };
+        add(profile.outer);
+        for (const Path &h : profile.holes)
+            add(h);
+        std::vector<int> out;
+        try {
+            for (const manifold::ivec3 &t : manifold::TriangulateIdx(polys))
+                out.insert(out.end(), {t.x, t.y, t.z});
+        } catch (...) {
+            out.clear();
+        }
+        if (!out.empty())
+            return out;
+    }
+    return {};
 }
 
 } // namespace profiles

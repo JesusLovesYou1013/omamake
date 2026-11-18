@@ -4,8 +4,8 @@ import "Units.js" as Units
 // A tool's options (owner, 2026-10-30: Fillet's radius, a polygon's sides, Offset's distance…),
 // in a row under the sketch bar while the tool is on, in the dimension box's look. Each value
 // works as soon as it's typed (the preview follows); a value that doesn't read turns its box red
-// and the last good one stays. Enter carries on (Offset, a pattern: makes it); Esc stops the
-// tool; Ctrl+Z leaves the box and takes back the last step (Ctrl+Y puts it back). The first box opens selected, so
+// and the last good one stays. Enter carries on (Offset, a pattern: makes it); Esc leaves the box
+// (as typed), Esc twice quickly stops the tool (Main.escPressed, GB-081); Ctrl+Z leaves the box and takes back the last step (Ctrl+Y puts it back). The first box opens selected, so
 // typing replaces it. Lengths in inches unless a unit is typed, angles in degrees.
 FocusScope {
     id: panel
@@ -149,6 +149,14 @@ FocusScope {
                 property bool wrong: false
                 function focusIn() { if (typed) { field.forceActiveFocus(); field.selectAll() } }
                 function focusOut() { field.focus = false }
+                // One Esc in the font list (Main.escStep asks from the focused item out): the list shuts, the tool stays.
+                function escStep() {
+                    if (!listOpen)
+                        return false
+                    listOpen = false
+                    panel.leave()
+                    return true
+                }
 
                 width: toggle ? name.implicitWidth + 44 : choice ? name.implicitWidth + 72 : isFont ? name.implicitWidth + 170
                        : name.implicitWidth + (modelData.kind === "text" ? 170 : 110)
@@ -270,7 +278,6 @@ FocusScope {
                         font.pixelSize: 14
                         clip: true
                         Text { visible: !filter.text.length; text: "Search fonts"; color: panel.theme.textSecondary; font: filter.font }
-                        Keys.onEscapePressed: { box.listOpen = false; panel.leave(); panel.cancelled() }
                         Keys.onReturnPressed: if (fontMenu.shownFonts.length) { panel.changed(box.modelData.key, fontMenu.shownFonts[0] === "Default" ? "" : fontMenu.shownFonts[0]); box.listOpen = false }
                     }
                     Rectangle { x: 8; y: 36; width: parent.width - 16; height: 1; color: panel.theme.border }
@@ -358,7 +365,6 @@ FocusScope {
                     }
                     Keys.onReturnPressed: event => enter(event)
                     Keys.onEnterPressed: event => enter(event)
-                    Keys.onEscapePressed: { panel.leave(); panel.cancelled() }
                     Keys.onTabPressed: {
                         const next = panel.boxAt((box.index + (box.parent === rowLow ? boxesA.count : 0) + 1) % panel.boxCount)
                         if (next) next.focusIn()

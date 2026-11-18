@@ -4,9 +4,20 @@
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
+#include <TopTools_MapOfShape.hxx>
+#include <ShapeUpgrade_UnifySameDomain.hxx>
+#include <TopTools_HSequenceOfShape.hxx>
+#include <ShapeAnalysis_FreeBounds.hxx>
+#include <Poly_Triangulation.hxx>
+#include <BRepMesh_IncrementalMesh.hxx>
+#include <BRepBuilderAPI_Copy.hxx>
+#include <cstdio>
+#include <cstdlib>
+#include <Geom_Line.hxx>
 #include <BRepCheck_Analyzer.hxx>
 #include <BRepGProp.hxx>
 #include <BRepLProp_SLProps.hxx>
+#include <BRepLib.hxx>
 #include <BRepLib_FuseEdges.hxx>
 #include <BRepTools.hxx>
 #include <BRepTopAdaptor_FClass2d.hxx>
@@ -22,6 +33,7 @@
 #include <ShapeBuild_ReShape.hxx>
 #include <ShapeExtend.hxx>
 #include <ShapeFix_Face.hxx>
+#include <ShapeFix_Shell.hxx>
 #include <Standard_Failure.hxx>
 #include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
@@ -31,6 +43,8 @@
 #include <TopoDS.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
+#include <TopoDS_Shell.hxx>
+#include <TopoDS_Solid.hxx>
 #include <TopoDS_Wire.hxx>
 
 #include <algorithm>
@@ -144,6 +158,28 @@ double areaOf(const TopoDS_Shape &s) {
     return p.Mass();
 }
 
+// A joined face can come out facing the wrong way for its shell (BRepCheck's
+// BadOrientationOfSubshape, though it faces out as the faces it replaced did): turned round
+// together with its neighbours, as the converter does after its own merge (meshsolid.cpp).
+TopoDS_Shape turnedRight(const TopoDS_Shape &shape) {
+    if (shape.ShapeType() != TopAbs_SOLID)
+        return shape;
+    TopExp_Explorer one(shape, TopAbs_SHELL);
+    if (!one.More())
+        return shape;
+    one.Next();
+    if (one.More())
+        return shape; // More than one shell: leave it.
+    ShapeFix_Shell faces(TopoDS::Shell(TopExp_Explorer(shape, TopAbs_SHELL).Current()));
+    faces.Perform();
+    TopoDS_Solid turned;
+    BRep_Builder().MakeSolid(turned);
+    BRep_Builder().Add(turned, faces.Shell());
+    if (!BRepLib::OrientClosedSolid(turned))
+        return shape;
+    return turned;
+}
+
 // One face for a group on `ref`'s surface, or null. `context` gathers every edge the fix swaps, so
 // the neighbours get the very same new edge (FreeCAD sews afterwards for the same reason).
 TopoDS_Face unite(const std::vector<TopoDS_Face> &group, const TopoDS_Face &ref, const Handle(ShapeBuild_ReShape) &context) {
@@ -192,7 +228,10 @@ TopoDS_Face unite(const std::vector<TopoDS_Face> &group, const TopoDS_Face &ref,
         BRepBndLib::Add(b, y);
         return y.SquareExtent() < x.SquareExtent();
     });
-    const Handle(Geom_Surface) surface = BRep_Tool::Surface(ref);
+    // A copy of the surface: an edge's curve on a face is kept per surface, so the fix below working
+    // on the very surface the old faces stand on rewrote their rims' curves in place, and a ring it
+    // then gave up on was left broken (hinge_female's countersinks, round 6).
+    const Handle(Geom_Surface) surface = Handle(Geom_Surface)::DownCast(BRep_Tool::Surface(ref)->Copy());
     const auto cylinder = Handle(Geom_CylindricalSurface)::DownCast(surface);
     const auto cone = Handle(Geom_ConicalSurface)::DownCast(surface);
     std::vector<TopoDS_Wire> round, inner;
@@ -224,6 +263,20 @@ TopoDS_Face unite(const std::vector<TopoDS_Face> &group, const TopoDS_Face &ref,
     if (fix.Status(ShapeExtend_FAIL))
         return {};
     TopoDS_Face face = fix.Face();
+    // A whole ring's new wrap-around line must be the straight line along the surface. The fix can
+    // trace it as a spline instead, and split a rim beside it into a piece of no length; OpenCascade's
+    // Boolean then can't split the face, and a cut through hinge_female's countersinks came back
+    // empty (round 6). Such a ring is left for OpenCascade's own merge, which keeps the line it had.
+    if (round.size() == 2)
+        for (TopExp_Explorer e(face, TopAbs_EDGE); e.More(); e.Next()) {
+            const TopoDS_Edge edge = TopoDS::Edge(e.Current());
+            if (!BRep_Tool::IsClosed(edge, face))
+                continue;
+            double a, b;
+            const Handle(Geom_Curve) curve = BRep_Tool::Curve(edge, a, b);
+            if (curve.IsNull() || !curve->IsKind(STANDARD_TYPE(Geom_Line)))
+                return {};
+        }
     // Facing out the way the faces it replaces did.
     gp_Dir want, got;
     if (!outward(ref, want) || !outward(face, got))
@@ -288,6 +341,16 @@ TopoDS_Shape sameSurfaces(const TopoDS_Shape &shape, int *united) {
         if (joined == 0)
             return shape;
         TopoDS_Shape result = reshape->Apply(shape);
+        if (!BRepCheck_Analyzer(result).IsValid()) {
+            // Turned round only if it still holds what it held: a whole shell can come out inside
+            // out and valid (the shelf bracket: -200% volume).
+            const TopoDS_Shape turned = turnedRight(result);
+            GProp_GProps was, now;
+            BRepGProp::VolumeProperties(shape, was);
+            BRepGProp::VolumeProperties(turned, now);
+            if (std::abs(now.Mass() - was.Mass()) <= 1e-5 * std::max(std::abs(was.Mass()), 1.0))
+                result = turned;
+        }
         if (!BRepCheck_Analyzer(result).IsValid())
             return {};
         // Straight edges cut in two at a corner that's gone (FreeCAD's process, modelRefine.cpp:1326:
@@ -311,9 +374,157 @@ TopoDS_Shape sameSurfaces(const TopoDS_Shape &shape, int *united) {
             if (BRepCheck_Analyzer(fused).IsValid())
                 result = fused;
         }
+        // Joined faces must hold what the faces they replace held. A shell joined valid but inside
+        // out (the converted shelf bracket, -200% volume after the merge) is turned back; anything
+        // else that changed what it holds isn't the same solid.
+        if (shape.ShapeType() == TopAbs_SOLID) {
+            GProp_GProps was, now;
+            BRepGProp::VolumeProperties(shape, was);
+            BRepGProp::VolumeProperties(result, now);
+            const double close = 1e-5 * std::max(std::abs(was.Mass()), 1.0);
+            if (std::abs(now.Mass() + was.Mass()) <= close && std::abs(was.Mass()) > close) {
+                // Its faces turned round as a whole solid would be: a solid merely flagged reversed
+                // isn't valid, and OpenCascade's merge after this one then refused it (hinge_female's
+                // countersinks stayed in halves, round 6).
+                const TopoDS_Shape turned = turnedRight(result);
+                GProp_GProps back;
+                BRepGProp::VolumeProperties(turned, back);
+                if (std::abs(back.Mass() - was.Mass()) > close || !BRepCheck_Analyzer(turned).IsValid())
+                    return {};
+                result = turned;
+            } else if (std::abs(now.Mass() - was.Mass()) > close)
+                return {};
+        }
         if (united)
             *united = joined;
         return result;
+    } catch (const Standard_Failure &) {
+        return {};
+    }
+}
+
+bool roundsDraw(const TopoDS_Shape &shape) {
+    try {
+        for (TopExp_Explorer e(shape, TopAbs_FACE); e.More(); e.Next()) {
+            const TopoDS_Face face = TopoDS::Face(e.Current());
+            const BRepAdaptor_Surface surface(face, false);
+            if (surface.GetType() != GeomAbs_Cylinder && surface.GetType() != GeomAbs_Cone)
+                continue;
+            bool wraps = false;
+            for (TopExp_Explorer x(face, TopAbs_EDGE); x.More() && !wraps; x.Next())
+                wraps = BRep_Tool::IsClosed(TopoDS::Edge(x.Current()), face);
+            if (!wraps)
+                continue;
+            const TopoDS_Face alone = TopoDS::Face(BRepBuilderAPI_Copy(face, true, false).Shape());
+            Bnd_Box box;
+            BRepBndLib::Add(alone, box);
+            BRepMesh_IncrementalMesh(alone, std::max(1e-3, std::sqrt(box.SquareExtent()) * 0.01), false, 0.5, false);
+            TopLoc_Location where;
+            const Handle(Poly_Triangulation) drawn = BRep_Tool::Triangulation(alone, where);
+            if (drawn.IsNull() || drawn->NbTriangles() == 0)
+                return false;
+        }
+        return true;
+    } catch (const Standard_Failure &) {
+        return false;
+    }
+}
+
+// One wrapped round face drawn on its own; the triangles, or -1.
+static int drawnTriangles(const TopoDS_Face &face) {
+    const TopoDS_Face alone = TopoDS::Face(BRepBuilderAPI_Copy(face, true, false).Shape());
+    Bnd_Box box;
+    BRepBndLib::Add(alone, box);
+    BRepMesh_IncrementalMesh(alone, std::max(1e-3, std::sqrt(box.SquareExtent()) * 0.01), false, 0.5, false);
+    TopLoc_Location where;
+    const Handle(Poly_Triangulation) drawn = BRep_Tool::Triangulation(alone, where);
+    return drawn.IsNull() ? -1 : drawn->NbTriangles();
+}
+
+// Every round face that can't be drawn, built again from its rims (its edges other than the
+// wrap-around one) on the same surface, the wrap-around line added by ShapeFix_Face as a made
+// cylinder or cone has it. The edges it re-makes are swapped in its neighbours too. Null unless
+// every such face then draws, keeps its area, and the body stays valid with its volume.
+static TopoDS_Shape reseamed(const TopoDS_Shape &shape) {
+    Handle(ShapeBuild_ReShape) context = new ShapeBuild_ReShape;
+    BRep_Builder builder;
+    bool any = false;
+    for (TopExp_Explorer e(shape, TopAbs_FACE); e.More(); e.Next()) {
+        const TopoDS_Face face = TopoDS::Face(e.Current());
+        const GeomAbs_SurfaceType kind = BRepAdaptor_Surface(face, false).GetType();
+        if ((kind != GeomAbs_Cylinder && kind != GeomAbs_Cone) || drawnTriangles(face) > 0)
+            continue;
+        Handle(TopTools_HSequenceOfShape) rims = new TopTools_HSequenceOfShape, wires;
+        for (TopExp_Explorer x(face, TopAbs_EDGE); x.More(); x.Next())
+            if (!BRep_Tool::IsClosed(TopoDS::Edge(x.Current()), face))
+                rims->Append(x.Current());
+        ShapeAnalysis_FreeBounds::ConnectEdgesToWires(rims, Precision::Confusion(), false, wires);
+        TopLoc_Location where;
+        const Handle(Geom_Surface) surface = BRep_Tool::Surface(face, where);
+        TopoDS_Face bare = BRepBuilderAPI_MakeFace(surface, Precision::Confusion()).Face();
+        bare.Location(where);
+        TopoDS_Face rebuilt = TopoDS::Face(bare.EmptyCopied());
+        for (int k = 1; k <= wires->Length(); ++k)
+            builder.Add(rebuilt, wires->Value(k));
+        ShapeFix_Face fix(rebuilt);
+        fix.SetContext(context);
+        fix.FixMissingSeamMode() = 1;
+        fix.FixOrientationMode() = 1;
+        fix.Perform();
+        TopoDS_Face made = fix.Face();
+        made.Orientation(face.Orientation());
+        GProp_GProps was, now;
+        BRepGProp::SurfaceProperties(face, was);
+        BRepGProp::SurfaceProperties(made, now);
+        if (drawnTriangles(made) <= 0 || std::abs(now.Mass() - was.Mass()) > 1e-6 * std::max(1.0, was.Mass()))
+            return {};
+        context->Replace(face, made);
+        any = true;
+    }
+    if (!any)
+        return {};
+    const TopoDS_Shape result = context->Apply(shape);
+    GProp_GProps was, now;
+    BRepGProp::VolumeProperties(shape, was);
+    BRepGProp::VolumeProperties(result, now);
+    if (!BRepCheck_Analyzer(result).IsValid() || std::abs(now.Mass() - was.Mass()) > 1e-6 * std::max(1.0, std::abs(was.Mass()))
+        || !roundsDraw(result))
+        return {};
+    return result;
+}
+
+TopoDS_Shape unifyDrawable(const TopoDS_Shape &shape, double linear, double angular) {
+    try {
+        ShapeUpgrade_UnifySameDomain unify(shape, true, true, false);
+        unify.SetLinearTolerance(linear);
+        unify.SetAngularTolerance(angular);
+        unify.Build();
+        if (roundsDraw(unify.Shape()))
+            return unify.Shape();
+        // The merge can leave a round's merged face with no wrap-around line it can be drawn
+        // along (hinge_female's countersinks, round 6): built again on its own surface from its
+        // rims, with OpenCascade's healing adding the wrap-around line, as a made cone has one.
+        if (const TopoDS_Shape again = reseamed(unify.Shape()); !again.IsNull())
+            return again;
+        // Again, the halves of every round left as they are.
+        TopTools_IndexedDataMapOfShapeListOfShape edgeFaces;
+        TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edgeFaces);
+        TopTools_MapOfShape keep;
+        for (int i = 1; i <= edgeFaces.Extent(); ++i) {
+            const TopTools_ListOfShape &list = edgeFaces(i);
+            if (list.Extent() != 2)
+                continue;
+            const TopoDS_Face a = TopoDS::Face(list.First()), b = TopoDS::Face(list.Last());
+            const GeomAbs_SurfaceType kind = BRepAdaptor_Surface(a, false).GetType();
+            if ((kind == GeomAbs_Cylinder || kind == GeomAbs_Cone) && !a.IsSame(b) && sameSurface(a, b))
+                keep.Add(edgeFaces.FindKey(i));
+        }
+        ShapeUpgrade_UnifySameDomain again(shape, true, true, false);
+        again.SetLinearTolerance(linear);
+        again.SetAngularTolerance(angular);
+        again.KeepShapes(keep);
+        again.Build();
+        return roundsDraw(again.Shape()) ? again.Shape() : TopoDS_Shape();
     } catch (const Standard_Failure &) {
         return {};
     }

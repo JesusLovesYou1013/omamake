@@ -29,8 +29,10 @@
 namespace projectexact {
 
 // The shadow these shapes (solids, or one face) throw straight down on the plane: closed outlines with
-// the shadow on their left, the outside ones first. Nothing covered (a face seen edge on): its edges
-// laid flat, each a loop of its own. False and why when it can't be worked out.
+// the shadow on their left, the outside ones first. One face: its outside and its holes. Solids (the
+// whole model, GB-095): only the outside of each separate region, no holes or other inner lines.
+// Nothing covered (a face seen edge on): its edges laid flat, each a loop of its own. False and why
+// when it can't be worked out.
 bool shadow(const std::vector<TopoDS_Shape> &shapes, const omamake::Placement &plane,
             std::vector<std::vector<omamake::FlatPiece>> &loops, std::string &why);
 

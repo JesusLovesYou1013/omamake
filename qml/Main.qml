@@ -12,7 +12,7 @@ import "Families.js" as Families
 import "SketchKeys.js" as SketchKeys
 
 // OmaMake's window: nothing but the 3D space, edge to edge. Every command lives
-// behind Alt+Space. Anything added later floats over the viewport and hides away.
+// behind the command search (S, or Ctrl+Space anywhere; GB-087). Anything added later floats over the viewport and hides away.
 Window {
     id: root
     width: 1400
@@ -23,7 +23,7 @@ Window {
 
     Theme {
         id: theme
-        locked: saveDialog.visible || loadDialog.visible || exportDialog.visible
+        locked: saveDialog.visible || loadDialog.visible || filePicker.visible
     }
 
     // Remembered between launches.
@@ -174,7 +174,7 @@ Window {
 
         }
 
-        // Camera rig: pivot (what we look at) → yaw → pitch → camera at a distance.
+        // Camera rig: pivot (what we look at) → yaw → pitch → roll (Export DXF only) → camera at a distance.
         Node {
             id: pivot
             Node {
@@ -184,6 +184,9 @@ Window {
                 Node {
                     id: pitchNode
                     eulerRotation.x: navigation.pitch
+                    Node {
+                    id: rollNode
+                    eulerRotation.z: -navigation.roll   // the camera turns the other way to the picture
                     PerspectiveCamera {
                         id: camera
                         z: navigation.distance
@@ -201,6 +204,7 @@ Window {
                         clipFar: 200000
                         horizontalMagnification: view.height / (2 * navigation.distance * Math.tan(navigation.fov * Math.PI / 360))
                         verticalMagnification: horizontalMagnification
+                    }
                     }
                 }
             }
@@ -251,6 +255,17 @@ Window {
             fadeDistance: Math.max(3000, navigation.distance * 4)
         }
 
+        // Extrude's cut region over its profile's plane (Document::extrudeRegion, BodyMaterial).
+        Texture {
+            id: cutMaskTexture
+            textureData: RegionMask { id: cutMask }
+            minFilter: Texture.Linear
+            magFilter: Texture.Linear
+            mipFilter: Texture.None
+            generateMipmaps: false
+            tilingModeHorizontal: Texture.ClampToEdge
+            tilingModeVertical: Texture.ClampToEdge
+        }
         Texture {
             id: studio
             textureData: ProceduralSkyTextureData {
@@ -275,21 +290,61 @@ Window {
                 visible: root.bodyVisible && !rewind.showing && !rewind.framesShowing && !edgePreviewShown
 
                 Model {
+                    objectName: "bodyFaces"
                     geometry: MeshGeometry { id: faces }
-                    materials: PrincipledMaterial {
-                        baseColor: theme.model
-                        metalness: navigation.simpleLook ? 0.08 : 0.85   // Simple Look has no sky to reflect
-                        roughness: navigation.simpleLook ? 0.42 : 0.28
+                    // The body's look; while Extrude shows a cut, a hole where the cut's volume is (GB-084
+                    // correction), filled by the faded copy below. Everywhere else exactly as always.
+                    materials: BodyMaterial {
+                        roleOf: 0
+                        tint: theme.model
+                        metal: navigation.simpleLook ? 0.08 : 0.85   // Simple Look has no sky to reflect
+                        rough: navigation.simpleLook ? 0.42 : 0.28
+                        region: extrudeTool.region
+                        regionMask: TextureInput { texture: cutMaskTexture }
                     }
                     castsShadows: true
                     receivesShadows: true
                 }
+                // Inside the cut's region, the bodies as the cut will leave them (GB-084 second correction, owner:
+                // "the new solid surface that will be created" when Done is hit): the pocket's walls and floor,
+                // solid, in the body's own look; made on a worker (Document::fillExtrudeCutResult), and the region
+                // only switched on once the drawing for it is in, so the body never flashes.
+                Model {
+                    objectName: "bodyCutResult"
+                    geometry: MeshGeometry { id: cutResultFaces }
+                    visible: !!(extrudeTool.region && extrudeTool.region.on)
+                    castsShadows: true
+                    receivesShadows: true
+                    materials: BodyMaterial {
+                        roleOf: 1
+                        tint: theme.model
+                        metal: navigation.simpleLook ? 0.08 : 0.85
+                        rough: navigation.simpleLook ? 0.42 : 0.28
+                        region: extrudeTool.region
+                        regionMask: TextureInput { texture: cutMaskTexture }
+                    }
+                }
+                Model {
+                    objectName: "bodyCutResultEdges"
+                    geometry: MeshGeometry { id: cutResultEdges; lines: true }
+                    visible: !!(extrudeTool.region && extrudeTool.region.on)
+                    depthBias: -40
+                    materials: RegionLineMaterial {
+                        roleOf: 1
+                        tint: theme.modelEdge
+                        region: extrudeTool.region
+                        regionMask: TextureInput { texture: cutMaskTexture }
+                    }
+                }
                 Model {
                     geometry: MeshGeometry { id: edges; lines: true }
                     depthBias: -40
-                    materials: PrincipledMaterial {
-                        lighting: PrincipledMaterial.NoLighting
-                        baseColor: theme.modelEdge
+                    // As PrincipledMaterial NoLighting drew them, with none inside Extrude's cut region (GB-084).
+                    materials: RegionLineMaterial {
+                        roleOf: 0
+                        tint: theme.modelEdge
+                        region: extrudeTool.region
+                        regionMask: TextureInput { texture: cutMaskTexture }
                     }
                 }
             }
@@ -396,21 +451,30 @@ Window {
             // Selected parts, then the hovered part on top (Selection.qml fills these): the body's,
             // and lines and points in sketches, so outside the body's node.
             Model {
+                objectName: "selectedParts"
                 geometry: MeshGeometry { id: selectedParts }
                 depthBias: -60
-                materials: PrincipledMaterial {
-                    baseColor: theme.selection
-                    metalness: 0.05
-                    roughness: 0.45
+                // Faded with the body inside a cut's volume (GB-084 correction), as always elsewhere.
+                materials: BodyMaterial {
+                    roleOf: 2
+                    tint: theme.selection
+                    metal: 0.05
+                    rough: 0.45
+                    region: extrudeTool.region
+                    regionMask: TextureInput { texture: cutMaskTexture }
                 }
             }
             Model {
                 geometry: MeshGeometry { id: hoverParts }
                 depthBias: -80
-                materials: PrincipledMaterial {
-                    baseColor: theme.hover
-                    metalness: 0.05
-                    roughness: 0.45
+                // Faded with the body inside a cut's volume (GB-084 correction), as always elsewhere.
+                materials: BodyMaterial {
+                    roleOf: 2
+                    tint: theme.hover
+                    metal: 0.05
+                    rough: 0.45
+                    region: extrudeTool.region
+                    regionMask: TextureInput { texture: cutMaskTexture }
                 }
             }
             // What Project has picked so far (Selection.drawProject): faces shaded translucent purple,
@@ -443,7 +507,8 @@ Window {
             OriginShapes {
                 id: originShapes
                 theme: theme
-                shown: root.originVisible
+                // Export DXF: only the origin's axes lying in the sketch's plane, the ones it can measure from (owner)
+                shown: dxfTool.axesShown || root.originVisible
                 styles: root.planeStyles
                 size: 150         // fixed, half-width in mm (owner, 2026-11-08: it followed the model and resized while scrubbing)
                 lineRadius: navigation.distance * 0.0011
@@ -465,15 +530,21 @@ Window {
             Model {
                 objectName: "profileSelected"
                 geometry: MeshGeometry { id: profileSelectedParts }
+                // Not while Extrude shows a cut's result: the red preview's top is the profile, and the pocket
+                // under it must show (GB-084 second correction).
+                visible: !(extrudeTool.region && extrudeTool.region.on)
                 depthBias: -25
                 castsShadows: false
                 receivesShadows: false
                 materials: ProfileMaterial { tint: Qt.rgba(theme.selection.r, theme.selection.g, theme.selection.b, 0.40) }
             }
-            // Extrude's preview per side: a faint fill, an outline (blue adds, red cuts), and the exact red region a cut removes.
+            // Extrude's preview per side: a faint fill and an outline (blue adds, red cuts; a cut that reaches a body
+            // a stronger red), one shape each (GB-084). Drawn last of the see-through things, whatever the camera:
+            // over the faded body when cutting, never sometimes under it (the sort is by distance, depthBias moves it).
             Model {
                 objectName: "extrudePreviewA"
                 geometry: MeshGeometry { id: extrudePreviewA }
+                depthBias: -1e6
                 castsShadows: false
                 receivesShadows: false
                 materials: XrayMaterial { tint: extrudeTool.fillOf(0) }
@@ -481,20 +552,15 @@ Window {
             Model {
                 objectName: "extrudeWireA"
                 geometry: MeshGeometry { id: extrudeWireA; lines: true }
+                depthBias: -1e6
                 castsShadows: false
                 receivesShadows: false
                 materials: XrayMaterial { tint: extrudeTool.lineOf(0) }
             }
             Model {
-                objectName: "extrudeCutA"
-                geometry: MeshGeometry { id: extrudeCutA }
-                castsShadows: false
-                receivesShadows: false
-                materials: XrayMaterial { tint: extrudeTool.cutColor }
-            }
-            Model {
                 objectName: "extrudePreviewB"
                 geometry: MeshGeometry { id: extrudePreviewB }
+                depthBias: -1e6
                 castsShadows: false
                 receivesShadows: false
                 materials: XrayMaterial { tint: extrudeTool.fillOf(1) }
@@ -502,16 +568,10 @@ Window {
             Model {
                 objectName: "extrudeWireB"
                 geometry: MeshGeometry { id: extrudeWireB; lines: true }
+                depthBias: -1e6
                 castsShadows: false
                 receivesShadows: false
                 materials: XrayMaterial { tint: extrudeTool.lineOf(1) }
-            }
-            Model {
-                objectName: "extrudeCutB"
-                geometry: MeshGeometry { id: extrudeCutB }
-                castsShadows: false
-                receivesShadows: false
-                materials: XrayMaterial { tint: extrudeTool.cutColor }
             }
             // Closed profiles, lightly shaded (Main.drawProfiles), under the lines.
             Model {
@@ -669,8 +729,11 @@ Window {
         view: view
         pivot: pivot
         camera: camera
-        onHoverAt: (x, y) => sketchTools.tool ? sketchTools.move(x, y) : selection.hoverAt(x, y)
-        onClickAt: (x, y, modifiers) => sketch.picking ? sketch.startAt(x, y)
+        onHoverAt: (x, y) => dxfTool.wantsClicks ? dxfTool.move(x, y) : stepTool.open ? stepTool.move(x, y) : sketchTools.tool ? sketchTools.move(x, y)
+                           : extrudeTool.open && extrudeTool.arrowHeld > 0 ? selection.clearHover() : selection.hoverAt(x, y)
+        onClickAt: (x, y, modifiers) => dxfTool.wantsClicks ? dxfTool.click(x, y)
+                                      : stepTool.open ? stepTool.click(x, y)
+                                      : sketch.picking ? sketch.startAt(x, y)
                                       : sketchTools.tool ? sketchTools.click(x, y)
                                       : selection.clickAt(x, y, modifiers)
         onDoubleClickAt: (x, y) => {
@@ -778,7 +841,7 @@ Window {
     // Distances between points get a thin line between them; a line's length sits beside it.
     Item {
         anchors.fill: parent
-        visible: root.openSketchShown && root.showDimensions
+        visible: root.openSketchShown && root.showDimensions || root.dxfDimsPreview
         Repeater {
             model: root.dimensions
             delegate: Item {
@@ -793,9 +856,11 @@ Window {
                 readonly property var look: modelData.type !== "angle" ? null
                                           : dragging ? root.angleLook(modelData, sketchTools.onPlane(dragSpot.x, dragSpot.y))
                                           : root.angleLooks[index] || null
+                // Kept near its line while dragged; once let go (or pinned where it first showed) it's exactly
+                // at its place on the sketch at any zoom, as Export DXF draws it.
                 readonly property point spot: look ? look.spot
-                                            : root.keptNear(dragging ? dragSpot
-                                                            : (root.labelSpots[index] || root.dimensionSpot(a, b, modelData.type)), a, b)
+                                            : dragging ? root.keptNear(dragSpot, a, b)
+                                            : (root.labelSpots[index] || root.dimensionSpot(a, b, modelData.type))
                 // The dashed line from the value back to what it measures: from wherever on the
                 // box is closest to wherever on the line is closest, so it stays short and tidy.
                 readonly property var leader: {
@@ -911,6 +976,7 @@ Window {
                         property point pressAt
                         property bool wasDragged: false
                         anchors.fill: parent
+                        enabled: !root.dxfDimsPreview      // in the Export DXF preview: shown only
                         hoverEnabled: true
                         cursorShape: dim.dragging ? Qt.ClosedHandCursor : Qt.PointingHandCursor
                         onPressed: m => pressAt = Qt.point(m.x, m.y)
@@ -979,11 +1045,16 @@ Window {
         onSketchEditRequested: id => root.editSketch(id)
         underlined: selection.treeKeys
         cutChoices: extrudeTool.open ? extrudeTool.cutChoices : null
+        sketchPick: dxfTool.open ? dxfTool.toggle : null
+        pickedSketches: dxfTool.pickedMap
+        bodyPick: stepTool.open ? stepTool.pick : null       // Export STEP: a body or component row is what's exported
+        pickedKeys: stepTool.pickedMap
+        onDxfReopenRequested: row => dxfTool.reopen(row)
         onCutToggled: (body, on) => extrudeTool.toggleCut(body, on)
         // Double-click on a body row: that body. On a component row: every body inside it, and in
         // the components within it (owner, 2026-11-02). Not while sketching.
         onSelectRequested: key => {
-            if (sketch.active || sketchTools.tool)
+            if (sketch.active || sketchTools.tool || stepTool.open)    // Export STEP: one click picks (bodyPick)
                 return
             const id = parseInt(key.slice(1))
             selection.selectBodies(key[0] === "b" ? [id] : doc.bodiesUnder(id))
@@ -1008,7 +1079,11 @@ Window {
         crossfade: root.crossfade
         fadeBusy: () => fading.on
         fadeMs: root.fadeMs
-        onActiveChanged: { sketchTools.cancel(); sketchTools.construction = false; root.gapsOn = false; root.gapsFading = false; root.gapAt = -1 }
+        onActiveChanged: {
+            sketchTools.cancel(); sketchTools.construction = false; root.gapsOn = false; root.gapsFading = false; root.gapAt = -1
+            if (!active && root.pendingExtrude)
+                Qt.callLater(root.startPendingExtrude)       // E in the sketch: Extrude once it's finished (GB-083)
+        }
     }
     SketchTools {
         id: sketchTools
@@ -1279,7 +1354,7 @@ Window {
 
     // A sketch place (u, v mm) → window pixels.
     function planeToScreen(u, v) {
-        const p = sketch.plane
+        const p = dimPlane
         return toScreen(p.origin.plus(p.xAxis.times(u)).plus(p.yAxis.times(v)))
     }
     // Where each dimension's value sits (owner, 2026-10-30): where it was dragged to if it was;
@@ -1292,12 +1367,37 @@ Window {
         font.pixelSize: 12
     }
     readonly property var labelPlaces: { viewTick; width; height; return placeLabels(dimensions) }
+    // A value is pinned on the sketch where it first shows (owner, 2026-11-13): from then on it stays there at any
+    // zoom until dragged, and Export DXF puts it exactly there. Values from older files are pinned when shown.
+    onLabelPlacesChanged: Qt.callLater(pinLabels)
+    function pinLabels() {
+        if (!dimSketchId || !dimPlane || !labelSpots.length)
+            return
+        const pins = []
+        for (let i = 0; i < dimensions.length; i++) {
+            const d = dimensions[i]
+            if (d.placed)
+                continue
+            const look = angleLooks[i]
+            if (d.type === "angle") {
+                if (look)
+                    pins.push({ id: d.id, u: look.along1, v: look.along2 })
+                continue
+            }
+            const s = labelSpots[i]
+            const at = s ? dimOnPlane(s.x, s.y) : null
+            if (at)
+                pins.push({ id: d.id, u: at.u - d.mid_u, v: at.v - d.mid_v })
+        }
+        if (pins.length)
+            doc.pinDimensionLabels(dimSketchId, pins)
+    }
     readonly property var labelSpots: labelPlaces.spots || []
     readonly property var angleLooks: labelPlaces.looks || []
     function placeLabels(dims) {
-        if (!sketch.active || !sketch.plane || !dims.length)
+        if (!dimSketchId || !dimPlane || !dims.length)
             return {}
-        const g = doc.sketchGeometry(sketch.sketchId)
+        const g = doc.sketchGeometry(dimSketchId)
         const avoid = [planeToScreen(0, 0)]
         for (const p of g.points)
             if (!p.rim && !p.hidden)
@@ -1372,7 +1472,7 @@ Window {
     // or null when the lines don't cross.
     function angleLook(d, at, grow) {
         const f = d.frame
-        if (!f || f.parallel || !sketch.plane)
+        if (!f || f.parallel || !dimPlane)
             return null
         const X = { u: f.cross[0], v: f.cross[1] }, e1 = { u: f.e1[0], v: f.e1[1] }, e2 = { u: f.e2[0], v: f.e2[1] }
         const den = e1.u * e2.v - e1.v * e2.u
@@ -1399,7 +1499,8 @@ Window {
             s2 = t2 < 0 ? -1 : 1
             s1 = s2 * d.side
         }
-        r = Math.max(50 / perMm, r + (grow || 0) / perMm)
+        if (at || !d.placed)          // a pinned one is exactly where it was left, at any zoom (Export DXF draws it there)
+            r = Math.max(50 / perMm, r + (grow || 0) / perMm)
         const a1 = { u: e1.u * s1, v: e1.v * s1 }, a2 = { u: e2.u * s2, v: e2.v * s2 }
         const from = Math.atan2(a1.v, a1.u)
         const sweep = Math.atan2(a1.u * a2.v - a1.v * a2.u, a1.u * a2.u + a1.v * a2.v)
@@ -1454,7 +1555,24 @@ Window {
     property var dimensions: []
     property int viewTick: 0
     function refreshDimensions() {
-        dimensions = sketch.active ? doc.sketchDimensions(sketch.sketchId) : []
+        dimensions = dimSketchId ? doc.sketchDimensions(dimSketchId) : []
+    }
+    // Whose dimensions are drawn: the open sketch's, or, in Export DXF with "Include dimensions" ticked, the
+    // exported sketch's, as a preview of the file (owner, 2026-11-13; shown only, not draggable or editable).
+    readonly property bool dxfDimsPreview: !sketch.active && dxfTool.open && dxfTool.dims && dxfTool.picked.length > 0
+    readonly property int dimSketchId: sketch.active ? sketch.sketchId : dxfDimsPreview ? dxfTool.picked[0].id : 0
+    readonly property var dimPlane: sketch.active ? sketch.plane : dimSketchId ? doc.sketchPlane(dimSketchId) : null
+    onDimSketchIdChanged: refreshDimensions()
+    // A window point on that sketch's plane, {u, v} mm, or null.
+    function dimOnPlane(x, y) {
+        const p = dimPlane
+        if (!p)
+            return null
+        const r = selection.rayAt(x, y), along = r.direction.dotProduct(p.normal)
+        if (Math.abs(along) < 1e-9)
+            return null
+        const at = r.origin.plus(r.direction.times(p.origin.minus(r.origin).dotProduct(p.normal) / along)).minus(p.origin)
+        return { u: at.dotProduct(p.xAxis), v: at.dotProduct(p.yAxis) }
     }
     Connections {
         target: camera
@@ -1523,44 +1641,64 @@ Window {
         nameFilters: ["OmaMake designs (*.omamake)"]
         onAccepted: root.loadFile(selectedFile.toString())
     }
-    // Export (owner, 2026-10-31): STEP for now, the first of the formats it will offer.
-    function exportBody() {
-        exportDialog.currentFolder = doc.filePath ? "file://" + doc.filePath.substring(0, doc.filePath.lastIndexOf("/")) : saveFolder
-        exportDialog.selectedFile = exportDialog.currentFolder + "/" + doc.exportName() + ".step"
+    // The one file picker for importing and exporting (owner, 2026-11-13): Import STEP, Import Mesh, Export (STEP)
+    // and Export DXF all open this same dialog, so a change to it reaches every one of them.
+    // `spec`: {title, save, filters, suffix, folder, name, done(url)}; folder defaults to the design's own.
+    property var pickDone: null
+    function pickFile(spec) {
+        filePicker.title = spec.title
+        filePicker.fileMode = spec.save ? FileDialog.SaveFile : FileDialog.OpenFile
+        filePicker.nameFilters = spec.filters
+        filePicker.defaultSuffix = spec.suffix || ""
+        filePicker.currentFolder = spec.folder || (doc.filePath ? "file://" + doc.filePath.substring(0, doc.filePath.lastIndexOf("/")) : saveFolder)
+        if (spec.name)
+            filePicker.selectedFile = filePicker.currentFolder + "/" + spec.name
+        pickDone = spec.done
         dialogLook.setDark(!theme.light)
-        exportDialog.open()
+        filePicker.open()
     }
     FileDialog {
-        id: exportDialog
-        title: "Export"
-        fileMode: FileDialog.SaveFile
-        nameFilters: ["STEP files (*.step *.stp)"]
-        defaultSuffix: "step"
+        id: filePicker
         onAccepted: {
-            const why = doc.exportTo(selectedFile.toString())
-            sketch.say(why ? why : "Exported " + selectedFile.toString().split("/").pop())
+            const done = root.pickDone
+            root.pickDone = null
+            if (done)
+                done(selectedFile.toString())
         }
+        onRejected: root.pickDone = null
+    }
+    // Export STEP (owner, 2026-10-31; GB-082): the bodies StepTool picked (one body, or every body in a
+    // component; the top one is the whole design), named after what was picked.
+    function exportBody(bodies, name) {
+        pickFile({ title: "Export STEP", save: true, filters: ["STEP files (*.step *.stp)"], suffix: "step", name: (name || doc.exportName()) + ".step",
+                   done: url => {
+                       const why = doc.exportTo(url, bodies)
+                       sketch.say(why ? why : "Exported " + bodies.length + (bodies.length === 1 ? " body" : " bodies") + " to " + url.split("/").pop())
+                       if (!why)
+                           stepTool.cancel()
+                   } })
+    }
+    // Export DXF (owner, 2026-11-13): the sketch DxfTool set up, laid flat as the user oriented it. A reopened
+    // export starts in its own file's folder, under its own name.
+    function exportDxf(id, way) {
+        const saved = way.row >= 0 ? doc.dxfExport(way.row).path : ""
+        pickFile({ title: "Export DXF", save: true, filters: ["DXF drawings (*.dxf)"], suffix: "dxf",
+                   folder: saved ? "file://" + saved.substring(0, saved.lastIndexOf("/")) : "",
+                   // a saved design's name goes first; an unsaved one has none yet ("(Unsaved)" isn't a name, owner)
+                   name: saved ? saved.split("/").pop() : (doc.filePath ? doc.exportName() + "-" : "") + (dxfTool.picked.length ? dxfTool.picked[0].name : "Sketch") + ".dxf",
+                   done: url => {
+                       const why = doc.exportSketchDxf(url, id, way)
+                       sketch.say(why ? why : "Exported the sketch" + (way.dims ? " with its dimensions" : "") + " to " + url.split("/").pop()
+                                              + ". It's listed under the sketch in the Browser: double-click it to export it again.")
+                       if (!why)
+                           dxfTool.cancel()
+                   } })
     }
     // Import STEP and Mesh (owner, 2026-10-30): reads in the background, the panel below shows how far
     // it's got and for how long; the view flies to the model when it lands.
-    FileDialog {
-        id: stepDialog
-        title: "Import STEP"
-        fileMode: FileDialog.OpenFile
-        nameFilters: ["STEP files (*.step *.stp *.STEP *.STP)"]
-        onAccepted: doc.importFile(selectedFile.toString())
-    }
-    FileDialog {
-        id: meshDialog
-        title: "Import Mesh"
-        fileMode: FileDialog.OpenFile
-        nameFilters: ["Mesh files (*.stl *.obj *.STL *.OBJ)"]
-        onAccepted: doc.importFile(selectedFile.toString())
-    }
-    function importFrom(dialog) {
-        dialog.currentFolder = doc.filePath ? "file://" + doc.filePath.substring(0, doc.filePath.lastIndexOf("/")) : saveFolder
-        dialogLook.setDark(!theme.light)
-        dialog.open()
+    function importFrom(kind) {
+        pickFile(kind === "mesh" ? { title: "Import Mesh", filters: ["Mesh files (*.stl *.obj *.STL *.OBJ)"], done: url => doc.importFile(url) }
+                                 : { title: "Import STEP", filters: ["STEP files (*.step *.stp *.STEP *.STP)"], done: url => doc.importFile(url) })
     }
     Connections {
         target: doc
@@ -1570,10 +1708,12 @@ Window {
                 importPanel.elapsed = 0
             }
         }
-        function onFitFinished(why, seconds, cylinders, cones, spheres, trianglesLeft, worstMm) {
+        function onFitFinished(why, seconds, cylinders, cones, spheres, bowls, trianglesLeft, worstMm) {
             if (why)
                 return sketch.say(why)
-            const made = [[cylinders, "cylinder"], [cones, "cone"], [spheres, "sphere"]].filter(k => k[0]).map(k => k[0] + " " + k[1] + (k[0] > 1 ? "s" : ""))
+            const made = [[cylinders, "cylinder"], [cones, "cone"], [spheres, "sphere"], [bowls, "smooth cap"]].filter(k => k[0]).map(k => k[0] + " " + k[1] + (k[0] > 1 ? "s" : ""))
+            if (!made.length)           // Low Poly: its facets joined into flats, no curves
+                return sketch.say("Joined facets at nearly the same angle into flats in " + seconds.toFixed(1) + " s")
             sketch.say("Fitted " + made.join(", ") + " in " + seconds.toFixed(1) + " s · at most " + (worstMm / 25.4).toFixed(4) + " in off · " + trianglesLeft.toLocaleString(Qt.locale(), "f", 0) + " triangles left as facets")
         }
         function onImportFinished(why, seconds, faces, triangles) {
@@ -1617,7 +1757,7 @@ Window {
         }
         Text {
             x: 16; y: 10
-            text: "Extruding"
+            text: doc.workingWhat || "Working"
             color: theme.textPrimary
             font.pixelSize: 14
             font.bold: true
@@ -2248,6 +2388,7 @@ Window {
         navigation.home()
         if (openNote)
             sketch.say(openNote)
+        recoverAsk.ask()          // GB-089: a design left by a memory stop
     }
 
     CommandSearch {
@@ -2266,7 +2407,9 @@ Window {
             { name: "Light Follows View", hint: root.lightFollowsView ? "On: the lamp turns with you. Turn off to keep it fixed in the room" : "Off: the lamp stays put in the room. Turn on to have it turn with you", group: "Look", modes: ["model"], keys: "", run: () => root.lightFollowsView = !root.lightFollowsView },
             { name: "Grid", hint: navigation.gridVisible ? "Hide the floor grid" : "Show the floor grid", group: "Look", modes: ["model"], keys: "", run: () => navigation.gridVisible = !navigation.gridVisible },
             { name: "Simple Look", words: "fast performance effects", hint: navigation.simpleLook ? "Back to full shading and shadows" : "Fewer effects, for slower computers", group: "Look", modes: ["model"], keys: "", run: () => navigation.simpleLook = !navigation.simpleLook },
-            { name: "Extrude", words: "extrude push pull pad boss cut join profile area face distance symmetric two sides new body", hint: "Push profiles or flat faces out into a body, a join, or a cut", group: "Create", modes: ["model"], keys: "E", letter: "e", run: () => Qt.callLater(extrudeTool.begin) },
+            // In a sketch too (owner, GB-083): as Fusion's E there, it finishes the sketch and starts Extrude with the
+            // profile areas selected in it.
+            { name: "Extrude", words: "extrude push pull pad boss cut join profile area face distance symmetric two sides new body", hint: sketch.active ? "Finish the sketch and push its selected profiles out into a body, a join, or a cut" : "Push profiles or flat faces out into a body, a join, or a cut", group: "Create", modes: both, keys: "E", letter: "e", run: () => sketch.active ? root.extrudeFromSketch() : Qt.callLater(extrudeTool.begin) },
             { name: "Chamfer", words: "chamfer bevel edge corner equal distance two distances angle miter blend tangent chain", hint: "Bevel edges: equal, two distances or distance and angle; runs on through where it's too big", group: "Modify", modes: ["model"], keys: "Shift C", run: () => { filletTool.cancel(); Qt.callLater(chamferTool.begin) } },
             { name: "Fillet", sym: "filletmodel", words: "fillet round radius edge corner constant chord length tangent chain blend", hint: "Round edges: a constant radius or chord length; runs on through where it's too big", group: "Modify", modes: ["model"], keys: "Shift F", run: () => { chamferTool.cancel(); Qt.callLater(filletTool.begin) } },
             { name: "New Component", hint: "An empty component inside the active one, made active", group: "Assemble", modes: ["model"], keys: "", run: () => doc.newComponent() },
@@ -2309,10 +2452,11 @@ Window {
             { name: "Finish Sketch", hint: "Back to the model", group: "Sketch", modes: ["sketch"], keys: "", run: () => sketch.finish() },
             { name: "Load", words: "open file design", hint: "Load an .omamake design (in a new window if this one holds work)", group: "File", modes: both, keys: "Ctrl O", run: () => root.load() },
             { name: "Save", hint: doc.filePath ? "Save to " + doc.filePath.split("/").pop() : "Save the design as an .omamake file", group: "File", modes: both, keys: "Ctrl S", run: () => root.save() },
-            { name: "Import STEP", words: "insert open stp step cad solid model file", hint: "Bring in a STEP file as a solid", group: "File", modes: ["model"], keys: "", run: () => root.importFrom(stepDialog) },
-            { name: "Import Mesh", words: "insert open stl obj mesh triangles 3d print model file", hint: "Bring in an STL or OBJ as a solid, flats merged", group: "File", modes: ["model"], keys: "", run: () => root.importFrom(meshDialog) },
-            { name: "Export", words: "save step stp cad file send fusion", hint: "Write the body to a file: STEP for now", group: "File", modes: ["model"], keys: "", run: () => root.exportBody() },
-            { name: "Fit Curved Surfaces", words: "facets mesh smooth round cylinder cone sphere convert repair triangles", hint: "Turn facets that follow a curve into true curved surfaces; undoable", group: "Modify", modes: ["model"], keys: "", run: () => doc.fitSurfaces() },
+            { name: "Import STEP", words: "insert open stp step cad solid model file", hint: "Bring in a STEP file as a solid", group: "File", modes: ["model"], keys: "", run: () => root.importFrom("step") },
+            { name: "Import Mesh", words: "insert open stl obj mesh triangles 3d print model file", hint: "Bring in an STL or OBJ as a solid, flats merged", group: "File", modes: ["model"], keys: "", run: () => root.importFrom("mesh") },
+            { name: "Export STEP", words: "export save step stp cad file send fusion body bodies component solid", hint: "Write a body, or every body in a component, to a STEP file: click it in the view or the Browser first", group: "File", modes: ["model"], keys: "", run: () => Qt.callLater(stepTool.begin) },
+            { name: "Export DXF", words: "export sketch sketches dxf drawing 2d save file fusion compare layers overlay", hint: "One sketch laid flat: which side faces you, a reference line for the bottom, dimensions optional; listed under the sketch to export again", group: "File", modes: ["model"], keys: "", run: () => Qt.callLater(dxfTool.begin) },
+            { name: "Fit Curved Surfaces", words: "facets mesh smooth round cylinder cone sphere convert repair triangles", hint: "Turn facets that follow a curve into true curved surfaces; undoable", group: "Modify", modes: ["model"], keys: "", run: () => meshAsk.ask() },
             { name: "Save As", hint: "Save the design under a new name", group: "File", modes: both, keys: "Ctrl Shift S", run: () => root.saveAs() },
             { name: "Quit OmaMake", hint: "Close the window", group: "App", modes: both, keys: "Ctrl Q", run: () => Qt.quit() }
         ].filter(c => (!c.onlyOmarchy || omarchyTheme.onOmarchy) && c.modes.includes(sketch.active ? "sketch" : "model"))
@@ -2320,8 +2464,15 @@ Window {
         readonly property var both: ["model", "sketch"]
     }
 
+    // Ctrl+Space: the command search from anywhere, even while a box is being typed in (a text box doesn't take
+    // Ctrl keys), and again to close it; never while a tool is in use (root.toolInUse, GB-087 follow-up), but
+    // always to close an open search. It was Alt+Space until Omarchy's dictation (Voxtype) took Alt+Space and
+    // the held Right Alt (owner, GB-087). Every window of the app: the Parameters window's too.
     Shortcut {
-        sequence: "Alt+Space"
+        id: searchAnywhereKey
+        sequence: "Ctrl+Space"
+        context: Qt.ApplicationShortcut
+        enabled: search.open || !root.toolInUse
         onActivated: search.toggle()
     }
     PlaneStyleMenu {
@@ -2336,49 +2487,146 @@ Window {
         anchorItem: modeButton
     }
 
-    // Esc, the app's one (owner pt158u, GB-056: "clicking escape should just escape out of any tool that I am
-    // using, period"): whatever focus has, the top layer goes. A question or menu first, then the
-    // dimension box, Create Sketch's pick, Find Profile Gaps' rings, panning, a model tool (Extrude: back
-    // from picking an object first; Chamfer, Fillet: nothing applied), a sketch drawing tool, picked
-    // constraint badges, the sketch itself (Finish Sketch, owner 2026-10-29), and last the selection.
-    // The tools' boxes don't take Esc themselves. A tool-options box being typed in (its list, a text's
-    // words) and the Parameters window keep their own Esc.
+    // Esc, the app's one (GB-056, then owner GB-081): every tool's Esc comes here, whatever focus has, so a new
+    // tool gets the same keys without doing anything.
+    //  - One Esc steps out of the part being used, never the tool: a question/menu/search shut; the dimension
+    //    box shut (nothing set, the Dimension tool stays on); a box being typed in let go (the text stays as
+    //    typed, neither confirmed nor undone; its highlight dropped; a font list shut); a pick waiting for its
+    //    click (Extrude's To Object, Export DXF's half-drawn bottom line) stopped; lit constraint badges, Find Profile Gaps' rings and the hand put away; with no tool on,
+    //    the selection cleared. In a sketch (owner, GB-081 correction): one Esc stops the sketch tool in use at
+    //    once (its box left too), puts a text being edited down, and never finishes the sketch (sketchEscStep). A part with more of its own says so with an escStep() that returns true
+    //    (asked from the focused item outwards: ToolOptions' font list, the Parameters window).
+    //  - Two Esc presses in quick succession (escKeys.interval: the double-click time, a fifth longer;
+    //    src/view/esckeys.h) leave the tool: the top one is cancelled (Extrude, Chamfer, Fillet, Export DXF,
+    //    Create Sketch's pick, the Parameters window, a question); in a sketch it's Finish Sketch, whether a
+    //    tool was on or not. The file dialogs (STEP,
+    //    DXF, Load, Save As) count the same way (escKeys.watchGtkDialogs).
     Shortcut {
         id: escKey
         sequence: "Esc"
         context: Qt.ApplicationShortcut
-        enabled: !parametersWindow.open && !toolOptions.typing && !textEdit.typing
-        onActivated: root.escTop()
+        onActivated: root.escPressed()
     }
-    function escTop() {
-        if (breakAsk.shown)
-            breakAsk.shown = false
-        else if (search.open)
-            search.open = false
-        else if (modeMenu.open)
-            modeMenu.close()
-        else if (planeMenu.open)
-            planeMenu.close()
-        else if (dimInput.open)
+    function escPressed() {
+        if (escKeys.press())
+            root.escExit()
+        else
+            root.escStep()
+    }
+    // A box being typed in: TextInput / TextEdit (they have both of these; so do TextField and TextArea, which
+    // inherit them). Used by Esc and by S (textBoxFocused).
+    function typingIn(item) {
+        return !!item && item.cursorPosition !== undefined && typeof item.deselect === "function"
+    }
+    // One Esc. True when something was stepped out of.
+    function escStep() {
+        if (search.open) { search.open = false; return true }
+        if (modeMenu.open) { modeMenu.close(); return true }
+        if (planeMenu.open) { planeMenu.close(); return true }
+        if (!parametersWindow.open && !breakAsk.shown && !meshAsk.shown && sketch.active)
+            return root.sketchEscStep()
+        if (dimInput.open) { dimInput.cancel(); return true }     // the box only
+        const focused = root.activeFocusItem
+        for (let f = focused; f; f = f.parent)
+            if (typeof f.escStep === "function" && f.escStep())
+                return true
+        if (typingIn(focused)) {
+            focused.deselect()
+            enterKey.forceActiveFocus()                           // the keys back to the window, the text as typed
+            return true
+        }
+        if (parametersWindow.open || breakAsk.shown || meshAsk.shown)
+            return false                                          // over everything: nothing under them is touched
+        if (extrudeTool.open && extrudeTool.stopPick())
+            return true
+        if (dxfTool.open && dxfTool.stopLine())
+            return true
+        if (stepTool.open && stepTool.stopHover())
+            return true
+        if (sketchTools.pickedConstraints.length) { sketchTools.pickedConstraints = []; return true }
+        if (root.gapsOn) { root.hideGaps(); return true }
+        if (navigation.panMode) { navigation.panMode = false; return true }
+        if (!root.toolInUse && selection.selected.length) {               // nothing on: the highlight goes
+            selection.clear()
+            return true
+        }
+        return false
+    }
+    // One Esc in a sketch (owner, GB-081 correction): the sketch tool in use stops at once, as before GB-081
+    // (a box of its being typed in is left too); a text being edited is put down as written; never the
+    // sketch itself, that's two quick presses.
+    function sketchEscStep() {
+        const focused = root.activeFocusItem
+        if (dimInput.open)
             dimInput.cancel()
+        if (sketchTools.tool) {
+            toolOptions.leave()
+            sketchTools.cancel()
+            if (typingIn(root.activeFocusItem))
+                enterKey.forceActiveFocus()
+            return true
+        }
+        if (textEdit.typing || textEdit.curve) {
+            textEdit.finish()                     // put down as written; nothing is removed
+            return true
+        }
+        if (typingIn(focused)) {
+            focused.deselect()
+            enterKey.forceActiveFocus()
+            return true
+        }
+        if (sketchTools.pickedConstraints.length) { sketchTools.pickedConstraints = []; return true }
+        if (root.gapsOn) { root.hideGaps(); return true }
+        if (navigation.panMode) { navigation.panMode = false; return true }
+        if (selection.selected.length) { selection.clear(); return true }
+        return false
+    }
+    // Two quick Esc presses: the top tool goes (the first press has already stepped out of its part).
+    // In a sketch it's Finish Sketch, tool or not (the first press has already stopped the tool).
+    // A tool in use (owner, GB-087 follow-up, t395u): the one test for it, the same tools a double Esc leaves
+    // (escExit below; keep the two in step when a tool is added) plus a file dialog or an import on its way.
+    // The search keys (S, Ctrl+Space) are off while it's true: finish or cancel the tool first. One Esc uses it
+    // too (escStep: with no tool on, the selection is cleared). In a sketch with no sketch tool on it's false.
+    readonly property bool toolInUse: parametersWindow.open || breakAsk.shown || meshAsk.shown || sketch.picking
+                                      || extrudeTool.open || dxfTool.open || stepTool.open || chamferTool.open || filletTool.open
+                                      || dimInput.open || sketchTools.tool !== "" || !!textEdit.curve
+                                      || doc.importing || filePicker.visible || saveDialog.visible || loadDialog.visible
+    function escExit() {
+        if (search.open) search.open = false
+        if (modeMenu.open) modeMenu.close()
+        if (planeMenu.open) planeMenu.close()
+        if (dimInput.open) dimInput.cancel()
+        if (parametersWindow.open)
+            parametersWindow.closeIt(false)
+        else if (breakAsk.shown)
+            breakAsk.shown = false
+        else if (meshAsk.shown) {
+            meshAsk.shown = false
+            meshAsk.redoing = null
+        }
+        else if (sketch.active) {
+            toolOptions.leave()
+            if (sketchTools.tool)
+                sketchTools.cancel()
+            if (textEdit.curve)
+                textEdit.finish()
+            sketchTools.pickedConstraints = []
+            sketch.finish()
+        }
         else if (sketch.picking)
             sketch.picking = false
-        else if (root.gapsOn)
-            root.hideGaps()
-        else if (navigation.panMode)
-            navigation.panMode = false
-        else if (extrudeTool.open)
+        else if (extrudeTool.open) {
+            extrudeTool.stopPick()
             extrudeTool.cancel()
+        }
+        else if (dxfTool.open)
+            dxfTool.cancel()
+        else if (stepTool.open)
+            stepTool.cancel()
         else if (chamferTool.open || filletTool.open) {
             chamferTool.cancel()
             filletTool.cancel()
-        } else if (sketchTools.tool)
-            sketchTools.cancel()                 // a drawing tool stops first, then the sketch
-        else if (sketchTools.pickedConstraints.length)
-            sketchTools.pickedConstraints = []
-        else if (sketch.active)
-            sketch.finish()
-        else
+        } else
             selection.clear()
     }
     // Sketch mode's keys (SketchKeys.js; owner, 2026-10-30): every sketch tool's and
@@ -2412,8 +2660,8 @@ Window {
                 root.runKey(c)
         }
     }
-    // E: Extrude, as in Fusion, with whatever profile or faces are selected. Model only: in a sketch
-    // E is Ellipse (SketchKeys.js), and a model tool never runs from a sketch.
+    // E: Extrude, as in Fusion, with whatever profile or faces are selected. This one is Model mode's; in a sketch
+    // E is the sketch keys' (oneKeys: Extrude's command, extrudeFromSketch, GB-083).
     Shortcut {
         id: extrudeKey
         sequence: "E"
@@ -2449,12 +2697,48 @@ Window {
             chamferTool.begin()
         }
     }
-    // S: the command search (Fusion's S opens its shortcuts box; Alt+Space works everywhere).
+    // S: the command search, in the model and in a sketch (Fusion's S opens its shortcuts box; owner, GB-087).
+    // Never while a text cursor is in a box (any TextInput / TextEdit that takes typing: the dimension box,
+    // Extrude's and the tools' number boxes, the search field, a sketch text, ...): there S is typed.
+    // Ctrl+Space works there too. Neither while a tool is in use (root.toolInUse; owner, GB-087 follow-up).
+    readonly property bool textBoxFocused: {
+        const f = root.activeFocusItem
+        return typingIn(f) && !f.readOnly
+    }
     Shortcut {
         id: searchKey
         sequence: "S"
-        enabled: root.sketchKeysOn
+        enabled: !root.textBoxFocused && !root.toolInUse && !search.open && !modeMenu.open && !planeMenu.open
         onActivated: search.toggle()
+    }
+    // Extrude from a sketch (owner, GB-083; Fusion's E in a sketch): the sketch is finished, as Fusion does when
+    // Extrude starts there, and Extrude opens with the closed profile areas that were selected in it (none: it
+    // waits for them, as when E is pressed in the model). A drawing tool on, a dimension box, a written text
+    // being edited are all put away first, as Finish Sketch does.
+    property var pendingExtrude: null
+    function extrudeFromSketch() {
+        if (!sketch.active || doc.working)
+            return
+        const profiles = selection.selected.filter(p => p.kind === "profile")
+        if (dimInput.open)
+            dimInput.cancel()
+        toolOptions.leave()
+        if (sketchTools.tool)
+            sketchTools.cancel()
+        if (textEdit.curve)
+            textEdit.finish()
+        sketchTools.pickedConstraints = []
+        root.pendingExtrude = profiles
+        sketch.finish()
+    }
+    function startPendingExtrude() {
+        const profiles = root.pendingExtrude
+        root.pendingExtrude = null
+        if (!profiles || sketch.active)
+            return
+        selection.selected = profiles
+        selection.redraw()
+        extrudeTool.begin()
     }
     function runKey(command) {
         if (sketchTools.tool && !command.keepsTool) {
@@ -2545,6 +2829,13 @@ Window {
         const next = doc.redoNext()
         if (!next.type)
             return
+        // A fit asks its two questions again (owner, 2026-11-11, moved to Fit 2026-11-12): the same answers
+        // put it back as it was, others fit again with them, Esc leaves it taken back.
+        if (next.type === "fit_surfaces" && !meshAsk.shown)
+            return meshAsk.ask(next)
+        redoNow(next)
+    }
+    function redoNow(next) {
         const run = () => {
             const action = doc.redo()
             if (action.type === "finish_sketch" && sketch.active)
@@ -2702,14 +2993,58 @@ Window {
         selection: selection
         previewA: extrudePreviewA
         previewB: extrudePreviewB
+        regionMask: cutMask
+        onArrowHeldChanged: if (arrowHeld > 0) selection.clearHover()
         wireA: extrudeWireA
+        cutFaces: cutResultFaces
+        cutEdges: cutResultEdges
         wireB: extrudeWireB
-        cutA: extrudeCutA
-        cutB: extrudeCutB
         project: p => root.toScreen(p)
         fadeMs: root.fadeMs
         z: 35
         onSay: (text, ms) => sketch.say(text, ms)
+    }
+    DxfTool {
+        id: dxfTool
+        anchors.fill: parent
+        theme: theme
+        fadeMs: root.fadeMs
+        z: 35
+        onSay: (text, ms) => sketch.say(text, ms)
+        onExportRequested: (id, way) => root.exportDxf(id, way)
+        toScreen: p => root.toScreen(p)
+        rayAt: (x, y) => selection.rayAt(x, y)
+        viewForward: () => camera.forward
+        lookAlong: (d, around) => navigation.lookAlong(d, around)
+        rollTo: (d, about) => navigation.rollTo(d, about)
+        viewRoll: navigation.roll
+        levelDegrees: sketchTools.levelDegrees
+        showHover: part => { selection.hovered = part; selection.redraw() }
+        hitOrigin: (x, y) => { const r = selection.rayAt(x, y), k = selection.perPixel(); return originShapes.hitAt(r.origin, r.direction, selection.pointPixels * k, selection.edgePixels * k) }
+        pickPart: (id, x, y) => {   // a point, line, arc or curve of the sketch, else a closed area of it, under the pointer
+            const r = selection.rayAt(x, y), k = selection.perPixel()
+            const hit = doc.pickSketch(id, r.origin, r.direction, selection.sketchPointPixels * k, selection.edgePixels * k, 15)
+            if (hit.kind)
+                return { kind: hit.kind, sketch: id, index: hit.index }
+            const area = doc.pickProfile([id], r.origin, r.direction)
+            return area.kind ? { kind: "profile", sketch: id, index: area.index, u: area.u, v: area.v } : null
+        }
+        pickLine: (id, x, y) => { const r = selection.rayAt(x, y), k = selection.perPixel(), hit = doc.pickSketch(id, r.origin, r.direction, k * 8, selection.edgePixels * k, 13); return hit.kind === "sketch_line" ? hit.index : 0 }   // 13: lines, construction, projected (no points)
+        viewTick: root.viewTick
+    }
+    // Export STEP's pick (GB-082): what to export, a body or a component; then the file picker.
+    StepTool {
+        id: stepTool
+        anchors.fill: parent
+        theme: theme
+        selection: selection
+        fadeMs: root.fadeMs
+        z: 35
+        onSay: (text, ms) => sketch.say(text, ms)
+        onExportRequested: (bodies, name) => root.exportBody(bodies, name)
+        // Another tool or a sketch taking over ends it (they set the view's clicks for themselves).
+        readonly property bool otherTool: extrudeTool.open || dxfTool.open || chamferTool.open || filletTool.open || sketch.active || sketch.picking
+        onOtherToolChanged: if (otherTool) cancel()
     }
     // Model Chamfer and Model Fillet: one tool (EdgeTool.qml), one at a time, sharing the preview's meshes.
     EdgeTool {
@@ -2739,6 +3074,7 @@ Window {
         onSay: (text, ms) => sketch.say(text, ms)
     }
     readonly property bool edgePreviewShown: chamferTool.previewShown || filletTool.previewShown
+
     Binding { target: doc; property: "chamferPreviewShown"; value: root.edgePreviewShown }
     ParametersWindow {
         id: parametersWindow
@@ -3165,6 +3501,332 @@ Window {
         }
     }
 
+    // What the mesh is (owner, 2026-11-10, round 4: "faceted holes and corners are almost never intended,
+    // so ask"), asked when Fit Curved Surfaces is run (owner, 2026-11-12: part of Fit, not of importing),
+    // in the "Break the link?" box's look. First: is it Low Poly styled (its facets are the look: Fit
+    // joins near-same-angle ones into flats and fits no curves)? If not: was it exported at a low
+    // resolution, a coarse mesh (Fit then takes a corner's curve from as few as 2 facets, and a whole hole
+    // or boss from 10 facets round it, fewer staying flat)? Worded as the export's coarseness, not the
+    // model's style (owner, round 6). The answer goes in the fit's step; Esc fits nothing.
+    Item {
+        id: meshAsk
+        objectName: "meshAsk"
+        property int step: 0            // 0: Low Poly?  1: low resolution?
+        property bool shown: false
+        property var redoing: null      // the fit step being redone, if asked for a redo
+        anchors.fill: parent
+        z: 90
+        opacity: shown ? 1 : 0
+        visible: opacity > 0
+        focus: shown
+        Behavior on opacity { NumberAnimation { duration: 150 } }
+        function ask(redo) {
+            redoing = redo || null
+            step = 0
+            shown = true
+        }
+        function answer(yes) {
+            if (step === 0 && !yes) {
+                step = 1
+                return
+            }
+            shown = false
+            const style = step === 0 ? "low_poly" : yes ? "low_res" : "detailed"
+            const redo = redoing
+            redoing = null
+            if (redo && style === (redo.style || "detailed"))
+                root.redoNow(redo)
+            else
+                doc.fitSurfaces(style)
+        }
+        Rectangle {
+            anchors.fill: parent
+            color: Qt.rgba(0, 0, 0, 0.35)
+            MouseArea { anchors.fill: parent }          // nothing behind it can be clicked
+        }
+        Rectangle {
+            anchors.centerIn: parent
+            width: 360
+            // Fixed to the taller of its two questions, so the box doesn't change size between them.
+            height: 196
+            radius: 12
+            color: theme.panelBg
+            border.color: theme.borderStrong
+            Text {
+                id: meshAskText
+                x: 22
+                y: 20
+                width: parent.width - 44
+                text: (meshAsk.shown && doc.fitName() ? "Fit " + doc.fitName() + "\n" : "") + (meshAsk.step === 0 ? "Is this a Low Poly styled model?"
+                                         : "Was it exported at a low resolution (a coarse mesh)?")
+                color: theme.textPrimary
+                font.pixelSize: 14
+                font.bold: true
+                wrapMode: Text.WordWrap
+            }
+            Text {
+                x: 22
+                y: meshAskText.y + meshAskText.implicitHeight + 8
+                width: parent.width - 44
+                text: meshAsk.step === 0
+                      ? "Yes: its flat facets are the look. Facets at nearly the same angle are joined into one flat, and it isn't fitted to curves."
+                      : "This is about how finely the file was exported, not the model's style. Yes: its round holes and corners came out as a few flat facets each. Fit then rounds a corner from two facets, and a hole from 10 facets round it."
+                color: theme.textSecondary
+                font.pixelSize: 12
+                wrapMode: Text.WordWrap
+            }
+            Row {
+                anchors.right: parent.right
+                anchors.rightMargin: 18
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: 16
+                spacing: 10
+                Repeater {
+                    model: [{ label: "No", yes: false }, { label: "Yes", yes: true }]
+                    delegate: Rectangle {
+                        required property var modelData
+                        objectName: "meshAsk" + modelData.label
+                        width: 70
+                        height: 32
+                        radius: 8
+                        color: meshArea.containsMouse ? theme.controlHover : Qt.rgba(theme.panelRaised.r, theme.panelRaised.g, theme.panelRaised.b, 1)
+                        border.width: 1.5
+                        border.color: theme.border
+                        Text {
+                            anchors.centerIn: parent
+                            text: parent.modelData.label
+                            color: theme.textPrimary
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+                        MouseArea {
+                            id: meshArea
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: meshAsk.answer(parent.modelData.yes)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // GB-089 (owner, 2026-11-16): the memory guard's popup. Heavy work ran the system's free memory under 15 %
+    // (src/document/recovery.cpp): every job has been told to stop, the design is in its recovery file, and OmaMake
+    // closes itself 3 s after this shows, before the system's out-of-memory killer would (that took the whole
+    // desktop session once). In the "Fit" questions' look; nothing behind it can be clicked.
+    Item {
+        id: memoryStop
+        objectName: "memoryStop"
+        property string message: ""
+        property string detail: ""
+        property bool shown: false
+        anchors.fill: parent
+        z: 1000
+        visible: shown
+        function show(text, more) {
+            message = text
+            detail = more
+            shown = true
+            recovery.acknowledge()
+            memoryClose.start()
+        }
+        Timer {
+            id: memoryClose
+            interval: 3000
+            onTriggered: recovery.closeNow()
+        }
+        Rectangle {
+            anchors.fill: parent
+            color: Qt.rgba(0, 0, 0, 0.45)
+            MouseArea { anchors.fill: parent }
+        }
+        Rectangle {
+            anchors.centerIn: parent
+            width: 400
+            height: memoryText.implicitHeight + memoryDetail.implicitHeight + 64
+            radius: 12
+            color: theme.panelBg
+            border.color: theme.danger
+            border.width: 1.5
+            Text {
+                id: memoryText
+                x: 22
+                y: 20
+                width: parent.width - 44
+                text: memoryStop.message
+                color: theme.textPrimary
+                font.pixelSize: 15
+                font.bold: true
+                wrapMode: Text.WordWrap
+            }
+            Text {
+                id: memoryDetail
+                x: 22
+                y: memoryText.y + memoryText.implicitHeight + 10
+                width: parent.width - 44
+                text: memoryStop.detail
+                color: theme.textSecondary
+                font.pixelSize: 12
+                wrapMode: Text.WordWrap
+            }
+        }
+    }
+    Connections {
+        target: recovery
+        function onMemoryLow(message, detail) { memoryStop.show(message, detail) }
+    }
+
+    // GB-089: at start, a design left by a memory stop (or by a window that ended without closing) is offered.
+    // Recover opens it; after a memory stop, as it stood 2 Timeline items before the operation (the owner: "saving
+    // progress 2 history items prior to this issue"), the newest state kept beside it to Load. No sets
+    // the file aside (~/.local/state/omamake/recovery/set-aside, the newest 5 kept), so a wrong click loses nothing.
+    Item {
+        id: recoverAsk
+        objectName: "recoverAsk"
+        property var info: ({})
+        property bool shown: false
+        property var restored: null
+        property double waitFrom: 0
+        anchors.fill: parent
+        z: 950
+        opacity: shown ? 1 : 0
+        visible: opacity > 0
+        focus: shown
+        Behavior on opacity { NumberAnimation { duration: 150 } }
+        readonly property bool memory: info.reason === "memory"
+        readonly property bool goesBack: memory && info.rewindTo < info.steps
+        function ask() {
+            info = recovery.pending
+            if (info && info.reason)
+                shown = true
+        }
+        function answer(yes) {
+            shown = false
+            if (!yes) {
+                recovery.decline()
+                return
+            }
+            const p = info
+            const r = recovery.recover()
+            if (r.why)
+                return sketch.say(r.why, 8000)
+            const label = (p.name && p.name !== "(Unsaved)" ? p.name : "the unsaved design") + (p.filePath ? "" : " (not saved to a file yet: use Save to keep it)")
+            if (r.mode === "earlier") {
+                // The state 2 items before the operation, from its own recovery file; the newest is kept to Load.
+                return sketch.say("Recovered " + label + " from the memory stop " + p.when + ", as it stood " + r.itemsBack + " history item"
+                                  + (r.itemsBack === 1 ? "" : "s") + " before the operation that ran out of memory. The newer state is kept as "
+                                  + String(r.newest).replace(/^\/home\/[^\/]+/, "~") + " (Load it to get those items back).", 25000)
+            }
+            if (r.mode === "newest")
+                return sketch.say("Recovered " + label + " as it was last kept, " + p.when + ".", 15000)
+            restored = p
+            waitFrom = Date.now()
+            sketch.say("Recovering " + (p.name || "the design") + "…", 60000)
+            recoverStep.start()
+        }
+        // No file of the earlier state (steps made too quickly to be written one by one): the newest was opened, and
+        // the marker goes back once the opened file's steps are built again (Document modelReadyFrom).
+        Timer {
+            id: recoverStep
+            interval: 250
+            repeat: true
+            onTriggered: {
+                const p = recoverAsk.restored
+                const label = (p.name && p.name !== "(Unsaved)" ? p.name : "the unsaved design") + (p.filePath ? "" : " (not saved to a file yet: use Save to keep it)")
+                const ready = doc.modelBuildDone && doc.modelReadyFrom <= p.rewindTo && !doc.working && !doc.importing
+                if (!ready && Date.now() - recoverAsk.waitFrom < 120000)
+                    return
+                stop()
+                if (!ready || doc.rewindTo(p.rewindTo) !== p.rewindTo) {
+                    sketch.say("Recovered " + label + " from the memory stop " + p.when + ", at its newest step (the Timeline's marker couldn't go back over the opened steps).", 15000)
+                    return
+                }
+                const behind = doc.future.filter(a => !a.in_sketch && a.type !== "finish_sketch" && a.type !== "edit_sketch").length
+                sketch.say("Recovered " + label + " from the memory stop " + p.when + ": shown " + behind + " history item" + (behind === 1 ? "" : "s")
+                           + " before the operation that ran out of memory. Drag the Timeline's marker forward to bring "
+                           + (behind === 1 ? "it" : "them") + " back.", 20000)
+            }
+        }
+        Rectangle {
+            anchors.fill: parent
+            color: Qt.rgba(0, 0, 0, 0.35)
+            MouseArea { anchors.fill: parent }
+        }
+        Rectangle {
+            anchors.centerIn: parent
+            width: 420
+            height: recoverTitle.implicitHeight + recoverText.implicitHeight + 92
+            radius: 12
+            color: theme.panelBg
+            border.color: theme.borderStrong
+            Text {
+                id: recoverTitle
+                x: 22
+                y: 20
+                width: parent.width - 44
+                text: recoverAsk.memory ? "Recover the design from the memory stop?" : "Recover the design OmaMake was closed with?"
+                color: theme.textPrimary
+                font.pixelSize: 14
+                font.bold: true
+                wrapMode: Text.WordWrap
+            }
+            Text {
+                id: recoverText
+                x: 22
+                y: recoverTitle.y + recoverTitle.implicitHeight + 8
+                width: parent.width - 44
+                text: {
+                    const i = recoverAsk.info
+                    const what = (i.name && i.name !== "(Unsaved)" ? "\"" + i.name + "\"" : "the design") + (i.filePath ? " (" + i.filePath.split("/").pop() + ")" : " (never saved to a file)")
+                    if (recoverAsk.memory)
+                        return "OmaMake closed " + i.when + " because system memory was running low. Recover " + what
+                               + (recoverAsk.goesBack ? " as it stood 2 history items before the operation that used the memory? The newest state is kept too, to Load if you want those items back."
+                                                      : "?")
+                    return "OmaMake ended without closing " + i.when + ". Recover " + what + " as it was last kept?"
+                }
+                color: theme.textSecondary
+                font.pixelSize: 12
+                wrapMode: Text.WordWrap
+            }
+            Row {
+                anchors.right: parent.right
+                anchors.rightMargin: 18
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: 16
+                spacing: 10
+                Repeater {
+                    model: [{ label: "No", yes: false }, { label: "Recover", yes: true }]
+                    delegate: Rectangle {
+                        required property var modelData
+                        objectName: "recoverAsk" + modelData.label
+                        width: 84
+                        height: 32
+                        radius: 8
+                        color: recoverArea.containsMouse ? theme.controlHover : Qt.rgba(theme.panelRaised.r, theme.panelRaised.g, theme.panelRaised.b, 1)
+                        border.width: 1.5
+                        border.color: theme.border
+                        Text {
+                            anchors.centerIn: parent
+                            text: parent.modelData.label
+                            color: theme.textPrimary
+                            font.pixelSize: 12
+                            font.bold: true
+                        }
+                        MouseArea {
+                            id: recoverArea
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: recoverAsk.answer(parent.modelData.yes)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // A faint hint at the top until the search has been opened 3 times (owner, 2026-10-29:
     // learnt by then). It steps aside for the sketch bar and the search itself, which
     // use the same spot.
@@ -3177,7 +3839,7 @@ Window {
         radius: height / 2
         color: Qt.rgba(theme.panelBg.r, theme.panelBg.g, theme.panelBg.b, 0.6)
         border.color: Qt.rgba(theme.border.r, theme.border.g, theme.border.b, 0.6)
-        opacity: search.timesOpened >= 3 || search.open || sketch.active || sketch.picking || extrudeTool.open || chamferTool.open || filletTool.open ? 0 : 0.85
+        opacity: search.timesOpened >= 3 || search.open || sketch.active || sketch.picking || extrudeTool.open || chamferTool.open || filletTool.open || dxfTool.open || stepTool.open ? 0 : 0.85
         visible: opacity > 0
         Behavior on opacity { NumberAnimation { duration: 400 } }
 
@@ -3185,7 +3847,9 @@ Window {
             id: hintRow
             anchors.centerIn: parent
             spacing: 8
-            KeyCap { theme: theme; text: "Alt" }
+            KeyCap { theme: theme; text: "S" }
+            Text { anchors.verticalCenter: parent.verticalCenter; text: "or"; color: theme.textSecondary; font.pixelSize: 13 }
+            KeyCap { theme: theme; text: "Ctrl" }
             KeyCap { theme: theme; text: "Space" }
             Text {
                 anchors.verticalCenter: parent.verticalCenter

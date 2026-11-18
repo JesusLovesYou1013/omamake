@@ -1,8 +1,10 @@
 .pragma library
 
 // Sketch mode's keys (owner, 2026-10-30): every drawing tool and constraint has one. They work
-// only inside a sketch and only reach sketch tools; a model tool never runs from a sketch, so a
-// clash with one of Fusion's model keys doesn't matter (F is the sketch Fillet here).
+// only inside a sketch and only reach sketch tools, with one exception: E is Extrude, as in Fusion
+// (owner, GB-083): it finishes the sketch and starts Extrude with the profile areas selected in it
+// (Main.extrudeFromSketch; Extrude's own command keeps its E). Ellipse has no key, as in Fusion
+// (search only). Otherwise a clash with one of Fusion's model keys doesn't matter (F is the sketch Fillet here).
 //   plain letter   drawing and modifying (Fusion's own where it has one: L R C D T O X M)
 //   Shift+letter   constraints
 //   Alt+letter     the less used drawing and modifying tools
@@ -13,7 +15,6 @@ var keys = {
     // drawing and modifying
     "Line": { keys: "L", letter: "l" },
     "Sketch Dimension": { keys: "D", letter: "d" },
-    "Ellipse": { keys: "E", letter: "e" },
     "Conic Curve": { keys: "Q", letter: "q" },
     "Fillet": { keys: "F", letter: "f" },
     "Offset": { keys: "O", letter: "o" },

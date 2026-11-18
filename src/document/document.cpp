@@ -1,9 +1,14 @@
+#include <QVector4D>
+#include <cstring>
+#include <QCryptographicHash>
 #include <QQuickWindow>
 #include <QKeyEvent>
 #include <qpa/qwindowsysteminterface.h>
 #include <QMouseEvent>
 #include <QCoreApplication>
 #include "document/document.h"
+#include "engine/stop.h"
+#include "view/regionmask.h"
 
 #include "view/meshgeometry.h"
 #include "document/profiles.h"
@@ -17,6 +22,12 @@
 #include <QFontDatabase>
 #include <QElapsedTimer>
 #include <QThread>
+#include <QThreadPool>
+#include <QImage>
+#include <manifold/manifold.h>
+#include <unordered_map>
+#include <numeric>
+#include <QEventLoop>
 #include <QTimer>
 #include <QPointer>
 #include <QDir>
@@ -39,10 +50,11 @@
 #include <array>
 #include <set>
 
+static std::size_t sketchStamp(const SketchGeometry &g);   // what a sketch is, for what is kept from it
+
 Document::Document(std::unique_ptr<omamake::GeometryEngine> engine, QObject *parent, bool background)
     : QObject(parent), m_engine(std::move(engine)) {
     m_background = background;
-    connect(this, &Document::structureChanged, this, [this] { m_profiles.clear(); });
     if (background)
         return;
     m_buildTimer = new QTimer(this);
@@ -289,7 +301,10 @@ QJsonObject Document::toJson() const {
     for (const QString &k : m_hidden)
         hidden.append(k);
 
-    return {{QStringLiteral("format"), QStringLiteral("omamake")},
+    // The meshes imported bodies came in as, each once, named by every solid saved from one (so a
+    // Fit after reopening reads the file's own triangles, as it did before saving).
+    std::map<std::string, std::string> sources;
+    QJsonObject out{{QStringLiteral("format"), QStringLiteral("omamake")},
             {QStringLiteral("version"), 1},
             {QStringLiteral("saved_at"), QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)},
             {QStringLiteral("engine"), engineName()},
@@ -313,6 +328,15 @@ QJsonObject Document::toJson() const {
                  return all;
              }()},
             {QStringLiteral("next_parameter"), m_nextParameter},
+            {QStringLiteral("dxf_exports"), m_dxfExports},
+            {QStringLiteral("sketch_changed_at"), [&] {      // when each sketch last changed (Export DXF's out-of-date mark)
+                 stampSketches();
+                 QJsonObject all;
+                 for (const auto &[id, c] : m_sketchChanged)
+                     if (c.second.isValid() && m_sketches.count(id))
+                         all.insert(QString::number(id), c.second.toString(Qt::ISODateWithMs));
+                 return all;
+             }()},
             {QStringLiteral("history"), [&] {          // a Project run still open is saved as done
                  QJsonArray all = m_actions;
                  for (int i = 0; i < all.size(); ++i) {
@@ -325,7 +349,13 @@ QJsonObject Document::toJson() const {
                      // the file holds it: the body unchanged since (it's in "solids") or the last import (body_file).
                      const auto own = m_importSolids.find(a.value(QStringLiteral("at")).toString());
                      if (own != m_importSolids.end() && !m_bodies.count(a.value(QStringLiteral("body")).toInt()) && own->second != m_bodyFile) {
-                         a.insert(QStringLiteral("solid"), QString::fromLatin1(own->second.toBase64()));
+                         const PackedText &packed = packedText(m_importText[own->first], own->second, true);   // GB-089: made once
+                         a.insert(QStringLiteral("solid"), packed.text);
+                         if (!packed.source.isEmpty()) {
+                             a.insert(QStringLiteral("solid_source"), packed.source);
+                             if (!sources.count(packed.source.toStdString()))
+                                 sources[packed.source.toStdString()];   // its mesh made below, once
+                         }
                          all[i] = a;
                      }
                  }
@@ -333,17 +363,58 @@ QJsonObject Document::toJson() const {
              }()},
             {QStringLiteral("solids"), [&] {           // every body's exact solid (Heavy engine; Lite can't save)
                  QJsonArray all;
+                 // GB-089: each solid's text made once and kept (a body's solid never changes: an operation makes a
+                 // new one with a new number), so the recovery file, written after every step, costs little.
                  for (const auto &entry : m_bodies) {
-                     const std::string bytes = m_engine->saveBody(omamake::BodyId(entry.first));
-                     if (bytes.empty())
+                     auto kept = m_solidText.find(entry.first);
+                     if (kept == m_solidText.end() && m_laterSolids) {   // the recovery's writer makes it (GB-089)
+                         m_laterSolids->push_back({entry.first, m_engine->saveBodyLater(omamake::BodyId(entry.first))});
                          continue;
-                     all.append(QJsonObject{{QStringLiteral("id"), entry.first},
-                                            {QStringLiteral("file"), QString::fromLatin1(qCompress(QByteArray::fromRawData(bytes.data(), qsizetype(bytes.size()))).toBase64())}});
+                     }
+                     if (kept == m_solidText.end()) {
+                         SolidText made;
+                         const std::string bytes = m_engine->saveBody(omamake::BodyId(entry.first));
+                         if (!bytes.empty()) {
+                             made.file = QString::fromLatin1(qCompress(QByteArray::fromRawData(bytes.data(), qsizetype(bytes.size()))).toBase64());
+                             made.source = QString::fromStdString(m_engine->sourceOf(bytes));
+                         }
+                         kept = m_solidText.emplace(entry.first, std::move(made)).first;
+                     }
+                     if (kept->second.file.isEmpty())
+                         continue;
+                     QJsonObject one{{QStringLiteral("id"), entry.first}, {QStringLiteral("file"), kept->second.file}};
+                     if (const QString &source = kept->second.source; !source.isEmpty()) {
+                         one.insert(QStringLiteral("source"), source);
+                         if (!sources.count(source.toStdString()))
+                             sources[source.toStdString()];   // its mesh made below, once
+                     }
+                     all.append(one);
                  }
+                 for (auto it = m_solidText.begin(); it != m_solidText.end();)
+                     it = m_bodies.count(it->first) ? std::next(it) : m_solidText.erase(it);
                  return all;
              }()},
-            {QStringLiteral("body_file"), QString::fromLatin1(m_bodyFile.toBase64())},
-            {QStringLiteral("step_file"), QString::fromLatin1(m_stepFile.toBase64())}};
+            {QStringLiteral("body_file"), packedText(m_bodyFileText, m_bodyFile, true).text},
+            {QStringLiteral("step_file"), packedText(m_stepFileText, m_stepFile, false).text}};
+    if (const QString source = m_bodyFileText.source; !source.isEmpty()) {
+        out.insert(QStringLiteral("body_file_source"), source);
+        if (!sources.count(source.toStdString()))
+            sources[source.toStdString()];   // its mesh made below, once
+    }
+    if (!sources.empty()) {
+        QJsonArray all;
+        for (const auto &entry : sources) {
+            const std::string &name = entry.first;
+            auto &text = m_sourceText[name];      // GB-089: made once per imported mesh
+            if (text.isEmpty()) {
+                const std::string mesh = m_engine->sourceBytes(name);
+                text = QString::fromLatin1(qCompress(QByteArray::fromRawData(mesh.data(), qsizetype(mesh.size()))).toBase64());
+            }
+            all.append(QJsonObject{{QStringLiteral("name"), QString::fromStdString(name)}, {QStringLiteral("mesh"), text}});
+        }
+        out.insert(QStringLiteral("sources"), all);
+    }
+    return out;
 }
 
 QString Document::saveTo(const QString &path) {
@@ -394,11 +465,19 @@ QString Document::exportName() const {
     return m_body ? m_bodies.at(int(m_body)).name : m_components.front().name;
 }
 
-QString Document::exportTo(const QString &path) {
+QString Document::exportTo(const QString &path, const QVariantList &bodies) {
     if (m_importing || m_working)
         return QStringLiteral("Wait for the import to finish.");
-    if (!m_body)
+    if (!m_body || m_bodies.empty())
         return QStringLiteral("There's no body to export.");
+    // The bodies asked for (Export STEP's pick, GB-082), taken in the design's own order, so the whole
+    // design picked gives exactly the file every body always gave.
+    std::set<int> wanted;
+    for (const QVariant &b : bodies)
+        wanted.insert(b.toInt());
+    const auto counts = [&](int id) { return wanted.empty() || wanted.count(id) > 0; };
+    if (!wanted.empty() && std::none_of(m_bodies.begin(), m_bodies.end(), [&](const auto &e) { return wanted.count(e.first) > 0; }))
+        return QStringLiteral("That has no bodies to export.");
     QString target = path;
     if (target.startsWith(QLatin1String("file://")))
         target = QUrl(target).toLocalFile();
@@ -410,6 +489,8 @@ QString Document::exportTo(const QString &path) {
     // Every body, joined into one solid for the file (STEP here holds a single shape).
     omamake::BodyId all = 0;
     for (const auto &entry : m_bodies) {
+        if (!counts(entry.first))
+            continue;
         const omamake::BodyId one = omamake::BodyId(entry.first);
         if (!all) {
             all = one;
@@ -432,6 +513,13 @@ QString Document::exportTo(const QString &path) {
     return {};
 }
 
+// The answers asked on Fit Curved Surfaces, as the engine takes them.
+static omamake::MeshStyle meshStyleOf(const QString &style) {
+    return style == QLatin1String("low_poly") ? omamake::MeshStyle::LowPoly
+           : style == QLatin1String("low_res") ? omamake::MeshStyle::LowRes
+                                               : omamake::MeshStyle::Detailed;
+}
+
 void Document::importFile(const QString &path) {
     const QString file = path.startsWith(QLatin1String("file://")) ? QUrl(path).toLocalFile() : path;
     if (m_importing || m_working)
@@ -444,6 +532,7 @@ void Document::importFile(const QString &path) {
     // Off the main thread so the window stays alive; the engine is left alone until it's back
     // (undo, save and load wait while `importing`).
     QThread *worker = QThread::create([this, file] {
+        const omamake::HeavyScope heavy;   // GB-089: the memory guard watches while this runs
         QElapsedTimer clock;
         clock.start();
         auto stage = [this](const char *text) {
@@ -465,7 +554,7 @@ void Document::importFile(const QString &path) {
             packed = qCompress(QByteArray::fromRawData(bytes.data(), qsizetype(bytes.size())));
         }
         const double seconds = clock.elapsed() / 1000.0;
-        QMetaObject::invokeMethod(this, [this, body, meshFile, mesh = std::move(mesh), packed, seconds, why] {
+        QMetaObject::invokeMethod(this, [this, file, body, meshFile, mesh = std::move(mesh), packed, seconds, why] {
             m_importing = false;
             emit importChanged();
             if (!body) {
@@ -475,10 +564,10 @@ void Document::importFile(const QString &path) {
             m_bodyFile = packed;
             placeImport(body, m_importName);
             m_importSolids[QString()] = packed;           // keyed by the record's time stamp just below
-            record({{QStringLiteral("type"), meshFile ? QStringLiteral("import_mesh") : QStringLiteral("import_step")},
-                    {QStringLiteral("body"), int(body)},
-                    {QStringLiteral("name"), m_importName}},
-                   QStringLiteral("Imported %1").arg(m_importName));
+            QJsonObject step{{QStringLiteral("type"), meshFile ? QStringLiteral("import_mesh") : QStringLiteral("import_step")},
+                             {QStringLiteral("body"), int(body)},
+                             {QStringLiteral("name"), m_importName}};
+            record(step, QStringLiteral("Imported %1").arg(m_importName));
             m_importSolids[m_actions.last().toObject().value(QStringLiteral("at")).toString()] = m_importSolids[QString()];
             m_importSolids.erase(QString());
             m_meshCache[int(body)] = std::move(mesh);     // already made off the main thread
@@ -491,17 +580,17 @@ void Document::importFile(const QString &path) {
     worker->start();
 }
 
-void Document::fitSurfaces() {
+void Document::fitSurfaces(const QString &style) {
     if (m_importing || m_working)
         return;
     if (!m_body) {
-        emit fitFinished(QStringLiteral("There's no body to fit."), 0, 0, 0, 0, 0, 0);
+        emit fitFinished(QStringLiteral("There's no body to fit."), 0, 0, 0, 0, 0, 0, 0);
         return;
     }
     // Fitting a fit only blurs it: the first went from the facets, the second from its own drawing.
     for (const QJsonValue &v : m_actions)
         if (v.toObject().value(QStringLiteral("type")).toString() == QLatin1String("fit_surfaces")) {
-            emit fitFinished(QStringLiteral("This body is already fitted; undo that to fit it again."), 0, 0, 0, 0, 0, 0);
+            emit fitFinished(QStringLiteral("This body is already fitted; undo that to fit it again."), 0, 0, 0, 0, 0, 0, 0);
             return;
         }
     m_importing = true;
@@ -510,7 +599,9 @@ void Document::fitSurfaces() {
     emit importChanged();
 
     const omamake::BodyId from = m_body;
-    QThread *worker = QThread::create([this, from] {
+    const QString kept = meshStyleOf(style) == omamake::MeshStyle::Detailed ? QStringLiteral("detailed") : style;
+    QThread *worker = QThread::create([this, from, kept, style = meshStyleOf(kept)] {
+        const omamake::HeavyScope heavy;   // GB-089: the memory guard watches while this runs
         QElapsedTimer clock;
         clock.start();
         auto stage = [this](const char *text) {
@@ -521,7 +612,7 @@ void Document::fitSurfaces() {
         };
         std::string why;
         omamake::FitResult result;
-        const omamake::BodyId body = m_engine->fitSurfaces(from, kFitShare, result, why, stage);
+        const omamake::BodyId body = m_engine->fitSurfaces(from, kFitShare, style, result, why, stage);
         omamake::Mesh mesh;
         QByteArray packed;
         if (body) {
@@ -531,17 +622,17 @@ void Document::fitSurfaces() {
             packed = qCompress(QByteArray::fromRawData(bytes.data(), qsizetype(bytes.size())));
         }
         const double seconds = clock.elapsed() / 1000.0;
-        QMetaObject::invokeMethod(this, [this, from, body, result, mesh = std::move(mesh), packed, seconds, why] {
+        QMetaObject::invokeMethod(this, [this, from, kept, body, result, mesh = std::move(mesh), packed, seconds, why] {
             m_importing = false;
             emit importChanged();
             if (!body) {
-                emit fitFinished(QString::fromStdString(why), seconds, 0, 0, 0, 0, 0);
+                emit fitFinished(QString::fromStdString(why), seconds, 0, 0, 0, 0, 0, 0);
                 return;
             }
             m_beforeFit.push_back({m_body, m_bodyFile});
             swapBody(int(from), body);
             m_bodyFile = packed;
-            record({{QStringLiteral("type"), QStringLiteral("fit_surfaces")}, {QStringLiteral("body"), int(body)}},
+            record({{QStringLiteral("type"), QStringLiteral("fit_surfaces")}, {QStringLiteral("body"), int(body)}, {QStringLiteral("style"), kept}},
                    QStringLiteral("Fit Curved Surfaces"));
             // Its result, for the Timeline's background rebuild of an opened file: Fit works from the triangles the
             // mesh came in as, which a file doesn't keep, so the rebuild takes the fitted body as it was made.
@@ -549,7 +640,7 @@ void Document::fitSurfaces() {
             m_meshCache[int(body)] = std::move(mesh);     // already made off the main thread
             refreshMesh();
             emit changed();
-            emit fitFinished({}, seconds, result.cylinders, result.cones, result.spheres, result.trianglesLeft, result.worstMm);
+            emit fitFinished({}, seconds, result.cylinders, result.cones, result.spheres, result.bowls, result.trianglesLeft, result.worstMm);
         }, Qt::QueuedConnection);
     });
     connect(worker, &QThread::finished, worker, &QObject::deleteLater);
@@ -584,6 +675,70 @@ void Document::addCube(double sizeMm) {
            QStringLiteral("Placed a %1 mm cube (Body1)").arg(sizeMm));
     refreshMesh();
     emit changed();
+}
+
+QJsonObject Document::recoveryState(std::vector<LaterSolid> &later) {
+    if (m_importing || m_working)
+        return {};
+    std::unique_lock<std::mutex> turn(m_engineLock, std::try_to_lock);   // a worker on the engine: not now
+    if (!turn.owns_lock())
+        return {};
+    // A solid not made into text before (the new body of the step just made) is written by the recovery's writer,
+    // off this thread: its work is taken here, the solid itself is never changed.
+    std::vector<std::pair<int, std::function<std::string()>>> missing;
+    m_laterSolids = &missing;
+    QJsonObject out = toJson();
+    m_laterSolids = nullptr;
+    for (auto &[body, write] : missing)
+        if (write)
+            later.push_back({body, std::move(write)});
+    return out;
+}
+
+const Document::PackedText &Document::packedText(PackedText &kept, const QByteArray &bytes, bool withSource) const {
+    if (kept.of.constData() != bytes.constData() || kept.of.size() != bytes.size() || (kept.text.isEmpty() && !bytes.isEmpty())) {
+        kept.of = bytes;
+        kept.text = QString::fromLatin1(bytes.toBase64());
+        kept.source = withSource && !bytes.isEmpty() ? QString::fromStdString(m_engine->sourceOf(qUncompress(bytes).toStdString())) : QString();
+    }
+    return kept;
+}
+
+int Document::recoveryRows(int steps) const {
+    int rows = 0;
+    for (int i = 0; i < std::min(steps, int(m_actions.size())); ++i) {
+        const QJsonObject a = m_actions[i].toObject();
+        const QString type = a.value(QStringLiteral("type")).toString();
+        rows += !(a.contains(QStringLiteral("in_sketch")) || type == QLatin1String("finish_sketch") || type == QLatin1String("edit_sketch"));
+    }
+    return rows;
+}
+
+int Document::recoveryRewindTo() const {
+    std::vector<int> rows;            // the design row's items (HistoryTimeline.fresh): a sketch's own steps aren't
+    for (int i = 0; i < int(m_actions.size()); ++i) {
+        const QJsonObject a = m_actions[i].toObject();
+        const QString type = a.value(QStringLiteral("type")).toString();
+        if (a.contains(QStringLiteral("in_sketch")) || type == QLatin1String("finish_sketch") || type == QLatin1String("edit_sketch"))
+            continue;
+        rows.push_back(i);
+    }
+    if (rows.size() < 2)
+        return int(m_actions.size());
+    return rows[std::max<std::size_t>(1, rows.size() - 2)];   // the history before the second-to-last item
+}
+
+QString Document::openRecovered(const QString &path, const QString &filePath, const QString &name) {
+    const QString why = openFrom(path);
+    if (!why.isEmpty())
+        return why;
+    m_filePath = filePath;
+    if (!name.isEmpty())
+        m_components.front().name = name;
+    qInfo().noquote() << "recovered:" << path << "as" << (filePath.isEmpty() ? QStringLiteral("(not saved)") : filePath);
+    emit fileChanged();
+    emit structureChanged();
+    return {};
 }
 
 bool Document::untouched() const {
@@ -827,17 +982,37 @@ QString Document::openFrom(const QString &path) {
     m_meshCache.clear();
     m_params.clear();
     m_nextParameter = 1;
+    m_dxfExports = d.value(QStringLiteral("dxf_exports")).toArray();
+    m_sketchChanged.clear();
+    m_savedChanged.clear();
+    {
+        const QJsonObject at = d.value(QStringLiteral("sketch_changed_at")).toObject();
+        for (auto it = at.begin(); it != at.end(); ++it)
+            m_savedChanged.insert(it.key().toInt(), QDateTime::fromString(it.value().toString(), Qt::ISODateWithMs));
+    }
+    m_stampsFromFile = true;
 
     // Bodies: made again by their history (so far only the starting cube), then the file's
     // components and bodies take over; the engine may number bodies differently, so their keys follow.
     m_components = {rootComponent()};
     // A design saved with every body's solid (several bodies): they come back as they were; the
     // saved ids stand for the new ones. Older files rebuild their one body from the history below.
+    std::map<QString, std::string> sources;          // the meshes imported bodies came in as (see toJson)
+    for (const QJsonValue &v : d.value(QStringLiteral("sources")).toArray()) {
+        const QJsonObject o = v.toObject();
+        sources[o.value(QStringLiteral("name")).toString()] = qUncompress(QByteArray::fromBase64(o.value(QStringLiteral("mesh")).toString().toLatin1())).toStdString();
+    }
+    const auto tieSource = [&](const std::string &bytes, const QString &name) {
+        if (const auto found = sources.find(name); !name.isEmpty() && found != sources.end())
+            m_engine->addSource(bytes, name.toStdString(), found->second);
+    };
     std::map<int, int> solidOf;
     for (const QJsonValue &v : d.value(QStringLiteral("solids")).toArray()) {
         const QJsonObject o = v.toObject();
         const QByteArray packed = QByteArray::fromBase64(o.value(QStringLiteral("file")).toString().toLatin1());
-        const omamake::BodyId id = m_engine->loadBody(qUncompress(packed).toStdString());
+        const std::string bytes = qUncompress(packed).toStdString();
+        tieSource(bytes, o.value(QStringLiteral("source")).toString());
+        const omamake::BodyId id = m_engine->loadBody(bytes);
         if (id)
             solidOf[o.value(QStringLiteral("id")).toInt()] = int(id);
         else
@@ -849,6 +1024,7 @@ QString Document::openFrom(const QString &path) {
         if (!haveSolids && a.value(QStringLiteral("type")).toString() == QLatin1String("cube"))
             buildCube(a.value(QStringLiteral("size_mm")).toDouble());
         m_bodyFile = QByteArray::fromBase64(d.value(QStringLiteral("body_file")).toString().toLatin1());
+        tieSource(qUncompress(m_bodyFile).toStdString(), d.value(QStringLiteral("body_file_source")).toString());
         const QString kind = a.value(QStringLiteral("type")).toString();
         if (haveSolids) {
             // the solids are already back
@@ -898,7 +1074,9 @@ QString Document::openFrom(const QString &path) {
         }
         if (a.contains(QStringLiteral("solid"))) {      // an import's own solid (see save)
             m_importSolids[a.value(QStringLiteral("at")).toString()] = QByteArray::fromBase64(a.value(QStringLiteral("solid")).toString().toLatin1());
+            tieSource(qUncompress(m_importSolids[a.value(QStringLiteral("at")).toString()]).toStdString(), a.value(QStringLiteral("solid_source")).toString());
             a.remove(QStringLiteral("solid"));
+            a.remove(QStringLiteral("solid_source"));
         }
         a.insert(QStringLiteral("undoable"), false);     // done before it was saved
         m_actions.append(a);
@@ -2009,6 +2187,7 @@ void Document::startBuild() {
     QPointer<Document> self(this);
     qInfo().noquote() << "timeline: building the opened file's" << plan.size() << "design steps again in the background";
     QThread *worker = QThread::create([self, gen, cancel, lite, plan = std::move(plan)] {
+        const omamake::HeavyScope heavy;   // GB-089: the memory guard watches while this runs
         QElapsedTimer clock;
         clock.start();
         auto out = std::make_shared<Arrived>();
@@ -2247,7 +2426,9 @@ void Document::loadSome() {
     if (m_importing || m_working)
         return;
     Arrived &a = *m_arrived;
-    const auto stop = [this](const QString &why) {
+    // GB-089: `why` taken as a copy: a.why lives in *m_arrived, freed by the reset below (it was read after being
+    // freed; seen as a crash a few seconds after opening a file whose steps can't be built again, e.g. a recovery).
+    const auto stop = [this](const QString why) {
         m_arrived.reset();
         m_buildTimer->stop();
         m_buildWhy = why;
@@ -2681,8 +2862,19 @@ QVariantMap Document::componentNode(const Component &c) const {
     QVariantList bodies, sketches;
     for (int id : c.bodies)
         bodies << node(QStringLiteral("b%1").arg(id), "body", m_bodies.at(id).name);
-    for (int id : c.sketches)
-        sketches << node(QStringLiteral("s%1").arg(id), "sketch", m_sketches.at(id).name);
+    for (int id : c.sketches) {
+        QVariantList exports;           // Export DXF's rows, under the sketch they came from (double-click: again)
+        for (int i = 0; i < m_dxfExports.size(); ++i) {
+            const QJsonObject e = m_dxfExports[i].toObject();
+            if (e.value(QStringLiteral("sketch")).toInt() != id)
+                continue;
+            QVariantMap row = node(QStringLiteral("x%1").arg(i), "dxf", QFileInfo(e.value(QStringLiteral("path")).toString()).fileName());
+            row.insert(QStringLiteral("row"), i);
+            row.insert(QStringLiteral("path"), e.value(QStringLiteral("path")).toString());
+            exports << row;
+        }
+        sketches << node(QStringLiteral("s%1").arg(id), "sketch", m_sketches.at(id).name, exports);
+    }
     if (!bodies.isEmpty())
         children << node(k + QStringLiteral("/bodies"), "folder", QStringLiteral("Bodies"), bodies);
     if (!sketches.isEmpty())
@@ -4069,9 +4261,10 @@ static void snapToExact(std::vector<std::vector<projection::Piece>> &loops, cons
 // circles it adds are counted; returns why nothing went on, or empty. Shared by one face and a batch.
 static QString putOutlineOnSketch(SketchGeometry &g, const std::vector<std::array<projection::Flat, 3>> &triangles, double size,
                                   int &lines, int &arcs, int &circles, const std::vector<omamake::FlatCurve> &exact = {},
-                                  const std::vector<omamake::Point2> &corners = {}) {
+                                  const std::vector<omamake::Point2> &corners = {}, bool outsideOnly = false) {
     const double tol = std::max(0.012, size / 25000);   // twice how far the drawn triangles may stray
-    std::vector<std::vector<projection::Piece>> loops = projection::outline(triangles, tol);
+    // outsideOnly: the whole model, its outside only (GB-095)
+    std::vector<std::vector<projection::Piece>> loops = projection::outline(triangles, tol, outsideOnly);
     snapToExact(loops, exact, corners, 2 * tol);
     if (loops.empty()) {
         // A flat face seen edge on throws no shadow: it's the line between its furthest points.
@@ -4300,27 +4493,42 @@ QVariantMap Document::projectIntoSketch(int sketch, int face) {
         return refuse(QStringLiteral("The model is made after this sketch, so it can't be projected into it."));
     Named &s = found->second;
     SketchGeometry &g = s.geometry;
-    // Exactly what the model has (owner, 2026-11-06), from the engine's own edges and surfaces.
+    // Exactly what the model has (owner, 2026-11-06), from the engine's own edges and surfaces. The outline,
+    // the lines it puts on the sketch and the areas they make are worked out off the window's thread.
     {
         std::vector<std::vector<omamake::FlatPiece>> loops;
-        QString why;
-        const int exact = exactShadow(s.plane, face, loops, why);
+        QString why, nothing;
+        int exact = 0, link = 0;
+        const SketchGeometry before = g;
+        SketchGeometry made = g;
+        PutCounts n;
+        KeptProfiles areas;
+        std::shared_ptr<const CurveIndex> curves;
+        const QVariantMap plane = s.plane;
+        offUiThread(QStringLiteral("Projecting"), [&] {
+            exact = exactShadow(plane, face, loops, why);
+            if (exact <= 0)
+                return;
+            nothing = putPiecesOnSketch(made, loops, n);
+            if (!nothing.isEmpty())
+                return;
+            link = addBodyLink(made, before, face < 0);
+            areas = workOutAreas(made);
+            curves = curveIndexOf(made, areas.stamp);
+        });
         if (exact < 0)
             return refuse(why);
         if (exact > 0) {
-            const SketchGeometry before = g;
-            PutCounts n;
-            if (const QString nothing = putPiecesOnSketch(g, loops, n); !nothing.isEmpty()) {
-                g = before;
+            if (!nothing.isEmpty())
                 return refuse(nothing);
-            }
+            g = std::move(made);
+            keepWorkedOut(sketch, g, std::move(areas), std::move(curves));
             const int snapshot = m_nextSnapshot++;
             m_snapshots[snapshot] = before;
             QString summary = QStringLiteral("Projected %1 onto the sketch (%2 lines, %3 arcs, %4 circles")
                                   .arg(face < 0 ? QStringLiteral("the whole model") : QStringLiteral("a face"))
                                   .arg(n.lines).arg(n.arcs).arg(n.circles);
             summary += n.curves ? QStringLiteral(", %1 curves)").arg(n.curves) : QStringLiteral(")");
-            const int link = addBodyLink(g, before, face < 0);
             record({{QStringLiteral("type"), QStringLiteral("shape")}, {QStringLiteral("sketch"), sketch},
                     {QStringLiteral("snapshot"), snapshot}, {QStringLiteral("link"), link}}, summary);
             sketchesEdited();
@@ -4353,7 +4561,7 @@ QVariantMap Document::projectIntoSketch(int sketch, int face) {
     std::vector<omamake::FlatCurve> exact;
     std::vector<omamake::Point2> corners;
     exactEdges(s.plane, face, exact, corners);
-    if (const QString why = putOutlineOnSketch(g, triangles, size, lines, arcs, circles, exact, corners); !why.isEmpty()) {
+    if (const QString why = putOutlineOnSketch(g, triangles, size, lines, arcs, circles, exact, corners, face < 0); !why.isEmpty()) {
         g = before;
         return refuse(why);
     }
@@ -4386,7 +4594,8 @@ QVariantList Document::projectFacesIntoSketch(int sketch, const QVariantList &fa
         return results;
     }
     Named &s = found->second;
-    SketchGeometry &g = s.geometry;
+    SketchGeometry &live = s.geometry;
+    SketchGeometry g = live;   // worked on off the window's thread, put in when done
     const QVector3D origin = s.plane.value(QStringLiteral("origin")).value<QVector3D>();
     const QVector3D xAxis = s.plane.value(QStringLiteral("xAxis")).value<QVector3D>();
     const QVector3D yAxis = s.plane.value(QStringLiteral("yAxis")).value<QVector3D>();
@@ -4404,7 +4613,10 @@ QVariantList Document::projectFacesIntoSketch(int sketch, const QVariantList &fa
     }
     const double size = std::hypot(std::hypot(m_mesh.max[0] - m_mesh.min[0], m_mesh.max[1] - m_mesh.min[1]), m_mesh.max[2] - m_mesh.min[2]);
     const SketchGeometry before = g;
-    int made = 0;
+    int made = 0, link = 0;
+    KeptProfiles areas;
+    std::shared_ptr<const CurveIndex> curves;
+    offUiThread(QStringLiteral("Projecting"), [&] {
     for (const QVariant &f : faces) {
         // Exactly what the face has (owner, 2026-11-06).
         std::vector<std::vector<omamake::FlatPiece>> loops;
@@ -4443,9 +4655,16 @@ QVariantList Document::projectFacesIntoSketch(int sketch, const QVariantList &fa
         results << QVariant(QVariantMap{{QStringLiteral("lines"), lines}, {QStringLiteral("arcs"), arcs}, {QStringLiteral("circles"), circles}});
     }
     if (made) {
+        link = addBodyLink(g, before, false);
+        areas = workOutAreas(g);
+        curves = curveIndexOf(g, areas.stamp);
+    }
+    });
+    if (made) {
+        live = std::move(g);
+        keepWorkedOut(sketch, live, std::move(areas), std::move(curves));
         const int snapshot = m_nextSnapshot++;
         m_snapshots[snapshot] = before;
-        const int link = addBodyLink(g, before, false);
         record({{QStringLiteral("type"), QStringLiteral("shape")}, {QStringLiteral("sketch"), sketch},
                 {QStringLiteral("snapshot"), snapshot}, {QStringLiteral("link"), link}},
                QStringLiteral("Projected %1 faces onto the sketch").arg(made));
@@ -5651,22 +5870,47 @@ QString Document::setSketchDimension(int sketch, int constraint, double value, c
     return {};
 }
 
-void Document::testMouse(QObject *window, const QString &kind, double x, double y) {
+void Document::testMouse(QObject *window, const QString &kind, double x, double y, int modifiers) {
     if (!qEnvironmentVariableIsSet("OMAMAKE_TEST_INPUT"))
         return;
     auto *w = qobject_cast<QQuickWindow *>(window);
     if (!w)
         return;
     const QPointF at(x, y);
-    const bool press = kind == QLatin1String("press"), release = kind == QLatin1String("release");
-    QMouseEvent ev(press ? QEvent::MouseButtonPress : release ? QEvent::MouseButtonRelease : QEvent::MouseMove, at, w->mapToGlobal(at),
-                   press || release ? Qt::LeftButton : Qt::NoButton, release ? Qt::NoButton : (press ? Qt::LeftButton : Qt::LeftButton), Qt::NoModifier);
+    // "double": the double-click a second press makes (sent between that press and its release).
+    const bool dbl = kind == QLatin1String("double");
+    // "drag": a move with the left button held (between a press and its release).
+    const bool press = kind == QLatin1String("press") || dbl, release = kind == QLatin1String("release"), drag = kind == QLatin1String("drag");
+    QMouseEvent ev(dbl ? QEvent::MouseButtonDblClick : press ? QEvent::MouseButtonPress : release ? QEvent::MouseButtonRelease : QEvent::MouseMove,
+                   at, w->mapToGlobal(at), press || release ? Qt::LeftButton : Qt::NoButton, press || drag ? Qt::LeftButton : Qt::NoButton,
+                   Qt::KeyboardModifiers(modifiers));
     const bool ok = QCoreApplication::sendEvent(w, &ev);
     Q_UNUSED(ok)
 }
 
 // Test-only (env OMAMAKE_TEST_INPUT): one key press and release sent to the window, so Enter in a
 // field can be tried the way a keyboard does it.
+namespace {
+std::atomic<int> g_testSaves{0};
+}
+void Document::testSaveImage(const QVariant &image, const QString &path) const {
+    if (!qEnvironmentVariableIsSet("OMAMAKE_TEST_INPUT"))
+        return;
+    const QImage picture = image.value<QImage>();
+    if (picture.isNull())
+        return;
+    ++g_testSaves;
+    QThreadPool::globalInstance()->start([picture, path] { picture.save(path); --g_testSaves; });
+}
+int Document::testSavesPending() const {
+    return g_testSaves.load();
+}
+QVariantList Document::testExtrudeLog(bool clear) {
+    QVariantList out = m_testExtrudeLog;
+    if (clear)
+        m_testExtrudeLog.clear();
+    return out;
+}
 void Document::testKey(QObject *window, int key, const QString &text, int modifiers) {
     if (!qEnvironmentVariableIsSet("OMAMAKE_TEST_INPUT"))
         return;
@@ -6368,6 +6612,605 @@ QVariantList Document::sketchOutlines(int sketch, int allow) const {
     return out;
 }
 
+// Export DXF (owner, 2026-11-13; Grok Bot while Claude's usage was out): the sketches picked, in one .dxf, each on
+// its own layer, where they sit in the model (so sketches on different planes overlay as they are). mm, ASCII R12.
+// Lines, arcs and circles stay true LINE / ARC / CIRCLE; other curves (splines, ellipses, text) go as 3D polylines
+// along their drawn path. Construction and helper lines are left out, as in a profile. Returns "" or why not.
+QString Document::exportSketchesDxf(const QString &path, const QVariantList &sketches) const {
+    QString target = path.startsWith(QLatin1String("file://")) ? QUrl(path).toLocalFile() : path;
+    if (target.isEmpty())
+        return QStringLiteral("No file name.");
+    if (!target.endsWith(QLatin1String(".dxf"), Qt::CaseInsensitive))
+        target += QStringLiteral(".dxf");
+    QString layers, ents;
+    std::set<QString> used;
+    const auto num = [](double v) { return QString::number(std::abs(v) < 1e-12 ? 0.0 : v, 'g', 15); };
+    for (const QVariant &which : sketches) {
+        const auto found = m_sketches.find(which.toInt());
+        if (found == m_sketches.end())
+            continue;
+        const Named &s = found->second;
+        const SketchGeometry &g = s.geometry;
+        const QString base = QString(s.name).replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9_$-]")), QStringLiteral("_"));
+        QString layer = base;                           // R12 layer names: letters, digits, _ - $ only; one each
+        for (int k = 2; used.count(layer.toUpper()); ++k)
+            layer = base + QStringLiteral("-%1").arg(k);
+        used.insert(layer.toUpper());
+        layers += QStringLiteral("0\nLAYER\n2\n%1\n70\n0\n62\n%2\n6\nCONTINUOUS\n").arg(layer).arg(int(used.size() - 1) % 7 + 1);
+        double o[3], x[3], y[3];
+        planeAxes(s.plane, o, x, y);
+        const auto at = [&](const SketchGeometry::Point &p) {
+            return std::array<double, 3>{o[0] + x[0] * p.u + y[0] * p.v, o[1] + x[1] * p.u + y[1] * p.v, o[2] + x[2] * p.u + y[2] * p.v};
+        };
+        const auto xyz = [&](int code, const std::array<double, 3> &p) {
+            return QStringLiteral("%1\n%2\n%3\n%4\n%5\n%6\n").arg(code).arg(num(p[0])).arg(code + 10).arg(num(p[1])).arg(code + 20).arg(num(p[2]));
+        };
+        const auto dot = [](const std::array<double, 3> &a, const std::array<double, 3> &b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+        const auto cross = [](const std::array<double, 3> &a, const std::array<double, 3> &b) {
+            return std::array<double, 3>{a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+        };
+        const auto unit = [&](std::array<double, 3> a) { const double l = std::sqrt(dot(a, a)); return std::array<double, 3>{a[0] / l, a[1] / l, a[2] / l}; };
+        // Arcs' plane (DXF's OCS): the sketch's normal turned to face +Z (or +Y, +X) so flat sketches read as plain 2D;
+        // turned, counter-clockwise on the sketch runs the other way. The arbitrary-axis rule gives the OCS's X and Y.
+        std::array<double, 3> n = unit(cross({x[0], x[1], x[2]}, {y[0], y[1], y[2]}));
+        const double lead = std::abs(n[2]) > 1e-9 ? n[2] : std::abs(n[1]) > 1e-9 ? n[1] : n[0];
+        const bool turned = lead < 0;
+        if (turned)
+            n = {-n[0], -n[1], -n[2]};
+        const std::array<double, 3> ax = unit(std::abs(n[0]) < 1.0 / 64 && std::abs(n[1]) < 1.0 / 64 ? cross({0, 1, 0}, n) : cross({0, 0, 1}, n));
+        const std::array<double, 3> ay = cross(n, ax);
+        const QString head = QStringLiteral("8\n%1\n").arg(layer);
+        const QString normal = QStringLiteral("210\n%1\n220\n%2\n230\n%3\n").arg(num(n[0]), num(n[1]), num(n[2]));
+        for (const auto &[id, l] : g.lines)
+            if (!g.helperLines.count(id) && !lineHidden(g, l.a, l.b) && (lineClass(g, id, l) & (kLineClass | kProjectedClass)))
+                ents += QStringLiteral("0\nLINE\n") + head + xyz(10, at(g.points.at(l.a))) + xyz(11, at(g.points.at(l.b)));
+        for (const auto &[id, k] : g.arcs) {
+            if (g.helperArcs.count(id) || lineHidden(g, k.c, k.c) || !(arcClass(g, id, k) & (kLineClass | kProjectedClass)))
+                continue;
+            const auto c = at(g.points.at(k.c));
+            const std::array<double, 3> oc{dot(c, ax), dot(c, ay), dot(c, n)};
+            const auto angle = [&](int p) {
+                const auto q = at(g.points.at(p));
+                const std::array<double, 3> d{q[0] - c[0], q[1] - c[1], q[2] - c[2]};
+                const double deg = std::atan2(dot(d, ay), dot(d, ax)) * 180 / M_PI;
+                return deg < 0 ? deg + 360 : deg;
+            };
+            ents += (k.circle() ? QStringLiteral("0\nCIRCLE\n") : QStringLiteral("0\nARC\n")) + head + xyz(10, oc) + QStringLiteral("40\n%1\n").arg(num(g.radius(id)));
+            if (!k.circle())
+                ents += QStringLiteral("50\n%1\n51\n%2\n").arg(num(angle(turned ? k.b : k.a)), num(angle(turned ? k.a : k.b)));
+            ents += normal;
+        }
+        for (const auto &[id, k] : g.curves) {
+            if (!(curveClass(g, id, k) & (kLineClass | kProjectedClass)))
+                continue;
+            for (const auto &run : g.curvePath(id)) {
+                if (run.size() < 2)
+                    continue;
+                ents += QStringLiteral("0\nPOLYLINE\n") + head + QStringLiteral("66\n1\n10\n0\n20\n0\n30\n0\n70\n8\n");
+                for (const auto &p : run)
+                    ents += QStringLiteral("0\nVERTEX\n") + head + xyz(10, at(p)) + QStringLiteral("70\n32\n");
+                ents += QStringLiteral("0\nSEQEND\n") + head;
+            }
+        }
+    }
+    if (used.empty())
+        return QStringLiteral("Pick a sketch to export first.");
+    QSaveFile file(target);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text))
+        return QStringLiteral("Couldn't write %1.").arg(QFileInfo(target).fileName());
+    file.write((QStringLiteral("0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1009\n9\n$INSUNITS\n70\n4\n0\nENDSEC\n"
+                               "0\nSECTION\n2\nTABLES\n0\nTABLE\n2\nLTYPE\n70\n1\n0\nLTYPE\n2\nCONTINUOUS\n70\n0\n3\nSolid line\n72\n65\n73\n0\n40\n0.0\n0\nENDTAB\n"
+                               "0\nTABLE\n2\nLAYER\n70\n%1\n").arg(used.size())
+                + layers + QStringLiteral("0\nENDTAB\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n") + ents
+                + QStringLiteral("0\nENDSEC\n0\nEOF\n")).toUtf8());
+    return file.commit() ? QString() : QStringLiteral("Couldn't write %1.").arg(QFileInfo(target).fileName());
+}
+
+QVariantList Document::dxfBottomLine(int sketch, const QVariantMap &way) const {
+    const QVariantList drawn = way.value(QStringLiteral("bottom")).toList();
+    const auto found = m_sketches.find(sketch);
+    if (drawn.size() != 4 || found == m_sketches.end())
+        return {};
+    const double u0 = drawn[0].toDouble(), v0 = drawn[1].toDouble();
+    const QString relation = way.value(QStringLiteral("relation")).toString();
+    const QVariantMap ref = way.value(QStringLiteral("ref")).toMap();
+    if (relation.isEmpty() || ref.isEmpty())
+        return drawn;
+    // The reference's direction now: one of the sketch's axes, or a line of it (any kind).
+    const SketchGeometry &g = found->second.geometry;
+    double ru = 1, rv = 0;
+    if (ref.value(QStringLiteral("kind")).toString() == QLatin1String("axis")) {
+        // The origin's X, Y or Z axis: only one lying in the sketch's plane counts (else the line as drawn).
+        const QString name = ref.value(QStringLiteral("axis")).toString();
+        const QVector3D dir(name == QLatin1String("X"), name == QLatin1String("Y"), name == QLatin1String("Z"));
+        const QVariantMap &pl = found->second.plane;
+        const QVector3D x = pl.value(QStringLiteral("xAxis")).value<QVector3D>(), y = pl.value(QStringLiteral("yAxis")).value<QVector3D>();
+        const QVector3D n = QVector3D::crossProduct(x, y).normalized();
+        if (std::abs(QVector3D::dotProduct(dir, n)) > 1e-6 || std::abs(QVector3D::dotProduct(pl.value(QStringLiteral("origin")).value<QVector3D>(), n)) > 1e-4)
+            return drawn;
+        ru = QVector3D::dotProduct(dir, x) / x.lengthSquared(), rv = QVector3D::dotProduct(dir, y) / y.lengthSquared();
+    } else {
+        const auto l = g.lines.find(ref.value(QStringLiteral("id")).toInt());
+        if (l == g.lines.end())
+            return drawn;                          // that line is gone: the line as it was drawn
+        const auto &a = g.points.at(l->second.a), &b = g.points.at(l->second.b);
+        ru = b.u - a.u, rv = b.v - a.v;
+    }
+    const double rl = std::hypot(ru, rv);
+    if (rl < 1e-12)
+        return drawn;
+    // The line's direction is the reference's turned back by the relation (the reference then sits that far
+    // counter-clockwise from the line, as seen; from the sketch's back that's the other way): Parallel 0,
+    // Perpendicular either way, Angle as typed. A line has no head, so half a turn more is the same; of these, the
+    // one nearest the line as drawn is kept, so the sketch turns the least.
+    const double typed = relation == QLatin1String("angle") ? -way.value(QStringLiteral("angle")).toDouble() : 0;
+    const std::vector<double> turns = relation == QLatin1String("perpendicular") ? std::vector<double>{90, -90}
+                                    : std::vector<double>{typed, typed + 180};
+    const bool flip = way.value(QStringLiteral("flip")).toBool();
+    const double wu = drawn[2].toDouble() - u0, wv = drawn[3].toDouble() - v0, len = std::hypot(wu, wv);
+    double du = 0, dv = 0, best = -2;
+    for (double turn : turns) {
+        const double t = (flip ? -turn : turn) * M_PI / 180, c = std::cos(t), s = std::sin(t);
+        const double eu = (c * ru - s * rv) / rl, ev = (s * ru + c * rv) / rl;
+        const double near = len > 1e-9 ? (eu * wu + ev * wv) / len : eu;
+        if (near > best + 1e-12)
+            best = near, du = eu, dv = ev;
+    }
+    const double keep = len > 1e-9 ? len : 10;
+    return {u0, v0, u0 + du * keep, v0 + dv * keep};
+}
+
+// When each sketch last changed (owner, 2026-11-13): a sketch whose drawing differs from when it was last looked
+// at is stamped with the time now. Not while the Timeline's marker is back (that only shows the past). A sketch
+// first seen here is new in this session (now), except right after a file opened: those take the saved times.
+void Document::stampSketches() const {
+    if (rolledBack())
+        return;
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    for (const auto &[id, s] : m_sketches) {
+        const QByteArray sig = QCryptographicHash::hash(QJsonDocument(geometryJson(s.geometry, &s)).toJson(QJsonDocument::Compact),
+                                                        QCryptographicHash::Sha1);
+        auto found = m_sketchChanged.find(id);
+        if (found == m_sketchChanged.end())
+            m_sketchChanged[id] = {sig, m_stampsFromFile ? m_savedChanged.value(id) : now};
+        else if (found->second.first != sig)
+            found->second = {sig, now};
+    }
+    m_stampsFromFile = false;
+}
+
+QVariantList Document::dxfOutdated() const {
+    stampSketches();
+    QVariantList out;
+    for (int i = 0; i < m_dxfExports.size(); ++i) {
+        const QJsonObject e = m_dxfExports[i].toObject();
+        const auto changed = m_sketchChanged.find(e.value(QStringLiteral("sketch")).toInt());
+        const QDateTime made = QDateTime::fromString(e.value(QStringLiteral("exported_at")).toString(), Qt::ISODateWithMs);
+        if (changed != m_sketchChanged.end() && changed->second.second.isValid() && made.isValid() && changed->second.second > made)
+            out << i;
+    }
+    return out;
+}
+
+QVariantMap Document::dxfExport(int row) const {
+    if (row < 0 || row >= m_dxfExports.size())
+        return {};
+    QVariantMap out = m_dxfExports[row].toObject().toVariantMap();
+    const auto found = m_sketches.find(out.value(QStringLiteral("sketch")).toInt());
+    if (found == m_sketches.end())
+        return {};
+    out.insert(QStringLiteral("name"), found->second.name);
+    return out;
+}
+
+// ---- Dimensions in Export DXF (owner, 2026-11-13): drawn exactly as the sketch shows them ----
+// The sketch draws a dimension's value in a tag at its place (pinned on the sketch in mm when it first shows,
+// moved only by dragging), a dashed line from the tag back to what it measures when that's more than 14 px off,
+// a thin line between the two points measured (all but a line's own length), and for an angle a dashed arc
+// with an arrow at each end and dashed lines out from the lines' ends (Main.qml: placeLabels, the dimension
+// delegate, angleLook, AngleMarks). The file draws the same, at the same places. What the sketch sizes in screen
+// pixels (text, arrows, dashes, the 14 px) takes the size it has with the sketch filling the window.
+namespace {
+
+// Millimetres a screen pixel covers with the sketch filling the window: Navigation.fitTo of the sketch's points'
+// box (radius half its diagonal, 40 degree view, 1.6 back) in a view about 990 px tall, as DxfTool.face() shows it.
+double dxfPixelMm(const std::map<int, SketchGeometry::Point> &points, const std::function<bool(int)> &hidden) {
+    double lo[2] = {1e300, 1e300}, hi[2] = {-1e300, -1e300};
+    for (const auto &[id, p] : points) {
+        if (hidden(id))
+            continue;
+        lo[0] = std::min(lo[0], p.u), lo[1] = std::min(lo[1], p.v), hi[0] = std::max(hi[0], p.u), hi[1] = std::max(hi[1], p.v);
+    }
+    const double radius = lo[0] <= hi[0] ? std::max(1.0, std::hypot(hi[0] - lo[0], hi[1] - lo[1]) / 2) : 1;
+    const double half = 20 * M_PI / 180, distance = radius / std::sin(half) * 1.6;
+    return 2 * distance * std::tan(half) / 990;
+}
+
+// Units.js inUnit / show: the value as the sketch's tag shows it.
+QString dimInUnit(double mm, const QString &unit) {
+    const auto trimmed = [](QString t) {
+        if (t.contains(QLatin1Char('.'))) {
+            while (t.endsWith(QLatin1Char('0')))
+                t.chop(1);
+            if (t.endsWith(QLatin1Char('.')))
+                t.chop(1);
+        }
+        return t == QLatin1String("-0") ? QStringLiteral("0") : t;
+    };
+    if (unit == QLatin1String("deg"))
+        return trimmed(QString::number(mm * 180 / M_PI, 'f', 2)) + QChar(0xB0);
+    struct U { const char *name; double mm; int decimals; bool imperial; };
+    static const U units[] = {{"in", 25.4, 3, true}, {"ft", 304.8, 3, true}, {"mm", 1, 2, false}, {"cm", 10, 3, false}, {"m", 1000, 4, false}};
+    const U *u = &units[0];
+    for (const U &k : units)
+        if (unit == QLatin1String(k.name))
+            u = &k;
+    const QString fixed = QString::number(mm / u->mm, 'f', u->decimals);
+    return (u->imperial ? fixed : trimmed(fixed)) + QLatin1Char(' ') + QLatin1String(u->name);
+}
+QString dimShown(double mm, const QString &unit) {
+    if (unit == QLatin1String("deg"))
+        return dimInUnit(mm, unit);
+    const bool known = unit == QLatin1String("in") || unit == QLatin1String("ft") || unit == QLatin1String("mm")
+                       || unit == QLatin1String("cm") || unit == QLatin1String("m");
+    const QString main = known ? unit : QStringLiteral("in");
+    const bool imperial = main == QLatin1String("in") || main == QLatin1String("ft");
+    return dimInUnit(mm, main) + QStringLiteral(" (") + dimInUnit(mm, imperial ? QStringLiteral("mm") : QStringLiteral("in")) + QLatin1Char(')');
+}
+
+// A dimension's two measured points as the sketch shows them (Document::sketchDimensions: a gap between lines
+// a quarter of the way along them).
+bool dimEnds(const SketchGeometry &g, const SketchGeometry::Constraint &c, SketchGeometry::Point &a, SketchGeometry::Point &b) {
+    double now = 0;
+    if (!c.isDimension() || c.follows() || !g.measure(c.type, c.first, c.second, now, a, b))
+        return false;
+    if (c.type == QLatin1String("lineline")) {
+        const auto l = g.line(c.second);
+        const SketchGeometry::Point p = g.point(l.a), q = g.point(l.b);
+        const double du = (p.u - q.u) / 4, dv = (p.v - q.v) / 4;
+        a = {a.u + du, a.v + dv};
+        b = {b.u + du, b.v + dv};
+    }
+    return true;
+}
+
+// Main.qml angleLook in sketch millimetres (px: mm per screen pixel): the arc's corner, radius, start and sweep
+// (radians), the two arms, its value's place, and whether it shows the other side's angle. False: no corner.
+struct AngleLook { double xu, xv, r, from, sweep, a1u, a1v, a2u, a2v, spotU, spotV, along1, along2; bool flipped; QVariantMap f; };
+bool dimAngleLook(const SketchGeometry &g, const SketchGeometry::Constraint &c, double px, AngleLook &out) {
+    const QVariantMap f = angleFrame(g, c.first, c.second);
+    if (f.isEmpty() || f.value(QStringLiteral("parallel")).toBool())
+        return false;
+    const auto v2 = [&](const char *k, int i) { return f.value(QLatin1String(k)).toList()[i].toDouble(); };
+    const double Xu = v2("cross", 0), Xv = v2("cross", 1), e1u = v2("e1", 0), e1v = v2("e1", 1), e2u = v2("e2", 0), e2v = v2("e2", 1);
+    const double den = e1u * e2v - e1v * e2u;
+    const double m1u = (v2("ends1", 0) + v2("ends1", 2)) / 2, m1v = (v2("ends1", 1) + v2("ends1", 3)) / 2;
+    const double m2u = (v2("ends2", 0) + v2("ends2", 2)) / 2, m2v = (v2("ends2", 1) + v2("ends2", 3)) / 2;
+    const double t1 = (m1u - Xu) * e1u + (m1v - Xv) * e1v, t2 = (m2u - Xu) * e2u + (m2v - Xv) * e2v;
+    const int side = c.u < 0 ? -1 : 1;
+    double s1, s2, r = std::min(150.0, std::max(90.0, std::min(std::abs(t1), std::abs(t2)) / px * 0.6)) * px;
+    double wu = 0, wv = 0;
+    if (c.labelU || c.labelV)
+        wu = e1u * c.labelU + e2u * c.labelV, wv = e1v * c.labelU + e2v * c.labelV;
+    if (std::hypot(wu, wv) > 1e-9) {
+        const double a = (wu * e2v - wv * e2u) / den, b = (e1u * wv - e1v * wu) / den;
+        s1 = a < 0 ? -1 : 1;
+        s2 = b < 0 ? -1 : 1;
+        if (c.labelPlaced)
+            r = std::hypot(wu, wv);
+    } else if (std::abs(t1) >= std::abs(t2)) {
+        s1 = t1 < 0 ? -1 : 1;
+        s2 = s1 * side;
+    } else {
+        s2 = t2 < 0 ? -1 : 1;
+        s1 = s2 * side;
+    }
+    if (!c.labelPlaced)                       // a pinned one is exactly where it was left (no 50 px floor)
+        r = std::max(50 * px, r);
+    out.f = f;
+    out.xu = Xu, out.xv = Xv, out.r = r;
+    out.a1u = e1u * s1, out.a1v = e1v * s1, out.a2u = e2u * s2, out.a2v = e2v * s2;
+    out.from = std::atan2(out.a1v, out.a1u);
+    out.sweep = std::atan2(out.a1u * out.a2v - out.a1v * out.a2u, out.a1u * out.a2u + out.a1v * out.a2v);
+    out.flipped = int(s1 * s2) != side;
+    const double half = out.from + out.sweep / 2, au = r * std::cos(half), av = r * std::sin(half);
+    out.spotU = Xu + au, out.spotV = Xv + av;
+    out.along1 = (au * e2v - av * e2u) / den, out.along2 = (e1u * av - e1v * au) / den;
+    return true;
+}
+
+// Where a dimension never shown in this version's sketch is pinned (Main.qml dimensionSpot): a line's own length
+// 20 px out to the side that's up as seen (left for an upright line), the others at their middle; an angle in the
+// middle of its arc. Offsets from the middle (angles: along the two lines), as placeDimensionLabel keeps them.
+bool dimDefaultPin(const SketchGeometry &g, const SketchGeometry::Constraint &c, double px, bool flip, double &u, double &v) {
+    if (c.type == QLatin1String("angle")) {
+        AngleLook look;
+        if (!dimAngleLook(g, c, px, look))
+            return false;
+        u = look.along1, v = look.along2;
+        return true;
+    }
+    SketchGeometry::Point a, b;
+    if (!dimEnds(g, c, a, b))
+        return false;
+    u = v = 0;
+    if (c.type != QLatin1String("length"))
+        return true;
+    double nu = -(b.v - a.v), nv = b.u - a.u;
+    const double l = std::hypot(nu, nv);
+    if (l < 1e-12)
+        return true;
+    nu /= l, nv /= l;
+    if (nv < 0 || (nv == 0 && (flip ? -nu : nu) > 0))
+        nu = -nu, nv = -nv;
+    u = nu * 20 * px, v = nv * 20 * px;
+    return true;
+}
+
+} // namespace
+
+// Pins dimension values where the sketch shows them (Main.qml, when they first show): [{id, u, v}], as
+// placeDimensionLabel keeps them. One change for all. Not a history step, like a drag.
+void Document::pinDimensionLabels(int sketch, const QVariantList &pins) {
+    const auto found = m_sketches.find(sketch);
+    if (found == m_sketches.end())
+        return;
+    bool any = false;
+    for (const QVariant &p : pins) {
+        const QVariantMap m = p.toMap();
+        const auto c = found->second.geometry.constraints.find(m.value(QStringLiteral("id")).toInt());
+        if (c == found->second.geometry.constraints.end() || !c->second.isDimension() || c->second.labelPlaced)
+            continue;
+        c->second.labelPlaced = true;
+        c->second.labelU = m.value(QStringLiteral("u")).toDouble();
+        c->second.labelV = m.value(QStringLiteral("v")).toDouble();
+        any = true;
+    }
+    if (any)
+        sketchesEdited();
+}
+
+// A sketch from before values were pinned, exported before it's opened: its values are pinned now, where the
+// sketch would first show them (dimDefaultPin), so the sketch shows them where the file has them.
+void Document::pinUnplacedLabels(int sketch, bool flip) {
+    const auto found = m_sketches.find(sketch);
+    if (found == m_sketches.end())
+        return;
+    const SketchGeometry &g = found->second.geometry;
+    const double px = dxfPixelMm(g.points, [&](int id) { return pointHidden(g, id); });
+    QVariantList pins;
+    for (const auto &[id, c] : g.constraints) {
+        double u = 0, v = 0;
+        if (c.isDimension() && !c.follows() && !c.labelPlaced && dimDefaultPin(g, c, px, flip, u, v))
+            pins << QVariantMap{{QStringLiteral("id"), id}, {QStringLiteral("u"), u}, {QStringLiteral("v"), v}};
+    }
+    if (!pins.isEmpty())
+        pinDimensionLabels(sketch, pins);
+}
+
+QString Document::sketchDxf(int sketch, const QVariantMap &way) const {
+    const bool flip = way.value(QStringLiteral("flip")).toBool(), dims = way.value(QStringLiteral("dims")).toBool();
+    const QVariantList bottom = dxfBottomLine(sketch, way);
+    const auto found = m_sketches.find(sketch);
+    if (found == m_sketches.end())
+        return QString();
+    const SketchGeometry &g = found->second.geometry;
+    const auto num = [](double v) { return QString::number(std::abs(v) < 1e-12 ? 0.0 : v, 'g', 15); };
+    using P2 = std::array<double, 2>;
+    // The sheet: seen from the front side (from the back, u runs the other way), then turned about the
+    // sketch's origin so the bottom line runs level, start to end along +x. Only its direction counts (owner,
+    // 2026-11-13): the line is never drawn, and the whole sketch is on the sheet wherever the line was.
+    const auto seen = [&](double u, double v) { return P2{flip ? -u : u, v}; };
+    double c = 1, s = 0;
+    if (bottom.size() == 4) {
+        const P2 a = seen(bottom[0].toDouble(), bottom[1].toDouble()), b = seen(bottom[2].toDouble(), bottom[3].toDouble());
+        const double l = std::hypot(b[0] - a[0], b[1] - a[1]);
+        if (l > 1e-9) {
+            c = (b[0] - a[0]) / l;
+            s = -(b[1] - a[1]) / l;
+        }
+    }
+    const auto at = [&](double u, double v) { const P2 q = seen(u, v); return P2{c * q[0] - s * q[1], s * q[0] + c * q[1]}; };
+    const auto pt = [&](const SketchGeometry::Point &p) { return at(p.u, p.v); };
+    const auto xy = [&](int code, const P2 &p) { return QStringLiteral("%1\n%2\n%3\n%4\n%5\n0\n").arg(code).arg(num(p[0])).arg(code + 10).arg(num(p[1])).arg(code + 20); };
+    const auto deg = [](const P2 &centre, const P2 &p) { double d = std::atan2(p[1] - centre[1], p[0] - centre[0]) * 180 / M_PI; return d < 0 ? d + 360 : d; };
+    QString ents;
+    const QString sk = QStringLiteral("8\nSKETCH\n"), dm = QStringLiteral("8\nDIMENSIONS\n");
+    double box[4] = {1e300, 1e300, -1e300, -1e300};    // what's drawn: the file's extents and starting view
+    const auto grow = [&](const P2 &p) {
+        box[0] = std::min(box[0], p[0]), box[1] = std::min(box[1], p[1]), box[2] = std::max(box[2], p[0]), box[3] = std::max(box[3], p[1]);
+    };
+    const auto line = [&](const QString &layer, const P2 &a, const P2 &b) {
+        ents += QStringLiteral("0\nLINE\n") + layer + xy(10, a) + xy(11, b);
+        grow(a), grow(b);
+    };
+    const auto arc = [&](const QString &layer, const P2 &centre, double r, double from, double to) {
+        ents += QStringLiteral("0\nARC\n") + layer + xy(10, centre) + QStringLiteral("40\n%1\n50\n%2\n51\n%3\n").arg(num(r), num(from), num(to));
+        const double span = std::fmod(to - from + 360, 360);
+        for (double d : {from, to, 0.0, 90.0, 180.0, 270.0})
+            if (std::fmod(d - from + 360, 360) <= span + 1e-9)
+                grow({centre[0] + r * std::cos(d * M_PI / 180), centre[1] + r * std::sin(d * M_PI / 180)});
+    };
+    for (const auto &[id, l] : g.lines)
+        if (!g.helperLines.count(id) && !lineHidden(g, l.a, l.b) && (lineClass(g, id, l) & (kLineClass | kProjectedClass)))
+            line(sk, pt(g.points.at(l.a)), pt(g.points.at(l.b)));
+    for (const auto &[id, k] : g.arcs) {
+        if (g.helperArcs.count(id) || lineHidden(g, k.c, k.c) || !(arcClass(g, id, k) & (kLineClass | kProjectedClass)))
+            continue;
+        const P2 centre = pt(g.points.at(k.c));
+        if (k.circle()) {
+            ents += QStringLiteral("0\nCIRCLE\n") + sk + xy(10, centre) + QStringLiteral("40\n%1\n").arg(num(g.radius(id)));
+            grow({centre[0] - g.radius(id), centre[1] - g.radius(id)}), grow({centre[0] + g.radius(id), centre[1] + g.radius(id)});
+            continue;
+        }
+        // Counter-clockwise from a to b on the sketch; seen from the back it runs the other way.
+        const P2 a = pt(g.points.at(k.a)), b = pt(g.points.at(k.b));
+        arc(sk, centre, g.radius(id), deg(centre, flip ? b : a), deg(centre, flip ? a : b));
+    }
+    for (const auto &[id, k] : g.curves) {
+        if (!(curveClass(g, id, k) & (kLineClass | kProjectedClass)))
+            continue;
+        for (const auto &run : g.curvePath(id)) {
+            if (run.size() < 2)
+                continue;
+            ents += QStringLiteral("0\nPOLYLINE\n") + sk + QStringLiteral("66\n1\n10\n0\n20\n0\n30\n0\n70\n0\n");
+            for (const auto &p : run) {
+                ents += QStringLiteral("0\nVERTEX\n") + sk + xy(10, pt(p));
+                grow(pt(p));
+            }
+            ents += QStringLiteral("0\nSEQEND\n") + sk;
+        }
+    }
+    // Dimensions as plain graphics (laser sites choke on DIMENSION blocks): line, ticks, extension lines, text.
+    if (dims) {
+        // Drawn as the sketch shows them (see dxfPixelMm and the notes above it): text, arrows and dashes at their
+        // screen size with the sketch filling the window; every place exactly where the sketch has it.
+        const double px = dxfPixelMm(g.points, [&](int id) { return pointHidden(g, id); });
+        const QString dash = dm + QStringLiteral("6\nDASHED\n");
+        const double capH = 0.7 * 12 * px;                     // 12 px type: its capitals
+        const auto textWide = [&](const QString &t) { return 0.55 * 12 * px * double(t.size()); };
+        // Centred on its place (72/73, for CAD apps); 10/20 is its left end on the baseline, where viewers that
+        // ignore the centring (Inkscape) start it.
+        const auto text = [&](const P2 &c, const QString &t) {
+            const double w = textWide(t);
+            const P2 left{c[0] - w / 2, c[1] - capH / 2};
+            ents += QStringLiteral("0\nTEXT\n") + dm + xy(10, left) + QStringLiteral("40\n%1\n1\n%2\n72\n1\n").arg(num(capH), t) + xy(11, c)
+                    + QStringLiteral("73\n2\n");
+            grow(left), grow({c[0] + w / 2, c[1] + capH / 2});
+        };
+        const auto nearestOn = [](const P2 &p, const P2 &a, const P2 &b) {
+            const double dx = b[0] - a[0], dy = b[1] - a[1], l = dx * dx + dy * dy;
+            const double t = l > 0 ? std::clamp(((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l, 0.0, 1.0) : 0;
+            return P2{a[0] + dx * t, a[1] + dy * t};
+        };
+        const auto arrow = [&](const P2 &tip, const P2 &back) {        // filled, 8 px long, 7 px across
+            const double l = std::max(1e-12, std::hypot(tip[0] - back[0], tip[1] - back[1]));
+            const double dx = (tip[0] - back[0]) / l, dy = (tip[1] - back[1]) / l;
+            const P2 w1{tip[0] - dx * 8 * px - dy * 3.5 * px, tip[1] - dy * 8 * px + dx * 3.5 * px};
+            const P2 w2{tip[0] - dx * 8 * px + dy * 3.5 * px, tip[1] - dy * 8 * px - dx * 3.5 * px};
+            ents += QStringLiteral("0\nSOLID\n") + dm + xy(10, tip) + xy(11, w1) + xy(12, w2) + xy(13, w2);
+            grow(tip), grow(w1), grow(w2);
+        };
+        for (const auto &[id, con] : g.constraints) {
+            SketchGeometry::Point fa, fb;
+            if (!dimEnds(g, con, fa, fb))
+                continue;
+            const double value = con.driven ? g.valueOf(con) : con.value;
+            const auto label = [&](double shownValue) {
+                return (con.driven ? QStringLiteral("(") : QString()) + (con.expr.isEmpty() ? QString() : QStringLiteral("Fx "))
+                       + dimShown(shownValue, con.unit) + (con.driven ? QStringLiteral(")") : QString());
+            };
+            if (con.type == QLatin1String("angle")) {
+                AngleLook k;
+                if (!dimAngleLook(g, con, px, k))
+                    continue;
+                const P2 centre = at(k.xu, k.xv);
+                const auto onArc = [&](double t) { return at(k.xu + k.r * std::cos(t), k.xv + k.r * std::sin(t)); };
+                const P2 p0 = onArc(k.from), p1 = onArc(k.from + k.sweep);
+                // A mirror (seen from the back) turns the sweep the other way; DXF arcs run counter-clockwise.
+                if ((flip ? -k.sweep : k.sweep) > 0)
+                    arc(dash, centre, k.r, deg(centre, p0), deg(centre, p1));
+                else
+                    arc(dash, centre, k.r, deg(centre, p1), deg(centre, p0));
+                arrow(p0, onArc(k.from + k.sweep / 40));
+                arrow(p1, onArc(k.from + k.sweep * 39 / 40));
+                // From a line's nearer end to just past the arc, when the arc isn't on the line itself.
+                const auto ends = [&](const char *key) { const QVariantList e = k.f.value(QLatin1String(key)).toList(); return std::array<double, 4>{e[0].toDouble(), e[1].toDouble(), e[2].toDouble(), e[3].toDouble()}; };
+                for (int i = 0; i < 2; ++i) {
+                    if (k.f.value(QLatin1String(i ? "axis2" : "axis1")).toBool())
+                        continue;
+                    const auto e = ends(i ? "ends2" : "ends1");
+                    const double au = i ? k.a2u : k.a1u, av = i ? k.a2v : k.a1v;
+                    const double ta = (e[0] - k.xu) * au + (e[1] - k.xv) * av, tb = (e[2] - k.xu) * au + (e[3] - k.xv) * av;
+                    const double lo = std::min(ta, tb), hi = std::max(ta, tb), over = 3 * px;
+                    double r0 = 0, r1 = 0;
+                    if (k.r > hi) r0 = hi, r1 = k.r + over;
+                    else if (k.r < lo) r0 = k.r - over, r1 = lo;
+                    if (r1 - r0 > over * 1.5)
+                        line(dash, at(k.xu + au * r0, k.xv + av * r0), at(k.xu + au * r1, k.xv + av * r1));
+                }
+                text(at(k.spotU, k.spotV), label(k.flipped ? M_PI - value : value));
+                continue;
+            }
+            const P2 a = pt(fa), b = pt(fb);
+            double lu = con.labelU, lv = con.labelV;
+            if (!con.labelPlaced)
+                dimDefaultPin(g, con, px, flip, lu, lv);
+            const P2 spot = at((fa.u + fb.u) / 2 + lu, (fa.v + fb.v) / 2 + lv);
+            if (con.type != QLatin1String("length"))
+                line(dm, a, b);
+            // The dashed line from the value's tag (12 px type, 7 px each side, 22 px tall) back to what it measures.
+            const QString t = label(value);
+            const double hw = (textWide(t) + 14 * px) / 2, hh = 11 * px;
+            const P2 near = nearestOn(spot, a, b);
+            const P2 from{std::clamp(near[0], spot[0] - hw, spot[0] + hw), std::clamp(near[1], spot[1] - hh, spot[1] + hh)};
+            const P2 to = nearestOn(from, a, b);
+            if (std::hypot(from[0] - to[0], from[1] - to[1]) > 14 * px)
+                line(dash, from, to);
+            text(spot, t);
+        }
+    }
+    // Extents and the starting view (the *ACTIVE viewport): the whole drawing with a 5% margin, so a viewer opens
+    // on all of it. Only the view: the sizes stay 1:1 in mm.
+    if (box[0] > box[2])
+        box[0] = box[1] = 0, box[2] = box[3] = 1;
+    const P2 lo{box[0], box[1]}, hi{box[2], box[3]};
+    const double wide = std::max(hi[0] - lo[0], 1e-6), tall = std::max(hi[1] - lo[1], 1e-6);
+    const QString header = QStringLiteral("9\n$EXTMIN\n") + xy(10, lo) + QStringLiteral("9\n$EXTMAX\n") + xy(10, hi)
+        + QStringLiteral("9\n$LIMMIN\n10\n%1\n20\n%2\n9\n$LIMMAX\n10\n%3\n20\n%4\n").arg(num(lo[0]), num(lo[1]), num(hi[0]), num(hi[1]));
+    const QString view = QStringLiteral("0\nTABLE\n2\nVPORT\n70\n1\n0\nVPORT\n2\n*ACTIVE\n70\n0\n10\n0\n20\n0\n11\n1\n21\n1\n"
+                                        "12\n%1\n22\n%2\n13\n0\n23\n0\n14\n1\n24\n1\n15\n1\n25\n1\n16\n0\n26\n0\n36\n1\n"
+                                        "17\n0\n27\n0\n37\n0\n40\n%3\n41\n%4\n42\n50\n43\n0\n44\n0\n50\n0\n51\n0\n"
+                                        "71\n0\n72\n100\n73\n1\n74\n3\n75\n0\n76\n0\n77\n0\n78\n0\n0\nENDTAB\n")
+                             .arg(num((lo[0] + hi[0]) / 2), num((lo[1] + hi[1]) / 2), num(tall * 1.05), num(wide / tall));
+    // DASHED: the sketch's 3 px dash, 3 px gap (dimension leaders, angle arcs).
+    const double dashMm = 3 * dxfPixelMm(g.points, [&](int id) { return pointHidden(g, id); });
+    const QString dashed = QStringLiteral("0\nLTYPE\n2\nDASHED\n70\n0\n3\nDashed\n72\n65\n73\n2\n40\n%1\n49\n%2\n49\n%3\n")
+                               .arg(num(2 * dashMm), num(dashMm), num(-dashMm));
+    // Latin-1 (ANSI_1252): the degree sign of an angle's value is one byte, read the same by CAD apps and Inkscape.
+    return QStringLiteral("0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1009\n9\n$DWGCODEPAGE\n3\nANSI_1252\n9\n$INSUNITS\n70\n4\n") + header + QStringLiteral("0\nENDSEC\n"
+                               "0\nSECTION\n2\nTABLES\n") + view + QStringLiteral("0\nTABLE\n2\nLTYPE\n70\n2\n0\nLTYPE\n2\nCONTINUOUS\n70\n0\n3\nSolid line\n72\n65\n73\n0\n40\n0.0\n")
+                + dashed + QStringLiteral("0\nENDTAB\n"
+                               "0\nTABLE\n2\nLAYER\n70\n%1\n0\nLAYER\n2\nSKETCH\n70\n0\n62\n7\n6\nCONTINUOUS\n").arg(dims ? 2 : 1)
+                + (dims ? QStringLiteral("0\nLAYER\n2\nDIMENSIONS\n70\n0\n62\n3\n6\nCONTINUOUS\n") : QString())
+                + QStringLiteral("0\nENDTAB\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n") + ents
+                + QStringLiteral("0\nENDSEC\n0\nEOF\n");
+}
+
+QString Document::exportSketchDxf(const QString &path, int sketch, const QVariantMap &way) {
+    QString target = path.startsWith(QLatin1String("file://")) ? QUrl(path).toLocalFile() : path;
+    if (target.isEmpty())
+        return QStringLiteral("No file name.");
+    if (!target.endsWith(QLatin1String(".dxf"), Qt::CaseInsensitive))
+        target += QStringLiteral(".dxf");
+    QVariantMap kept = way;
+    const int from = kept.contains(QStringLiteral("row")) ? kept.take(QStringLiteral("row")).toInt() : -1;
+    if (kept.value(QStringLiteral("dims")).toBool())
+        pinUnplacedLabels(sketch, kept.value(QStringLiteral("flip")).toBool());   // before the file and its time stamp
+    const QByteArray text = sketchDxf(sketch, kept).toLatin1();
+    if (text.isEmpty())
+        return QStringLiteral("Pick a sketch to export first.");
+    QSaveFile file(target);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text) || file.write(text) != text.size() || !file.commit())
+        return QStringLiteral("Couldn't write %1.").arg(QFileInfo(target).fileName());
+    // Listed under its sketch: the row it was reopened from, else the one already writing this file, else a new one.
+    // `exported_at`: when (UTC), kept in the design file; the sketch changed after that = out of date.
+    stampSketches();
+    const QJsonObject record{{QStringLiteral("sketch"), sketch}, {QStringLiteral("path"), target},
+                             {QStringLiteral("way"), QJsonObject::fromVariantMap(kept)},
+                             {QStringLiteral("exported_at"), QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)}};
+    int row = from >= 0 && from < m_dxfExports.size() ? from : -1;
+    for (int i = 0; row < 0 && i < m_dxfExports.size(); ++i)
+        if (m_dxfExports[i].toObject().value(QStringLiteral("path")).toString() == target)
+            row = i;
+    if (row >= 0)
+        m_dxfExports[row] = record;
+    else
+        m_dxfExports.append(record);
+    emit structureChanged();
+    return QString();
+}
+
 QVariantMap Document::pickSketch(int sketch, QVector3D origin, QVector3D direction, float pointReach, float edgeReach,
                                  int allow) const {
     QVariantMap none{{QStringLiteral("kind"), QString()}};
@@ -6540,11 +7383,20 @@ void Document::fillSketches(MeshGeometry *target, MeshGeometry *fullTarget, Mesh
                 std::vector<QVector3D> at;
                 for (const auto &p : path)
                     at.push_back(onSketch(s, p.u, p.v));
-                if (isConstruction)
+                if (isConstruction) {
                     addDashed(dashedIn(isProjected, fully), at, radius);
-                else
-                    for (std::size_t i = 0; i + 1 < at.size(); ++i)
-                        addTube(solidIn(isProjected, fully), at[i], at[i + 1], radius);
+                } else {
+                    // Points closer than half the line's own width (under a pixel: radius follows the zoom,
+                    // and zooming in draws again) go into one tube, so a sketch of a thousand small curves
+                    // isn't a hundred thousand tubes nobody can see apart.
+                    std::size_t from = 0;
+                    for (std::size_t i = 1; i < at.size(); ++i) {
+                        if (i + 1 < at.size() && (at[i] - at[from]).length() < 0.5f * radius)
+                            continue;
+                        addTube(solidIn(isProjected, fully), at[from], at[i], radius);
+                        from = i;
+                    }
+                }
             }
         };
         for (const auto &[id, k] : g.arcs)
@@ -6593,8 +7445,16 @@ void Document::fillProfiles(MeshGeometry *target, const QVariantList &sketches) 
                 addProfile(out, s, p);
             continue;
         }
-        for (const profiles::Profile &p : profilesOf(v.toInt(), s))
-            addProfile(out, s, p);
+        const auto &all = profilesOf(v.toInt(), s);
+        auto &triangles = m_profiles.at(v.toInt()).triangles;
+        if (triangles.size() != all.size()) {
+            triangles.clear();
+            for (const profiles::Profile &p : all) {
+                triangles.push_back(profiles::triangles(p));
+            }
+        }
+        for (std::size_t i = 0; i < all.size(); ++i)
+            addProfile(out, s, all[i], &triangles[i]);
     }
     finish(out);
     target->setMesh(out);
@@ -6605,20 +7465,55 @@ void Document::fillProfiles(MeshGeometry *target, const QVariantList &sketches) 
 void Document::sketchesEdited() {
     if (syncLinks())
         emit historyChanged();       // a link's issue appeared or went: the marks in the timeline
-    m_profiles.clear();
-    noteLiveMove();
+    noteLiveMove();   // the kept areas are checked against the sketch itself (profilesOf)
     emit sketchesChanged();
 }
 
 const std::vector<profiles::Profile> &Document::profilesOf(int id, const Named &sketch) const {
+    const std::size_t stamp = sketchStamp(sketch.geometry);
     const auto known = m_profiles.find(id);
-    if (known != m_profiles.end())
-        return known->second;
+    if (known != m_profiles.end() && known->second.stamp == stamp)
+        return known->second.profiles;
     const auto [paths, groups] = profilePaths(sketch.geometry);
-    return m_profiles[id] = profiles::find(paths, 0, 1e-4, groups).profiles;
+    KeptProfiles &kept = m_profiles[id];
+    kept = {stamp, profiles::find(paths, 0, 1e-4, groups).profiles, {}};
+    return kept.profiles;
 }
 
-void Document::addProfile(omamake::Mesh &out, const Named &s, const profiles::Profile &p) const {
+Document::KeptProfiles Document::workOutAreas(const SketchGeometry &g) const {
+    const auto [paths, groups] = profilePaths(g);
+    KeptProfiles out{sketchStamp(g), profiles::find(paths, 0, 1e-4, groups).profiles, {}};
+    for (const profiles::Profile &p : out.profiles)
+        out.triangles.push_back(profiles::triangles(p));
+    return out;
+}
+
+// The work on a worker thread, this one waiting for it in its own event loop: the window keeps drawing,
+// animating the busy card and answering the compositor (so it is never "not responding"). Clicks and keys
+// wait until it is done (they would change what the worker is reading); timers and drawing go on.
+void Document::offUiThread(const QString &what, const std::function<void()> &work) {
+    const bool was = m_working;
+    const QString wasWhat = m_workingWhat;
+    m_working = true;
+    m_workingWhat = what;
+    emit workingChanged();
+    QEventLoop wait;
+    QThread *worker = QThread::create([this, &work] {
+        const omamake::HeavyScope heavy;   // GB-089: the memory guard watches while this runs
+        std::lock_guard<std::mutex> turn(m_engineLock);
+        work();
+    });
+    connect(worker, &QThread::finished, &wait, &QEventLoop::quit, Qt::QueuedConnection);
+    worker->start();
+    wait.exec(QEventLoop::ExcludeUserInputEvents);
+    worker->wait();
+    delete worker;
+    m_working = was;
+    m_workingWhat = wasWhat;
+    emit workingChanged();
+}
+
+void Document::addProfile(omamake::Mesh &out, const Named &s, const profiles::Profile &p, const std::vector<int> *kept) const {
     const QVector3D normal = QVector3D::crossProduct(s.plane.value(QStringLiteral("xAxis")).value<QVector3D>(),
                                                      s.plane.value(QStringLiteral("yAxis")).value<QVector3D>()).normalized();
     std::vector<QVector3D> at;
@@ -6627,7 +7522,8 @@ void Document::addProfile(omamake::Mesh &out, const Named &s, const profiles::Pr
     for (const auto &h : p.holes)
         for (const auto &q : h)
             at.push_back(onSketch(s, q.u, q.v));
-    const std::vector<int> t = profiles::triangles(p);
+    const std::vector<int> made = kept ? std::vector<int>{} : profiles::triangles(p);
+    const std::vector<int> &t = kept ? *kept : made;
     for (std::size_t i = 0; i + 2 < t.size(); i += 3)
         addTriangle(out, at[t[i]], at[t[i + 1]], at[t[i + 2]], normal, normal, normal);
 }
@@ -8211,12 +9107,37 @@ static bool exactCurve(const SketchGeometry &g, const SketchGeometry::Curve &k, 
 // Which steps of each loop lie on one of the sketch's curves, and where along it: a step's two ends
 // must both be on the same drawn piece of it (two samples next to each other, or a point where the
 // outline crossed something, part way between them).
-void Document::exactCurves(const SketchGeometry &g, omamake::Profile &profile) const {
-    profile.curves.clear();
-    profile.onCurve.clear();
-    profile.along.clear();
-    struct Drawn { std::vector<SketchGeometry::Point> samples; };
-    std::vector<Drawn> drawn;
+struct Document::CurveIndex {
+    std::size_t stamp = 0;                                    // what the sketch was when this was built
+    std::vector<omamake::Profile::Curve> curves;
+    std::vector<std::vector<SketchGeometry::Point>> drawn;    // each curve's samples, as drawn
+    std::map<std::pair<long long, long long>, std::vector<std::pair<int, double>>> bySpot;
+};
+
+// Everything a sketch's drawn lines and areas depend on (a text on a path follows lines, arcs and curves):
+// what is kept from it (its areas, its curves' index) is used again only while this is the same.
+static std::size_t sketchStamp(const SketchGeometry &g) {
+    std::size_t stamp = 0;
+    const auto mix = [&](std::size_t h) { stamp ^= h + 0x9e3779b97f4a7c15ULL + (stamp << 6) + (stamp >> 2); };
+    const auto ids = [&](const std::set<int> &set) { mix(set.size()); for (const int id : set) mix(std::size_t(id)); };
+    for (const auto &[id, p] : g.points) { mix(std::size_t(id)); mix(std::hash<double>{}(p.u)); mix(std::hash<double>{}(p.v)); }
+    for (const auto &[id, l] : g.lines) { mix(std::size_t(id)); mix(std::size_t(l.a)); mix(std::size_t(l.b)); }
+    for (const auto &[id, k] : g.arcs) { mix(std::size_t(id)); mix(std::size_t(k.c)); mix(std::size_t(k.a)); mix(std::size_t(k.b)); }
+    for (const auto &[id, k] : g.curves) {
+        mix(std::size_t(id)); mix(qHash(k.type)); mix(std::hash<double>{}(k.value)); mix(qHash(k.text)); mix(qHash(k.font));
+        mix(std::size_t(k.flags)); mix(std::hash<double>{}(k.anchor));
+        mix(k.points.size()); for (const int q : k.points) mix(std::size_t(q));
+        mix(k.path.size()); for (const int q : k.path) mix(std::size_t(q));
+    }
+    ids(g.constructionLines); ids(g.constructionArcs); ids(g.constructionCurves);
+    ids(g.helperPoints); ids(g.helperLines); ids(g.helperArcs);
+    return stamp;
+}
+
+std::shared_ptr<const Document::CurveIndex> Document::curveIndexOf(const SketchGeometry &g, std::size_t stamp) const {
+    const double cell = 1e-6;
+    auto made = std::make_shared<CurveIndex>();
+    made->stamp = stamp;
     for (const auto &[id, k] : g.curves) {
         if (g.constructionCurves.count(id))
             continue;
@@ -8226,17 +9147,42 @@ void Document::exactCurves(const SketchGeometry &g, omamake::Profile &profile) c
         const auto paths = g.curvePath(id);
         if (paths.size() != 1 || paths[0].size() < 2)
             continue;
-        profile.curves.push_back(std::move(c));
-        drawn.push_back({paths[0]});
+        made->curves.push_back(std::move(c));
+        made->drawn.push_back(paths[0]);
     }
-    if (drawn.empty())
-        return;
     // Samples by where they are (a 1e-6 mm grid), for the points that are samples themselves.
+    for (std::size_t c = 0; c < made->drawn.size(); ++c)
+        for (std::size_t s = 0; s < made->drawn[c].size(); ++s)
+            made->bySpot[{std::llround(made->drawn[c][s].u / cell), std::llround(made->drawn[c][s].v / cell)}].push_back({int(c), double(s)});
+    return made;
+}
+
+void Document::keepWorkedOut(int sketch, const SketchGeometry &g, KeptProfiles &&areas, std::shared_ptr<const CurveIndex> curves) {
+    const std::size_t stamp = sketchStamp(g);   // only if it is still that sketch
+    if (areas.stamp == stamp)
+        m_profiles[sketch] = std::move(areas);
+    if (curves && curves->stamp == stamp)
+        m_curveIndex[sketch] = std::move(curves);
+}
+
+void Document::exactCurves(int sketch, const SketchGeometry &g, omamake::Profile &profile) const {
+    profile.curves.clear();
+    profile.onCurve.clear();
+    profile.along.clear();
+    const std::size_t stamp = sketchStamp(g);   // a kept index is never one of an older sketch
     const double cell = 1e-6, near = 1e-4;
-    std::map<std::pair<long long, long long>, std::vector<std::pair<int, double>>> bySpot;
-    for (std::size_t c = 0; c < drawn.size(); ++c)
-        for (std::size_t s = 0; s < drawn[c].samples.size(); ++s)
-            bySpot[{std::llround(drawn[c].samples[s].u / cell), std::llround(drawn[c].samples[s].v / cell)}].push_back({int(c), double(s)});
+    std::shared_ptr<const CurveIndex> &kept = m_curveIndex[sketch];
+    if (!kept || kept->stamp != stamp)
+        kept = curveIndexOf(g, stamp);
+    const CurveIndex &index = *kept;
+    if (index.drawn.empty())
+        return;
+    profile.curves = index.curves;
+    struct Drawn { const std::vector<SketchGeometry::Point> &samples; };
+    std::vector<Drawn> drawn;
+    for (const auto &d : index.drawn)
+        drawn.push_back({d});
+    const auto &bySpot = index.bySpot;
     // Every place a point is on a curve: (curve, along).
     auto places = [&](const omamake::Point2 &p) {
         std::vector<std::pair<int, double>> out;
@@ -8256,6 +9202,27 @@ void Document::exactCurves(const SketchGeometry &g, omamake::Profile &profile) c
         }
         return out;
     };
+    // A step over more than one sample of a curve: the finder folds samples closer than its join distance
+    // into the next piece (profiles.cpp), so the step is still that curve if the curve between its ends is
+    // no longer than the step itself plus that distance. Not a chord cut across the curve.
+    auto folded = [&](int c, double a, double b, const omamake::Point2 &p, const omamake::Point2 &q) {
+        const auto &s = drawn[std::size_t(c)].samples;
+        const auto at = [&](double t) {
+            const std::size_t i = std::min(std::size_t(t), s.size() - 2);
+            const double f = t - double(i);
+            return std::pair{s[i].u + f * (s[i + 1].u - s[i].u), s[i].v + f * (s[i + 1].v - s[i].v)};
+        };
+        double length = 0;
+        auto last = at(std::min(a, b));
+        for (double t = std::floor(std::min(a, b)) + 1; t < std::max(a, b); t += 1) {
+            const auto next = at(t);
+            length += std::hypot(next.first - last.first, next.second - last.second);
+            last = next;
+        }
+        const auto end = at(std::max(a, b));
+        length += std::hypot(end.first - last.first, end.second - last.second);
+        return length <= std::hypot(q.x - p.x, q.y - p.y) + near;
+    };
     for (std::size_t l = 0; l < profile.loops.size(); ++l) {
         const auto &loop = profile.loops[l];
         const std::size_t n = loop.size();
@@ -8268,10 +9235,10 @@ void Document::exactCurves(const SketchGeometry &g, omamake::Profile &profile) c
         for (std::size_t i = 0; i < n; ++i) {
             if (arcs && !std::isnan(profile.centres[l][i].x))
                 continue;                                   // a true arc already
-            double best = 2;
+            double best = std::numeric_limits<double>::infinity();
             for (const auto &[c, a] : at[i])
                 for (const auto &[d, b] : at[(i + 1) % n])
-                    if (c == d && std::abs(b - a) <= 1 + 1e-9 && std::abs(b - a) > 1e-12 && std::abs(b - a) < best) {
+                    if (c == d && std::abs(b - a) > 1e-12 && std::abs(b - a) < best && (std::abs(b - a) <= 1 + 1e-9 || folded(c, a, b, loop[i], loop[(i + 1) % n]))) {
                         best = std::abs(b - a);
                         on[i] = c;
                         along[i] = {a, b};
@@ -8319,17 +9286,28 @@ bool Document::readExtrude(const QVariantMap &spec, ExtrudeJob &job, QString &wh
                 return false;
             }
             planeAxes(found->second.plane, place.origin, place.x, place.y);
-            auto loop = [](const profiles::Path &path) {
-                std::vector<omamake::Point2> out;
-                for (const auto &p : path)
-                    out.push_back({p.u, p.v});
-                return out;
-            };
-            profile.loops.push_back(loop(all[std::size_t(index)].outer));
-            for (const auto &h : all[std::size_t(index)].holes)
-                profile.loops.push_back(loop(h));
-            arcCentres(found->second.geometry, profile);
-            exactCurves(found->second.geometry, profile);
+            // Worked out once per area while the sketch stays as it is: every option change asks again, and a
+            // projected area's outline can be 400,000 points (half a second each time, on the window's thread).
+            AreaCache &kept = m_areaCache[found->first];
+            const std::size_t stamp = sketchStamp(found->second.geometry);
+            if (kept.stamp != stamp)
+                kept = {stamp, {}};
+            if (const auto known = kept.made.find(index); known != kept.made.end()) {
+                profile = known->second;
+            } else {
+                auto loop = [](const profiles::Path &path) {
+                    std::vector<omamake::Point2> out;
+                    for (const auto &p : path)
+                        out.push_back({p.u, p.v});
+                    return out;
+                };
+                profile.loops.push_back(loop(all[std::size_t(index)].outer));
+                for (const auto &h : all[std::size_t(index)].holes)
+                    profile.loops.push_back(loop(h));
+                arcCentres(found->second.geometry, profile);
+                exactCurves(found->first, found->second.geometry, profile);
+                kept.made[index] = profile;
+            }
         }
         if (!job.places.empty()) {              // every area on the first one's plane, facing the same way
             const omamake::Placement &f = job.places.front();
@@ -8572,31 +9550,121 @@ std::vector<omamake::Point2> insidePoints(const omamake::Profile &profile) {
 }
 
 // Inside a closed mesh: a ray crosses its skin an odd number of times.
-bool insideMesh(const omamake::Mesh &m, const QVector3D &p) {
-    for (int k = 0; k < 3; ++k)
-        if (p[k] < m.min[k] || p[k] > m.max[k])
-            return false;
-    const QVector3D dir(0.5773f, 0.5774f, 0.5775f);    // askew, so it doesn't run along an edge
-    int crossings = 0;
-    const auto at = [&](std::uint32_t i) { return QVector3D(m.positions[i * 3], m.positions[i * 3 + 1], m.positions[i * 3 + 2]); };
-    for (std::size_t t = 0; t + 2 < m.indices.size(); t += 3) {
-        const QVector3D a = at(m.indices[t]), b = at(m.indices[t + 1]), c = at(m.indices[t + 2]);
-        const QVector3D e1 = b - a, e2 = c - a, h = QVector3D::crossProduct(dir, e2);
-        const float det = QVector3D::dotProduct(e1, h);
-        if (std::abs(det) < 1e-12f)
-            continue;
-        const QVector3D s = p - a;
-        const float u = QVector3D::dotProduct(s, h) / det;
-        if (u < 0 || u > 1)
-            continue;
-        const QVector3D q = QVector3D::crossProduct(s, e1);
-        const float v = QVector3D::dotProduct(dir, q) / det;
-        if (v < 0 || u + v > 1)
-            continue;
-        if (QVector3D::dotProduct(e2, q) / det > 0)
-            ++crossings;
+// Whether a point is inside a body's mesh: a ray from it, askew so it doesn't run along an edge, crossing
+// the mesh an odd number of times. The triangles are kept in a grid as the ray sees them (looking along
+// it), so each point asks only the few its ray can meet, not every triangle of the body: a projected face
+// of a thousand curves has a thousand points to ask about, against each body (2026-11-13).
+// A mesh's content as one number (positions and triangles), for the caches that outlive a call (GB-088).
+std::uint64_t meshContentKey(const omamake::Mesh &m) {
+    std::uint64_t h = 1469598103934665603ull;
+    const auto mix = [&h](const void *data, std::size_t bytes) {
+        const unsigned char *p = static_cast<const unsigned char *>(data);
+        std::size_t i = 0;
+        for (; i + 8 <= bytes; i += 8) {
+            std::uint64_t w;
+            std::memcpy(&w, p + i, 8);
+            h = (h ^ w) * 1099511628211ull;
+            h ^= h >> 29;
+        }
+        for (; i < bytes; ++i)
+            h = (h ^ p[i]) * 1099511628211ull;
+    };
+    mix(m.positions.data(), m.positions.size() * sizeof(float));
+    mix(m.indices.data(), m.indices.size() * sizeof(std::uint32_t));
+    return h ? h : 1;
+}
+
+class MeshRays {
+public:
+    explicit MeshRays(const omamake::Mesh &m) : m_mesh(m) {
+        m_e1 = QVector3D::crossProduct(kDir, QVector3D(0, 0, 1)).normalized();
+        m_e2 = QVector3D::crossProduct(kDir, m_e1).normalized();
+        const std::size_t tris = m.indices.size() / 3;
+        float lo[2] = {INFINITY, INFINITY}, hi[2] = {-INFINITY, -INFINITY};
+        for (std::size_t i = 0; i + 2 < m.positions.size(); i += 3) {
+            const QVector3D q(m.positions[i], m.positions[i + 1], m.positions[i + 2]);
+            const float a = QVector3D::dotProduct(q, m_e1), b = QVector3D::dotProduct(q, m_e2);
+            lo[0] = std::min(lo[0], a); hi[0] = std::max(hi[0], a);
+            lo[1] = std::min(lo[1], b); hi[1] = std::max(hi[1], b);
+        }
+        m_n = std::clamp(int(std::sqrt(double(tris))), 1, 1024);
+        m_lo[0] = lo[0]; m_lo[1] = lo[1];
+        m_size[0] = std::max(hi[0] - lo[0], 1e-6f) / float(m_n);
+        m_size[1] = std::max(hi[1] - lo[1], 1e-6f) / float(m_n);
+        m_cells.assign(std::size_t(m_n) * std::size_t(m_n), {});
+        for (std::size_t t = 0; t + 2 < m.indices.size(); t += 3) {
+            float tl[2] = {INFINITY, INFINITY}, th[2] = {-INFINITY, -INFINITY};
+            for (int k = 0; k < 3; ++k) {
+                const QVector3D q = at(m.indices[t + std::size_t(k)]);
+                const float a = QVector3D::dotProduct(q, m_e1), b = QVector3D::dotProduct(q, m_e2);
+                tl[0] = std::min(tl[0], a); th[0] = std::max(th[0], a);
+                tl[1] = std::min(tl[1], b); th[1] = std::max(th[1], b);
+            }
+            const int x0 = cellOf(tl[0], 0), x1 = cellOf(th[0], 0), y0 = cellOf(tl[1], 1), y1 = cellOf(th[1], 1);
+            for (int x = x0; x <= x1; ++x)
+                for (int y = y0; y <= y1; ++y)
+                    m_cells[std::size_t(x) * std::size_t(m_n) + std::size_t(y)].push_back(std::uint32_t(t));
+        }
     }
-    return crossings % 2 == 1;
+    bool inside(const QVector3D &p) const {
+        for (int k = 0; k < 3; ++k)
+            if (p[k] < m_mesh.min[k] || p[k] > m_mesh.max[k])
+                return false;
+        const float a = QVector3D::dotProduct(p, m_e1), b = QVector3D::dotProduct(p, m_e2);
+        if (a < m_lo[0] - m_size[0] || b < m_lo[1] - m_size[1])
+            return false;
+        int crossings = 0;
+        for (const std::uint32_t t : m_cells[std::size_t(cellOf(a, 0)) * std::size_t(m_n) + std::size_t(cellOf(b, 1))]) {
+            const QVector3D A = at(m_mesh.indices[t]), B = at(m_mesh.indices[t + 1]), C = at(m_mesh.indices[t + 2]);
+            const QVector3D e1 = B - A, e2 = C - A, h = QVector3D::crossProduct(kDir, e2);
+            const float det = QVector3D::dotProduct(e1, h);
+            if (std::abs(det) < 1e-12f)
+                continue;
+            const QVector3D s = p - A;
+            const float u = QVector3D::dotProduct(s, h) / det;
+            if (u < 0 || u > 1)
+                continue;
+            const QVector3D q = QVector3D::crossProduct(s, e1);
+            const float v = QVector3D::dotProduct(kDir, q) / det;
+            if (v < 0 || u + v > 1)
+                continue;
+            if (QVector3D::dotProduct(e2, q) / det > 0)
+                ++crossings;
+        }
+        return crossings % 2 == 1;
+    }
+private:
+    inline static const QVector3D kDir{0.5773f, 0.5774f, 0.5775f};
+    QVector3D at(std::uint32_t i) const { return QVector3D(m_mesh.positions[i * 3], m_mesh.positions[i * 3 + 1], m_mesh.positions[i * 3 + 2]); }
+    int cellOf(float v, int axis) const { return std::clamp(int(std::floor((v - m_lo[axis]) / m_size[axis])), 0, m_n - 1); }
+    const omamake::Mesh &m_mesh;
+    QVector3D m_e1, m_e2;
+    int m_n = 1;
+    float m_lo[2] = {0, 0}, m_size[2] = {1, 1};
+    std::vector<std::vector<std::uint32_t>> m_cells;
+};
+
+// Each body's MeshRays kept while its mesh stays the same (GB-088: planExtrude made them again on every call,
+// 30-60 ms on the speaker mount, on the window thread for each join/cut look-up). The ray grid points into its
+// own copy of the mesh. Shared by the window thread and the workers, so behind its own lock.
+struct RaysKept {
+    std::uint64_t key = 0;
+    std::shared_ptr<const omamake::Mesh> mesh;
+    std::shared_ptr<const MeshRays> rays;
+};
+std::mutex g_raysLock;
+std::map<std::pair<const void *, int>, RaysKept> g_rays;
+std::shared_ptr<const MeshRays> raysFor(const void *doc, int id, const omamake::Mesh &now) {
+    const std::uint64_t key = meshContentKey(now);
+    std::lock_guard<std::mutex> hold(g_raysLock);
+    RaysKept &kept = g_rays[{doc, id}];
+    if (kept.key != key || !kept.rays) {
+        auto mesh = std::make_shared<const omamake::Mesh>(now);
+        kept.rays = std::make_shared<const MeshRays>(*mesh);
+        kept.mesh = mesh;
+        kept.key = key;
+    }
+    return kept.rays;
 }
 
 } // namespace
@@ -8607,6 +9675,7 @@ bool insideMesh(const omamake::Mesh &m, const QVector3D &p) {
 // body, and this runs again every time the distance changes.
 void Document::planExtrude(ExtrudeJob &job) {
     auto vec = [](const double *a) { return QVector3D(float(a[0]), float(a[1]), float(a[2])); };
+    std::map<int, std::shared_ptr<const MeshRays>> rays;   // each body's triangles as the ray sees them (kept: raysFor)
     for (ExtrudeSide &s : job.sides) {
         std::set<int> hit, touch;
         for (std::size_t i = 0; i < job.places.size(); ++i) {
@@ -8622,15 +9691,17 @@ void Document::planExtrude(ExtrudeJob &job) {
                 Q_UNUSED(named)
                 if (m_hidden.count(QStringLiteral("b%1").arg(id)))
                     continue;
-                const omamake::Mesh &bm = bodyMesh(id);
+                std::shared_ptr<const MeshRays> &body = rays[id];
+                if (!body)
+                    body = raysFor(this, id, bodyMesh(id));
                 bool in = false, against = false;
                 for (const omamake::Point2 &p : spots) {
                     const QVector3D flat = o + x * float(p.x) + y * float(p.y);
                     for (const double f : {0.02, 0.25, 0.5, 0.75, 0.98})
-                        in = in || insideMesh(bm, flat + n * float(from + (to - from) * f));
+                        in = in || body->inside(flat + n * float(from + (to - from) * f));
                     if (in)
                         break;
-                    against = against || insideMesh(bm, flat + n * float(behind));
+                    against = against || body->inside(flat + n * float(behind));
                 }
                 if (in)
                     hit.insert(id);
@@ -8675,6 +9746,17 @@ QVariantMap Document::extrudePlan(const QVariantMap &spec) {
 // on failing taken again with points this close (mm) taken as one (0.00004 in). The result must still pass
 // every check (sound solid, no looser than what went in). Exact models never get here.
 static constexpr double kFuzzyProfile = 0.001;
+// GB-093 (owner, 2026-11-17): how far a cut's profile step lying on a wall of a body it cuts is moved off that
+// wall into the empty side (heavy engine's clearWalls), so the tool's wall and the body's never coincide.
+static constexpr double kWallClearance = 0.01;   // mm
+// GB-089: the most Extrude's automatic second try with Fuzzy profile may take (owner, 2026-11-16: about 60 s), then it
+// is stopped and everything put back. OMAMAKE_FUZZY_SECONDS changes it (tests).
+static constexpr double kFuzzySeconds = 60;
+static double fuzzySeconds() {
+    bool ok = false;
+    const double env = qEnvironmentVariable("OMAMAKE_FUZZY_SECONDS").toDouble(&ok);
+    return ok && env > 0 ? env : kFuzzySeconds;
+}
 
 Document::ExtrudeResult Document::computeExtrude(const ExtrudeJob &job) const {
     ExtrudeResult out;
@@ -8788,7 +9870,44 @@ Document::ExtrudeResult Document::computeExtrude(const ExtrudeJob &job) const {
         const ExtrudeSide &s = job.sides[si];
         std::vector<std::size_t> areas;
         QStringList problems;
-        std::vector<omamake::BodyId> tools = extrudeTools(job, int(si), &areas, &problems);
+        // GB-093: a cut's profile steps lying on a wall of any body it cuts are moved 0.01 mm off it, into the empty
+        // side, against every body it reaches (not only the one the profile came from). Cuts only: the strip moved
+        // across is empty, so what is cut away is the same; a join or a new body would gain it, so they stay exact.
+        // A taper's walls lean, and a body's own face pushed as it is (extrudeFace) has no profile: both stay exact.
+        ExtrudeJob cleared;
+        const ExtrudeJob *use = &job;
+        if (s.resolved == QLatin1String("cut") && std::abs(s.taper) < 1e-9) {
+            std::vector<omamake::BodyId> targets;
+            for (const int id : s.hits)
+                if (!s.skip.count(id))
+                    targets.push_back(currentOf(id));
+            if (!targets.empty()) {
+                cleared = job;
+                QStringList said;
+                for (std::size_t i = 0; i < cleared.places.size(); ++i) {
+                    if ((job.faces[i].first && job.faces[i].second >= 0) || std::abs(s.to[i] - s.from[i]) < 1e-9)
+                        continue;
+                    const std::string r = m_engine->clearWalls(cleared.profiles[i], cleared.places[i], s.from[i], s.to[i], targets, kWallClearance);
+                    if (!r.empty())
+                        said << QStringLiteral("area %1: %2").arg(i).arg(QString::fromStdString(r));
+                }
+                if (!said.isEmpty()) {
+                    use = &cleared;
+                    step(QStringLiteral("side %1: wall clearance: %2").arg(si).arg(said.join(QStringLiteral("; "))));
+                }
+            }
+        }
+        std::vector<omamake::BodyId> tools = extrudeTools(*use, int(si), &areas, &problems);
+        if (use != &job && !problems.isEmpty()) {
+            // A moved profile that couldn't be built: the exact one, as before.
+            for (const omamake::BodyId t : tools)
+                m_engine->release(t);
+            tools.clear();
+            areas.clear();
+            problems.clear();
+            step(QStringLiteral("side %1: the cleared profile couldn't be built; the exact one used").arg(si));
+            tools = extrudeTools(job, int(si), &areas, &problems);
+        }
         {
             QStringList made;
             for (std::size_t k = 0; k < tools.size(); ++k)
@@ -8909,7 +10028,63 @@ Document::ExtrudeResult Document::computeExtrude(const ExtrudeJob &job) const {
         // New body / new component: areas that touch each other make one body.
         std::vector<omamake::BodyId> groups;
         std::unordered_set<omamake::BodyId> fusedOnes;   // made by a join: its faces already merged
-        for (const omamake::BodyId t : tools) {
+        // All the tools in one Boolean: the areas that touch come out as one solid, the rest apart. Asking
+        // every pair how far apart they are first measured each face against every other: minutes for
+        // tools of a few hundred curved faces (2026-11-12), for what the Boolean finds anyway.
+        // Only tools whose areas' boxes on the sketch touch can touch (a taper widens a box by how far its
+        // sides lean out): each such cluster is one Boolean, and an area touching no other is a body as it
+        // is, with no Boolean at all (16 areas of a projected face, none touching: 3 s of fusing for nothing).
+        std::vector<omamake::BodyId> leftover;
+        if (tools.size() > 1 && areas.size() == tools.size()) {
+            std::vector<std::array<double, 4>> box;
+            for (std::size_t k = 0; k < tools.size(); ++k) {
+                const std::size_t a = areas[k];
+                const double lean = std::max(std::abs(s.from[a]), std::abs(s.to[a]))
+                                    * std::tan(std::min(std::abs(s.taper), 89.0) * M_PI / 180) + 1e-3;
+                std::array<double, 4> b{INFINITY, INFINITY, -INFINITY, -INFINITY};
+                for (const auto &p : job.profiles[a].loops.front()) {
+                    b[0] = std::min(b[0], p.x); b[1] = std::min(b[1], p.y);
+                    b[2] = std::max(b[2], p.x); b[3] = std::max(b[3], p.y);
+                }
+                box.push_back({b[0] - lean, b[1] - lean, b[2] + lean, b[3] + lean});
+            }
+            std::vector<int> root(tools.size());
+            for (std::size_t k = 0; k < root.size(); ++k)
+                root[k] = int(k);
+            const auto top = [&](int k) { while (root[std::size_t(k)] != k) k = root[std::size_t(k)] = root[std::size_t(root[std::size_t(k)])]; return k; };
+            for (std::size_t i = 0; i < box.size(); ++i)
+                for (std::size_t j = i + 1; j < box.size(); ++j)
+                    if (box[i][0] <= box[j][2] && box[j][0] <= box[i][2] && box[i][1] <= box[j][3] && box[j][1] <= box[i][3])
+                        root[std::size_t(top(int(j)))] = top(int(i));
+            std::map<int, std::vector<omamake::BodyId>> clusters;
+            for (std::size_t k = 0; k < tools.size(); ++k)
+                clusters[top(int(k))].push_back(tools[k]);
+            for (const auto &[first, cluster] : clusters) {
+                Q_UNUSED(first)
+                if (cluster.size() == 1) {
+                    groups.push_back(cluster.front());
+                    continue;
+                }
+                const omamake::BodyId all = m_engine->combine(cluster.front(), std::vector<omamake::BodyId>(cluster.begin() + 1, cluster.end()),
+                                                              omamake::Combine::Join);
+                if (!all) {
+                    leftover.insert(leftover.end(), cluster.begin(), cluster.end());
+                    continue;
+                }
+                std::vector<omamake::BodyId> parts = m_engine->pieces(all);
+                if (parts.empty())
+                    parts.push_back(all);
+                else
+                    m_engine->release(all);
+                for (const omamake::BodyId t : cluster)
+                    m_engine->release(t);
+                fusedOnes.insert(parts.begin(), parts.end());
+                groups.insert(groups.end(), parts.begin(), parts.end());
+            }
+        } else {
+            leftover = tools;
+        }
+        for (const omamake::BodyId t : leftover) {
             bool merged = false;
             for (omamake::BodyId &g : groups) {
                 if (m_engine->gap(g, t, 1e-3) < 1e-6) {
@@ -9031,12 +10206,37 @@ Document::ExtrudeResult Document::computeExtrude(const ExtrudeJob &job) const {
 Document::ExtrudeResult Document::computeExtrudeTrying(ExtrudeJob job) const {
     job.fuzzy = false;
     ExtrudeResult exact = computeExtrude(job);
+    if (omamake::memoryStopRequested()) {   // GB-089
+        exact.stopped = QStringLiteral("memory");
+        exact.failed = true;
+    }
     // Fuzzy profile only changes how a cut, join or intersect is built: any other failure would come out the same.
     if (!exact.failed || !exact.booleanFailed)
         return exact;
-    qInfo().noquote() << QStringLiteral("extrude: couldn't be built exactly; trying again with Fuzzy profile (%1 mm)").arg(kFuzzyProfile);
+    if (exact.stopped == QLatin1String("memory") || omamake::memoryStopRequested())
+        return exact;                 // GB-089: the memory guard stopped it; no second try
+    qInfo().noquote() << QStringLiteral("extrude: couldn't be built exactly; trying again with Fuzzy profile (%1 mm, at most %2 s)").arg(kFuzzyProfile).arg(fuzzySeconds());
     job.fuzzy = true;
-    ExtrudeResult fuzzy = computeExtrude(job);
+    // GB-089: the second try has a time limit (owner, 2026-11-16: it once ran 5 minutes, took 6.2 GB and the system
+    // killed the session). Past it, OpenCascade's Boolean is told to stop (heavyengine.cpp BreakCheck), the extrude
+    // puts everything back, and applyExtrude says so plainly.
+    QElapsedTimer fuzzyClock;
+    fuzzyClock.start();
+    ExtrudeResult fuzzy;
+    {
+        const omamake::StopScope limit(fuzzySeconds());
+        fuzzy = computeExtrude(job);
+        if (omamake::memoryStopRequested())
+            fuzzy.stopped = QStringLiteral("memory");
+        else if (limit.timedOut())
+            fuzzy.stopped = QStringLiteral("time");
+    }
+    fuzzy.stoppedAfter = fuzzyClock.elapsed() / 1000.0;
+    if (!fuzzy.stopped.isEmpty()) {
+        fuzzy.failed = true;
+        qInfo().noquote() << QStringLiteral("extrude: the Fuzzy profile try was stopped (%1) after %2 s; everything put back")
+                                 .arg(fuzzy.stopped).arg(fuzzy.stoppedAfter, 0, 'f', 1);
+    }
     fuzzy.fuzzyTried = true;
     QStringList trace;
     trace << QStringLiteral("first try, exact:") << exact.trace << QString()
@@ -9106,6 +10306,19 @@ QVariantMap Document::applyExtrude(ExtrudeResult &&r, const QVariantMap &spec) {
         }
         for (const omamake::BodyId g : groups)
             created.append(addBody(g, into));
+    }
+    if (r.swaps.empty() && created.isEmpty() && !r.stopped.isEmpty()) {
+        // GB-089: stopped part way, in plain words (the log still says every step).
+        QString why = r.stopped == QLatin1String("memory")
+            ? QStringLiteral("The extrude was stopped because the system was running low on memory. Nothing was changed.")
+            : QStringLiteral("The extrude couldn't be built exactly, and the second try with Fuzzy profile was stopped after %1 s so it "
+                             "wouldn't run on and use up the system's memory. Nothing was changed. The model's faces may not meet "
+                             "cleanly there (a rough conversion); a shorter or simpler profile may work.")
+                  .arg(qRound(r.stoppedAfter));
+        const QString log = writeExtrudeLog(r, spec, why);
+        if (!log.isEmpty())
+            why += QStringLiteral(" Why, step by step: %1").arg(log);
+        return {{QStringLiteral("ok"), false}, {QStringLiteral("why"), why}, {QStringLiteral("stopped"), r.stopped}};
     }
     if (r.swaps.empty() && created.isEmpty()) {
         QString why = r.notes.isEmpty() ? QStringLiteral("Nothing was made.") : r.notes.join(QLatin1Char(' '));
@@ -9179,13 +10392,20 @@ QVariantMap Document::extrudeInBackground(const QVariantMap &spec) {
     QString why;
     if (!readExtrude(spec, job, why))
         return {{QStringLiteral("ok"), false}, {QStringLiteral("why"), why}};
-    planExtrude(job);
+    for (const auto &body : m_bodies)   // the bodies' meshes are kept here, so the worker only reads them
+        if (!m_hidden.count(QStringLiteral("b%1").arg(body.first)))
+            bodyMesh(body.first);
     m_working = true;
+    m_workingWhat = QStringLiteral("Extruding");
     emit workingChanged();
-    QThread *worker = QThread::create([this, job = std::move(job), spec] {
+    QThread *worker = QThread::create([this, job = std::move(job), spec]() mutable {
+        const omamake::HeavyScope heavy;   // GB-089: the memory guard watches while this runs
         QElapsedTimer clock;
         clock.start();
+        std::unique_lock<std::mutex> turn(m_engineLock);   // a preview still being made goes first
+        planExtrude(job);   // which bodies it reaches: read only, nothing changes them while working
         ExtrudeResult r = computeExtrudeTrying(job);
+        turn.unlock();
         const double seconds = clock.elapsed() / 1000.0;
         QMetaObject::invokeMethod(this, [this, r = std::move(r), spec, seconds]() mutable {
             m_working = false;
@@ -9204,57 +10424,920 @@ QVariantMap Document::extrudeInBackground(const QVariantMap &spec) {
 void Document::fillExtrudeCutaway(MeshGeometry *target, const QVariantMap &spec, int side) {
     if (!target)
         return;
-    omamake::Mesh out = emptyMesh();
+    auto job = std::make_shared<ExtrudeJob>();
+    QString why;
+    bool cuts = false;
+    if (readExtrude(spec, *job, why) && side >= 0 && std::size_t(side) < job->sides.size()) {
+        planExtrude(*job);
+        const ExtrudeSide &s = job->sides[std::size_t(side)];
+        if (s.resolved == QLatin1String("cut"))
+            for (const int id : s.hits)
+                cuts = cuts || (!s.skip.count(id) && m_bodies.count(id));
+    }
+    // The extrude itself, drawn strongly: intersecting it with each body showed exactly what goes, but took
+    // seconds (minutes on a thread) every time a drag paused.
+    previewOffUiThread(target, nullptr, cuts ? job : nullptr, side);
+}
+
+namespace {
+
+// Felzenszwalb and Huttenlocher's exact squared distance transform along one line (f: 0 at the feature, a
+// huge number elsewhere).
+void distanceLine(const std::vector<float> &f, std::vector<float> &d, std::vector<int> &v, std::vector<float> &z, int n)
+{
+    int k = 0;
+    v[0] = 0;
+    z[0] = -1e30f;
+    z[1] = 1e30f;
+    for (int q = 1; q < n; ++q) {
+        float s = ((f[q] + float(q) * q) - (f[v[k]] + float(v[k]) * v[k])) / (2.0f * q - 2.0f * v[k]);
+        while (s <= z[k]) {
+            --k;
+            s = ((f[q] + float(q) * q) - (f[v[k]] + float(v[k]) * v[k])) / (2.0f * q - 2.0f * v[k]);
+        }
+        ++k;
+        v[k] = q;
+        z[k] = s;
+        z[k + 1] = 1e30f;
+    }
+    k = 0;
+    for (int q = 0; q < n; ++q) {
+        while (z[k + 1] < q)
+            ++k;
+        d[q] = float(q - v[k]) * (q - v[k]) + f[v[k]];
+    }
+}
+
+// Distance (in texels) from each texel to the nearest one where `on` is set.
+std::vector<float> distanceTo(const std::vector<char> &on, int w, int h)
+{
+    const float far = 1e20f;
+    std::vector<float> g(std::size_t(w) * h);
+    const int n = std::max(w, h);
+    std::vector<float> f(n), d(n), z(n + 1);
+    std::vector<int> v(n);
+    for (int x = 0; x < w; ++x) {
+        for (int y = 0; y < h; ++y)
+            f[y] = on[std::size_t(y) * w + x] ? 0 : far;
+        distanceLine(f, d, v, z, h);
+        for (int y = 0; y < h; ++y)
+            g[std::size_t(y) * w + x] = d[y];
+    }
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x)
+            f[x] = g[std::size_t(y) * w + x];
+        distanceLine(f, d, v, z, w);
+        for (int x = 0; x < w; ++x)
+            g[std::size_t(y) * w + x] = std::sqrt(d[x]);
+    }
+    return g;
+}
+
+}
+
+QVariantMap Document::extrudeRegion(const QVariantMap &spec, RegionMask *mask, const QVariantList &cutting) {
+    const QVariantMap off{{QStringLiteral("on"), false}};
     ExtrudeJob job;
     QString why;
-    if (readExtrude(spec, job, why) && side >= 0 && std::size_t(side) < job.sides.size()) {
-        planExtrude(job);
-        const ExtrudeSide &s = job.sides[std::size_t(side)];
-        if (s.resolved == QLatin1String("cut")) {
-            // The extrude itself, drawn strongly: intersecting it with each body showed exactly what
-            // goes, but took seconds (minutes on a thread) every time a drag paused.
-            bool any = false;
-            for (const int id : s.hits)
-                any = any || (!s.skip.count(id) && m_bodies.count(id));
-            if (any)
-                for (const omamake::BodyId t : extrudeTools(job, side)) {
-                    const omamake::Mesh m = m_engine->mesh(t);
-                    m_engine->release(t);
-                    const std::uint32_t base = std::uint32_t(out.positions.size() / 3);
-                    out.positions.insert(out.positions.end(), m.positions.begin(), m.positions.end());
-                    out.normals.insert(out.normals.end(), m.normals.begin(), m.normals.end());
-                    for (const std::uint32_t i : m.indices)
-                        out.indices.push_back(base + i);
-                    out.edgeLines.insert(out.edgeLines.end(), m.edgeLines.begin(), m.edgeLines.end());
+    const bool cut0 = cutting.size() > 0 && cutting[0].toBool(), cut1 = cutting.size() > 1 && cutting[1].toBool();
+    if (!mask || (!cut0 && !cut1) || !readExtrude(spec, job, why) || job.places.empty())
+        return off;
+    const omamake::Placement &f = job.places.front();
+    const QVector3D O(float(f.origin[0]), float(f.origin[1]), float(f.origin[2]));
+    const QVector3D X = QVector3D(float(f.x[0]), float(f.x[1]), float(f.x[2])).normalized();
+    const QVector3D Y = QVector3D(float(f.y[0]), float(f.y[1]), float(f.y[2])).normalized();
+    const QVector3D N = QVector3D::crossProduct(X, Y).normalized();
+
+    // Every area's loops on the first one's plane (u, v along X, Y from O).
+    std::vector<std::vector<std::vector<QPointF>>> areas;
+    double lo[2] = {1e300, 1e300}, hi[2] = {-1e300, -1e300};
+    std::size_t key = 1469598103934665603ull;
+    auto mix = [&key](double x) { std::uint64_t b; std::memcpy(&b, &x, 8); key = (key ^ b) * 1099511628211ull; };
+    for (std::size_t i = 0; i < job.places.size(); ++i) {
+        const omamake::Placement &p = job.places[i];
+        const QVector3D o(float(p.origin[0]), float(p.origin[1]), float(p.origin[2]));
+        const QVector3D px(float(p.x[0]), float(p.x[1]), float(p.x[2])), py(float(p.y[0]), float(p.y[1]), float(p.y[2]));
+        std::vector<std::vector<QPointF>> loops;
+        for (const auto &loop : job.profiles[i].loops) {
+            std::vector<QPointF> out;
+            for (const auto &q : loop) {
+                const QVector3D at = o + px * float(q.x) + py * float(q.y) - O;
+                const double u = QVector3D::dotProduct(at, X), v = QVector3D::dotProduct(at, Y);
+                out.push_back({u, v});
+                lo[0] = std::min(lo[0], u); hi[0] = std::max(hi[0], u);
+                lo[1] = std::min(lo[1], v); hi[1] = std::max(hi[1], v);
+                mix(u); mix(v);
+            }
+            loops.push_back(std::move(out));
+        }
+        areas.push_back(std::move(loops));
+        mix(-1e9 - double(i));
+    }
+    if (hi[0] < lo[0])
+        return off;
+
+    // Each cutting side's start, end and taper. A tapered symmetric one widens away from the profile both
+    // ways (extrudeTools makes it two), so it's drawn as two sides from 0.
+    struct Side { bool on = false; double from = 0, to = 0, tan = 0; };
+    Side sides[2];
+    bool perArea = false;
+    std::vector<std::pair<double, double>> lengths0;
+    for (int s = 0; s < 2 && std::size_t(s) < job.sides.size(); ++s) {
+        if (!(s == 0 ? cut0 : cut1))
+            continue;
+        const ExtrudeSide &e = job.sides[std::size_t(s)];
+        Side &out = sides[s];
+        out.on = true;
+        out.from = e.from.front();
+        out.to = e.to.front();
+        out.tan = std::abs(e.taper) > 1e-9 ? std::tan(e.taper * M_PI / 180) : 0;
+        if (s == 0) {
+            for (std::size_t i = 0; i < e.from.size(); ++i) {
+                lengths0.push_back({e.from[i], e.to[i]});
+                perArea = perArea || std::abs(e.from[i] - out.from) > 1e-6 || std::abs(e.to[i] - out.to) > 1e-6;
+            }
+            if (perArea)          // outside every area (a taper's widening): all of them together
+                for (const auto &[a, b] : lengths0) {
+                    out.from = std::min(out.from, std::min(a, b));
+                    out.to = std::max(out.to, std::max(a, b));
                 }
         }
     }
-    finish(out);
-    target->setMesh(out);
+    if (sides[0].on && !sides[1].on && !perArea && sides[0].tan != 0 && sides[0].from < 0 && sides[0].to > 0) {
+        sides[1] = {true, 0, sides[0].from, sides[0].tan};
+        sides[0].from = 0;
+    }
+
+    // The field reaches past the profile as far as a widening taper can go (in steps, so a drag doesn't
+    // remake it every time), plus a little.
+    const double span = std::max(hi[0] - lo[0], hi[1] - lo[1]);
+    double grow = 0;
+    for (const Side &s : sides)
+        if (s.on && s.tan > 0)
+            grow = std::max(grow, s.tan * std::abs(s.to - s.from));
+    const double stepGrow = std::max(1.0, span * 0.25);
+    grow = std::ceil(grow / stepGrow) * stepGrow;
+    const double margin = grow + std::max(0.5, span * 0.02);
+    mix(margin);
+    if (mask->key != key) {
+        const int most = 256;
+        const double cell = std::max(1e-3, (span + 2 * margin) / (most - 1));
+        const int w = std::min(most, int(std::ceil((hi[0] - lo[0] + 2 * margin) / cell)) + 1);
+        const int h = std::min(most, int(std::ceil((hi[1] - lo[1] + 2 * margin) / cell)) + 1);
+        mask->u0 = lo[0] - margin;
+        mask->v0 = lo[1] - margin;
+        mask->cell = cell;
+        mask->w = w;
+        mask->h = h;
+        // Inside: even-odd along each row of texel centres, area by area.
+        std::vector<char> in(std::size_t(w) * h, 0), out(std::size_t(w) * h, 1);
+        mask->area.assign(std::size_t(w) * h, -1);
+        std::vector<double> xs;
+        for (int y = 0; y < h; ++y) {
+            const double v = mask->v0 + (y + 0.5) * cell;
+            for (std::size_t a = 0; a < areas.size(); ++a) {
+                xs.clear();
+                for (const auto &loop : areas[a])
+                    for (std::size_t k = 0; k < loop.size(); ++k) {
+                        const QPointF &p = loop[k], &q = loop[(k + 1) % loop.size()];
+                        if ((p.y() <= v) != (q.y() <= v))
+                            xs.push_back(p.x() + (v - p.y()) / (q.y() - p.y()) * (q.x() - p.x()));
+                    }
+                std::sort(xs.begin(), xs.end());
+                for (std::size_t k = 0; k + 1 < xs.size(); k += 2) {
+                    const int x0 = std::max(0, int(std::ceil((xs[k] - mask->u0) / cell - 0.5)));
+                    const int x1 = std::min(w - 1, int(std::floor((xs[k + 1] - mask->u0) / cell - 0.5)));
+                    for (int x = x0; x <= x1; ++x) {
+                        in[std::size_t(y) * w + x] = 1;
+                        out[std::size_t(y) * w + x] = 0;
+                        mask->area[std::size_t(y) * w + x] = int(a);
+                    }
+                }
+            }
+        }
+        const std::vector<float> toIn = distanceTo(in, w, h), toOut = distanceTo(out, w, h);
+        mask->sd.assign(std::size_t(w) * h, 0);
+        for (std::size_t k = 0; k < mask->sd.size(); ++k)
+            mask->sd[k] = float(in[k] ? (toOut[k] - 0.5) * cell : -(toIn[k] - 0.5) * cell);
+        mask->key = key;
+        mask->rgba.clear();
+    }
+    if (mask->rgba.empty()) {               // a new field: to the texture (a drag changes only the shader's numbers)
+        const std::size_t n = std::size_t(mask->w) * mask->h;
+        mask->rgba.assign(n * 4, 0);
+        for (std::size_t k = 0; k < n; ++k)
+            mask->rgba[k * 4] = mask->sd[k];
+        mask->fill(mask->w, mask->h, mask->rgba);
+    }
+    const auto scene = [](const QVector3D &v) { return v; };   // the body's own coordinates (engine, Z up: body.vert)
+    const auto side = [](const Side &s) { return QVector4D(s.on ? 1 : 0, float(s.from), float(s.to), float(s.tan)); };
+    const double spanU = mask->w * mask->cell, spanV = mask->h * mask->cell;
+    return {{QStringLiteral("on"), true},
+            {QStringLiteral("origin"), scene(O)}, {QStringLiteral("x"), scene(X)}, {QStringLiteral("y"), scene(Y)},
+            {QStringLiteral("normal"), scene(N)},
+            {QStringLiteral("grid"), QVector4D(float(mask->u0), float(mask->v0), float(1 / spanU), float(1 / spanV))},
+            {QStringLiteral("perArea"), perArea}, {QStringLiteral("range"), mask->range},
+            {QStringLiteral("side0"), side(sides[0])}, {QStringLiteral("side1"), side(sides[1])}};
+}
+
+// A preview's solid made and meshed on a worker; the window draws the last one meanwhile. Only the newest
+// asked for each drawing is put in (a drag asks many times).
+void Document::previewOffUiThread(MeshGeometry *target, MeshGeometry *wire, std::shared_ptr<const ExtrudeJob> job, int side) {
+    std::shared_ptr<std::atomic<int>> &turns = m_previewTurns[target];
+    if (!turns)
+        turns = std::make_shared<std::atomic<int>>(0);
+    const int turn = ++*turns;
+    const QPointer<MeshGeometry> t(target), w(wire);
+    const double askedAt = double(QDateTime::currentMSecsSinceEpoch());
+    const bool logged = qEnvironmentVariableIsSet("OMAMAKE_TEST_INPUT");
+    auto put = [this, t, w, turns, turn, askedAt, logged](const omamake::Mesh &out, QVariantMap times = {}) {
+        if (turns->load() != turn)
+            return;
+        QElapsedTimer clock;
+        clock.start();
+        if (t)
+            t->setMesh(out);
+        if (w)
+            w->setMesh(out);
+        if (logged && !times.isEmpty()) {
+            times[QStringLiteral("kind")] = QStringLiteral("preview");
+            times[QStringLiteral("setMesh")] = clock.nsecsElapsed() / 1e6;
+            times[QStringLiteral("latency")] = double(QDateTime::currentMSecsSinceEpoch()) - askedAt;
+            times[QStringLiteral("at")] = double(QDateTime::currentMSecsSinceEpoch());
+            times[QStringLiteral("tris")] = int(out.indices.size() / 3);
+            m_testExtrudeLog << times;
+        }
+    };
+    if (!job) {
+        omamake::Mesh out = emptyMesh();
+        finish(out);
+        put(out);
+        return;
+    }
+    QThread *worker = QThread::create([this, job, side, turns, turn, put] {
+        const omamake::HeavyScope heavy;   // GB-089: the memory guard watches while this runs
+        omamake::Mesh out = emptyMesh();
+        QElapsedTimer clock;
+        clock.start();
+        double waitMs = 0, toolMs = 0, meshMs = 0;
+        {
+            std::lock_guard<std::mutex> hold(m_engineLock);
+            waitMs = clock.nsecsElapsed() / 1e6;
+            if (turns->load() != turn)
+                return;   // a newer one was asked for while this waited
+            const std::vector<omamake::BodyId> tools = extrudeTools(*job, side);
+            toolMs = clock.nsecsElapsed() / 1e6 - waitMs;
+            for (const omamake::BodyId t : tools) {
+                const omamake::Mesh m = m_engine->mesh(t);
+                m_engine->release(t);
+                const std::uint32_t base = std::uint32_t(out.positions.size() / 3);
+                out.positions.insert(out.positions.end(), m.positions.begin(), m.positions.end());
+                out.normals.insert(out.normals.end(), m.normals.begin(), m.normals.end());
+                for (const std::uint32_t i : m.indices)
+                    out.indices.push_back(base + i);
+                out.edgeLines.insert(out.edgeLines.end(), m.edgeLines.begin(), m.edgeLines.end());
+            }
+        }
+        meshMs = clock.nsecsElapsed() / 1e6 - waitMs - toolMs;
+        finish(out);
+        // A straight prism is kept: the next lengths are this mesh stretched, at once (GB-088).
+        QVector3D o, n;
+        double from = 0, to = 0;
+        if (const std::uint64_t key = prismKey(*job, side, o, n, from, to); key && !out.positions.empty()) {
+            auto kept = std::make_shared<ExtrudePrism>();
+            kept->o = o;
+            kept->n = n;
+            kept->from = from;
+            kept->to = to;
+            kept->mesh = out;
+            std::lock_guard<std::mutex> hold(m_prismLock);
+            if (m_prisms.size() > 16)
+                m_prisms.clear();
+            m_prisms[key] = kept;
+        }
+        const QVariantMap times{{QStringLiteral("wait"), waitMs}, {QStringLiteral("tools"), toolMs}, {QStringLiteral("mesh"), meshMs},
+                                {QStringLiteral("finish"), clock.nsecsElapsed() / 1e6 - waitMs - toolMs - meshMs}};
+        QMetaObject::invokeMethod(this, [put, out = std::move(out), times] { put(out, times); }, Qt::QueuedConnection);
+    });
+    connect(worker, &QThread::finished, worker, &QObject::deleteLater);
+    worker->start();
+}
+
+namespace {
+// A kept prism at another length: every point moved along the plane's normal, the start end to `from`, the
+// far end to `to` (GB-088). Exact for a straight, untapered extrude: its points all lie on one end or the other.
+omamake::Mesh stretchedPrism(const ExtrudePrism &p, double from, double to) {
+    omamake::Mesh out = p.mesh;
+    const double span = p.to - p.from;
+    const auto move = [&](std::vector<float> &v) {
+        for (std::size_t k = 0; k + 2 < v.size(); k += 3) {
+            const QVector3D q(v[k], v[k + 1], v[k + 2]);
+            const double w = QVector3D::dotProduct(q - p.o, p.n);
+            const double w2 = from + (w - p.from) / span * (to - from);
+            const QVector3D at = q + p.n * float(w2 - w);
+            v[k] = at.x(); v[k + 1] = at.y(); v[k + 2] = at.z();
+        }
+    };
+    move(out.positions);
+    move(out.edgeLines);
+    move(out.points);
+    for (std::vector<float> &e : out.edges)
+        move(e);
+    for (int i = 0; i < 3; ++i) {
+        out.min[i] = std::numeric_limits<float>::max();
+        out.max[i] = std::numeric_limits<float>::lowest();
+    }
+    for (std::size_t k = 0; k + 2 < out.positions.size(); k += 3)
+        for (int i = 0; i < 3; ++i) {
+            out.min[i] = std::min(out.min[i], out.positions[k + std::size_t(i)]);
+            out.max[i] = std::max(out.max[i], out.positions[k + std::size_t(i)]);
+        }
+    return out;
+}
+
+// A drawn mesh as a Manifold solid (GB-088): positions and normals per vertex, each triangle's face number
+// (+ `faceBase`) kept through the boolean; the face-by-face copies of a point joined so it's closed.
+bool toManifold(const omamake::Mesh &m, std::uint32_t faceBase, manifold::Manifold &out) {
+    if (m.indices.empty() || m.normals.size() != m.positions.size())
+        return false;
+    const std::size_t verts = m.positions.size() / 3, tris = m.indices.size() / 3;
+    // The face-by-face copies of a point are one (within 1 micron): the first copy stands for the rest.
+    std::vector<std::uint32_t> same(verts);
+    {
+        std::unordered_map<std::uint64_t, std::uint32_t> at;
+        at.reserve(verts * 2);
+        for (std::size_t v = 0; v < verts; ++v) {
+            std::uint64_t key = 0;
+            for (int k = 0; k < 3; ++k)
+                key = key * 2097143ull + std::uint64_t(std::llround(double(m.positions[v * 3 + std::size_t(k)]) * 1000.0) + (1ll << 40));
+            same[v] = at.emplace(key, std::uint32_t(v)).first->second;
+        }
+    }
+    manifold::MeshGL g;
+    g.numProp = 6;
+    g.vertProperties.resize(verts * 6);
+    for (std::size_t v = 0; v < verts; ++v)
+        for (int k = 0; k < 3; ++k) {
+            g.vertProperties[v * 6 + std::size_t(k)] = m.positions[same[v] * 3 + std::size_t(k)];
+            g.vertProperties[v * 6 + 3 + std::size_t(k)] = m.normals[v * 3 + std::size_t(k)];
+        }
+    for (std::size_t v = 0; v < verts; ++v)
+        if (same[v] != v) {
+            g.mergeFromVert.push_back(std::uint32_t(v));
+            g.mergeToVert.push_back(same[v]);
+        }
+    // Triangles with two corners at one point are left out; the few holes a drawn mesh has (a sliver face
+    // never meshed: 18 open edges on the speaker mount) are closed with a fan.
+    std::map<std::pair<std::uint32_t, std::uint32_t>, int> edges;   // directed, between stand-in points: +1 a->b
+    for (std::size_t t = 0; t < tris; ++t) {
+        const std::uint32_t c[3] = {m.indices[t * 3], m.indices[t * 3 + 1], m.indices[t * 3 + 2]};
+        const std::uint32_t a = same[c[0]], b = same[c[1]], d = same[c[2]];
+        if (a == b || b == d || a == d)
+            continue;
+        g.triVerts.insert(g.triVerts.end(), {c[0], c[1], c[2]});
+        g.faceID.push_back(faceBase + (t < m.triangleFace.size() ? m.triangleFace[t] : 0));
+        for (const auto &[x, y] : {std::pair{a, b}, std::pair{b, d}, std::pair{d, a}}) {
+            if (x < y)
+                ++edges[{x, y}];
+            else
+                --edges[{y, x}];
+        }
+    }
+    std::map<std::uint32_t, std::vector<std::uint32_t>> next;   // the fill's own edges: a hole's rim the other way
+    for (const auto &[e, n] : edges) {
+        if (n == 1)
+            next[e.second].push_back(e.first);       // a->b used once: the fill runs b->a
+        else if (n == -1)
+            next[e.first].push_back(e.second);
+        else if (n != 0)
+            return false;
+    }
+    while (!next.empty()) {
+        std::vector<std::uint32_t> loop{next.begin()->first};
+        for (;;) {
+            auto at = next.find(loop.back());
+            if (at == next.end() || at->second.empty())
+                return false;
+            const std::uint32_t to = at->second.back();
+            at->second.pop_back();
+            if (at->second.empty())
+                next.erase(at);
+            if (to == loop.front())
+                break;
+            loop.push_back(to);
+            if (loop.size() > 4096)
+                return false;
+        }
+        for (std::size_t k = 1; k + 1 < loop.size(); ++k) {
+            g.triVerts.insert(g.triVerts.end(), {loop[0], loop[k], loop[k + 1]});
+            g.faceID.push_back(faceBase);
+        }
+    }
+    out = manifold::Manifold(g);
+    if (out.Status() != manifold::Manifold::Error::NoError && qEnvironmentVariableIsSet("OMAMAKE_TEST_INPUT"))
+        qDebug() << "quick cut: no closed solid from" << tris << "triangles, status" << int(out.Status());
+    return out.Status() == manifold::Manifold::Error::NoError && !out.IsEmpty();
+}
+
+// A Manifold result appended to a drawn mesh, only the triangles meeting the box lo..hi (the view draws a
+// Cut's result only inside the cut's region, GB-084): faces from the tool (face number >= toolBase) turned
+// to face out of what's left, and lines where two faces meet (face numbers differ, or a crease over 40 deg).
+void appendManifold(omamake::Mesh &out, const manifold::Manifold &solid, std::uint32_t toolBase, const float lo[3], const float hi[3]) {
+    const manifold::MeshGL g = solid.GetMeshGL();
+    const std::size_t np = g.numProp, verts = g.NumVert(), tris = g.NumTri();
+    if (np < 6)
+        return;
+    std::vector<std::uint32_t> canon(verts);
+    std::iota(canon.begin(), canon.end(), 0u);
+    for (std::size_t i = 0; i < g.mergeFromVert.size() && i < g.mergeToVert.size(); ++i)
+        canon[g.mergeFromVert[i]] = g.mergeToVert[i];
+    std::vector<std::int64_t> placed(verts, -1);
+    const std::uint32_t base = std::uint32_t(out.positions.size() / 3);
+    std::uint32_t next = base;
+    struct Side { std::uint32_t face; QVector3D normal; };
+    std::unordered_map<std::uint64_t, Side> open;
+    open.reserve(4096);
+    for (std::size_t t = 0; t < tris; ++t) {
+        const std::uint32_t v[3] = {g.triVerts[t * 3], g.triVerts[t * 3 + 1], g.triVerts[t * 3 + 2]};
+        float tl[3] = {1e30f, 1e30f, 1e30f}, th[3] = {-1e30f, -1e30f, -1e30f};
+        for (const std::uint32_t q : v)
+            for (int k = 0; k < 3; ++k) {
+                tl[k] = std::min(tl[k], g.vertProperties[q * np + std::size_t(k)]);
+                th[k] = std::max(th[k], g.vertProperties[q * np + std::size_t(k)]);
+            }
+        bool meets = true;
+        for (int k = 0; k < 3 && meets; ++k)
+            meets = th[k] >= lo[k] && tl[k] <= hi[k];
+        if (!meets)
+            continue;
+        const std::uint32_t face = t < g.faceID.size() ? g.faceID[t] : 0;
+        const bool tool = face >= toolBase;
+        QVector3D p[3];
+        for (int c = 0; c < 3; ++c) {
+            const std::uint32_t q = v[c];
+            p[c] = QVector3D(g.vertProperties[q * np], g.vertProperties[q * np + 1], g.vertProperties[q * np + 2]);
+            if (placed[q] < 0) {
+                placed[q] = next++;
+                for (int k = 0; k < 3; ++k) {
+                    out.positions.push_back(g.vertProperties[q * np + std::size_t(k)]);
+                    out.normals.push_back((tool ? -1.0f : 1.0f) * g.vertProperties[q * np + 3 + std::size_t(k)]);
+                    out.min[k] = std::min(out.min[k], g.vertProperties[q * np + std::size_t(k)]);
+                    out.max[k] = std::max(out.max[k], g.vertProperties[q * np + std::size_t(k)]);
+                }
+            }
+            out.indices.push_back(std::uint32_t(placed[q]));
+        }
+        const QVector3D normal = QVector3D::crossProduct(p[1] - p[0], p[2] - p[0]).normalized();
+        for (int c = 0; c < 3; ++c) {
+            const std::uint32_t a = canon[v[c]], b = canon[v[(c + 1) % 3]];
+            const std::uint64_t key = (std::uint64_t(std::min(a, b)) << 32) | std::max(a, b);
+            const auto found = open.find(key);
+            if (found == open.end()) {
+                open.emplace(key, Side{face, normal});
+                continue;
+            }
+            if (found->second.face != face || QVector3D::dotProduct(found->second.normal, normal) < 0.766f)
+                for (const QVector3D &e : {p[c], p[(c + 1) % 3]})
+                    out.edgeLines.insert(out.edgeLines.end(), {e.x(), e.y(), e.z()});
+            open.erase(found);
+        }
+    }
+}
+
+// The bodies as Manifold solids, kept while their mesh stays the same (the Cut worker's own: one at a time).
+struct SolidKept {
+    std::uint64_t key = 0;
+    bool ok = false;
+    manifold::Manifold solid;
+};
+std::mutex g_solidsLock;
+std::map<std::pair<const void *, int>, SolidKept> g_solids;
+
+// One mesh appended to another (positions, normals, triangles, edge lines; the box grown).
+void appendMesh(omamake::Mesh &out, const omamake::Mesh &m) {
+    const std::uint32_t base = std::uint32_t(out.positions.size() / 3);
+    out.positions.insert(out.positions.end(), m.positions.begin(), m.positions.end());
+    out.normals.insert(out.normals.end(), m.normals.begin(), m.normals.end());
+    for (const std::uint32_t i : m.indices)
+        out.indices.push_back(base + i);
+    out.edgeLines.insert(out.edgeLines.end(), m.edgeLines.begin(), m.edgeLines.end());
+    for (std::size_t k = 0; k + 2 < m.positions.size(); k += 3)
+        for (int i = 0; i < 3; ++i) {
+            out.min[i] = std::min(out.min[i], m.positions[k + std::size_t(i)]);
+            out.max[i] = std::max(out.max[i], m.positions[k + std::size_t(i)]);
+        }
+}
+}
+
+// Which straight prism a side's solid is (GB-088): 0 when it isn't one (a taper, areas on different planes or
+// with different lengths, no length), else a number naming its shape and its way (not its length).
+std::uint64_t Document::prismKey(const ExtrudeJob &job, int side, QVector3D &o, QVector3D &n, double &from, double &to) {
+    if (side < 0 || std::size_t(side) >= job.sides.size() || job.places.empty())
+        return 0;
+    const ExtrudeSide &s = job.sides[std::size_t(side)];
+    if (std::abs(s.taper) > 1e-9 || s.from.size() < job.places.size() || s.to.size() < job.places.size())
+        return 0;
+    const auto vec = [](const double *a) { return QVector3D(float(a[0]), float(a[1]), float(a[2])); };
+    o = vec(job.places[0].origin);
+    n = QVector3D::crossProduct(vec(job.places[0].x), vec(job.places[0].y)).normalized();
+    from = s.from[0];
+    to = s.to[0];
+    if (std::abs(to - from) < 1e-6)
+        return 0;
+    std::uint64_t h = 1469598103934665603ull;
+    const auto mix = [&h](const void *data, std::size_t bytes) {
+        const unsigned char *p = static_cast<const unsigned char *>(data);
+        for (std::size_t i = 0; i < bytes; ++i)
+            h = (h ^ p[i]) * 1099511628211ull;
+    };
+    const int way = to > from ? 1 : -1;
+    mix(&way, sizeof way);
+    mix(&job.fuzzy, sizeof job.fuzzy);
+    for (std::size_t i = 0; i < job.places.size(); ++i) {
+        const omamake::Placement &pl = job.places[i];
+        const QVector3D ni = QVector3D::crossProduct(vec(pl.x), vec(pl.y)).normalized();
+        if (QVector3D::dotProduct(ni, n) < 0.999999f || std::abs(QVector3D::dotProduct(vec(pl.origin) - o, n)) > 1e-4f
+            || std::abs(s.from[i] - from) > 1e-9 || std::abs(s.to[i] - to) > 1e-9)
+            return 0;
+        mix(pl.origin, sizeof pl.origin);
+        mix(pl.x, sizeof pl.x);
+        mix(pl.y, sizeof pl.y);
+        if (i < job.faces.size())
+            mix(&job.faces[i], sizeof job.faces[i]);
+        for (const auto &loop : job.profiles[i].loops)
+            mix(loop.data(), loop.size() * sizeof(omamake::Point2));
+        for (const auto &loop : job.profiles[i].centres)
+            mix(loop.data(), loop.size() * sizeof(omamake::Point2));
+        const std::size_t curves = job.profiles[i].loops.size() * 31 + job.profiles[i].centres.size();
+        mix(&curves, sizeof curves);
+    }
+    return h ? h : 1;
+}
+
+bool Document::prismFor(const ExtrudeJob &job, int side, double startBack, omamake::Mesh &out) {
+    QVector3D o, n;
+    double from = 0, to = 0;
+    const std::uint64_t key = prismKey(job, side, o, n, from, to);
+    if (!key)
+        return false;
+    std::shared_ptr<const ExtrudePrism> kept;
+    {
+        std::lock_guard<std::mutex> hold(m_prismLock);
+        const auto found = m_prisms.find(key);
+        if (found == m_prisms.end())
+            return false;
+        kept = found->second;
+    }
+    const double way = to > from ? 1 : -1;
+    out = stretchedPrism(*kept, from - way * startBack, to);
+    return true;
+}
+
+// Extrude's Cut result for the preview (GB-084 second correction). Nothing heavy runs on the window's thread:
+// here only the spec is read (as fillExtrudePreview does every step), the extrude's box worked out and the
+// meshes of the shown bodies it meets copied from the cache. The plan (which bodies it cuts), the booleans
+// and the meshing run on one worker, which takes the newest ask each time it's free: asks made meanwhile
+// replace each other (only the newest is ever made; GB-086, owner: the window must never stop answering).
+void Document::fillExtrudeCutResult(MeshGeometry *faces, MeshGeometry *edges, const QVariantMap &spec) {
+    if (!faces)
+        return;
+    QElapsedTimer callClock;
+    callClock.start();
+    auto ask = std::make_shared<CutAsk>();
+    ask->turn = ++m_cutTurn;
+    ask->askedAt = double(QDateTime::currentMSecsSinceEpoch());
+    ask->faces = faces;
+    ask->edges = edges;
+    ask->spec = spec;
+    ask->job = std::make_shared<ExtrudeJob>();
+    QString why;
+    if (spec.isEmpty() || !readExtrude(spec, *ask->job, why) || ask->job->sides.empty()) {
+        omamake::Mesh none = emptyMesh();
+        finish(none);
+        faces->setMesh(none);
+        if (edges)
+            edges->setMesh(none);
+        {
+            std::lock_guard<std::mutex> hold(m_cutAskLock);
+            m_cutAsk.reset();                     // anything waiting is stale now
+        }
+        m_cutClearedTurn = ask->turn;             // and anything still being made is never shown
+        emit extrudeCutResultReady(false, spec, {false, false}, 0);
+        return;
+    }
+    const ExtrudeJob &job = *ask->job;
+    for (const auto &entry : m_bodies)
+        if (!m_shownSet || m_shown.count(entry.first))
+            ask->shown.insert(entry.first);
+    // The extrude's box (every area's outline at each side's start and end, widened by a taper), and the
+    // shown bodies it meets, copied now (the cache is this thread's): inside the cut's region the view draws
+    // the worker's drawing in place of the bodies, so a body there the cut leaves alone must be in it too.
+    float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+    for (std::size_t i = 0; i < job.places.size(); ++i) {
+        const omamake::Placement &p = job.places[i];
+        const QVector3D o(float(p.origin[0]), float(p.origin[1]), float(p.origin[2]));
+        const QVector3D px(float(p.x[0]), float(p.x[1]), float(p.x[2])), py(float(p.y[0]), float(p.y[1]), float(p.y[2]));
+        const QVector3D n = QVector3D::crossProduct(px, py).normalized();
+        for (const ExtrudeSide &side : job.sides) {
+            const double ends[2] = {side.from[std::min(i, side.from.size() - 1)], side.to[std::min(i, side.to.size() - 1)]};
+            const float grow = float(std::abs(std::tan(side.taper * M_PI / 180)) * std::abs(ends[1] - ends[0])) + 1.0f;
+            for (const auto &loop : job.profiles[i].loops)
+                for (const auto &q : loop)
+                    for (const double w : ends) {
+                        const QVector3D at = o + px * float(q.x) + py * float(q.y) + n * float(w);
+                        for (int k = 0; k < 3; ++k) {
+                            lo[k] = std::min(lo[k], at[k] - grow);
+                            hi[k] = std::max(hi[k], at[k] + grow);
+                        }
+                    }
+        }
+    }
+    for (const int id : ask->shown) {
+        auto cached = m_meshCache.find(id);
+        if (cached == m_meshCache.end())
+            continue;                             // not drawn yet: nothing to stand in for
+        const omamake::Mesh &m = cached->second;
+        bool meets = !m.positions.empty();
+        for (int k = 0; k < 3 && meets; ++k)
+            meets = m.max[k] >= lo[k] && m.min[k] <= hi[k];
+        if (meets)
+            ask->meshes[id] = m;
+    }
+    // GB-088: each side's solid from its kept prism (the red preview's), its start moved back 0.05 mm so it
+    // never lies in the face it starts on (the result there is the same: that face is cut away).
+    ask->quick = qEnvironmentVariable("OMAMAKE_QUICK_CUT") != QLatin1String("0");   // 0: always the exact way (compare)
+    for (std::size_t side = 0; side < job.sides.size(); ++side) {
+        bool length = false;
+        for (std::size_t i = 0; i < job.sides[side].from.size() && i < job.sides[side].to.size(); ++i)
+            length = length || std::abs(job.sides[side].to[i] - job.sides[side].from[i]) > 1e-9;
+        if (!length)
+            continue;
+        omamake::Mesh tool;
+        if (ask->quick && prismFor(job, int(side), 0.05, tool))
+            ask->tools[int(side)] = std::move(tool);
+        else
+            ask->quick = false;
+    if (qEnvironmentVariableIsSet("OMAMAKE_TEST_INPUT") && !ask->quick)
+        qDebug() << "quick cut: no kept prism for a side";
+    }
+    ask->copyMs = callClock.nsecsElapsed() / 1e6;
+    {
+        std::lock_guard<std::mutex> hold(m_cutAskLock);
+        m_cutAsk = ask;                           // replaces one still waiting
+        if (m_cutWorking)
+            return;                               // the worker takes it when it's free
+        m_cutWorking = true;
+    }
+    QThread *worker = QThread::create([this] {
+        const omamake::HeavyScope heavy;   // GB-089: the memory guard watches while this runs
+        for (;;) {
+            std::shared_ptr<CutAsk> ask;
+            {
+                std::lock_guard<std::mutex> hold(m_cutAskLock);
+                ask.swap(m_cutAsk);
+                if (!ask) {
+                    m_cutWorking = false;
+                    return;
+                }
+            }
+            QElapsedTimer clock;
+            clock.start();
+            omamake::Mesh out = emptyMesh();
+            bool ok = true;
+            QVariantList cutting{false, false};
+            const auto newer = [this, &ask] { return m_cutTurn.load() != ask->turn; };
+            double waitMs = 0, planMs = 0, toolMs = 0, boolMs = 0, meshMs = 0, appendMs = 0;
+            QElapsedTimer part;
+            // GB-088: the quick way, when every side's solid is a kept prism: a mesh boolean (Manifold) of each
+            // body's drawn mesh (kept as a solid while it stays the same) minus the prism, only what lies in the
+            // cut's box kept. No engine, so nothing else waits on it; 10-20x quicker than the exact boolean on
+            // the speaker mount. Anything it can't do (a mesh that won't close, a missing body) goes the exact way.
+            bool quickDone = false;
+            constexpr std::uint32_t kToolFaces = 1u << 24;
+            if (ask->quick) {
+                ExtrudeJob &job = *ask->job;
+                {
+                    std::lock_guard<std::mutex> hold(m_engineLock);   // bodyMesh may ask the engine (not yet drawn)
+                    waitMs = clock.nsecsElapsed() / 1e6;
+                    part.start();
+                    planExtrude(job);
+                    planMs = part.nsecsElapsed() / 1e6;
+                }
+                bool fine = true;
+                std::map<int, manifold::Manifold> current;
+                float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+                // Not stopped for a newer ask: it's quick, and during a drag the solid then keeps up, a step or
+                // two behind the red (an ask stopped for a newer one never showed anything until the drag paused).
+                for (std::size_t s = 0; s < job.sides.size() && fine; ++s) {
+                    const ExtrudeSide &side = job.sides[s];
+                    if (side.resolved != QLatin1String("cut"))
+                        continue;
+                    std::vector<int> ids;
+                    for (const int id : side.hits)
+                        if (!side.skip.count(id) && ask->shown.count(id))
+                            ids.push_back(id);
+                    if (ids.empty())
+                        continue;
+                    const auto tool = ask->tools.find(int(s));
+                    if (tool == ask->tools.end()) {
+                        fine = false;
+                        break;
+                    }
+                    if (s < 2)
+                        cutting[int(s)] = true;
+                    part.restart();
+                    manifold::Manifold toolSolid;
+                    fine = toManifold(tool->second, kToolFaces, toolSolid);
+                    for (int k = 0; k < 3; ++k) {
+                        lo[k] = std::min(lo[k], tool->second.min[k] - 1.0f);
+                        hi[k] = std::max(hi[k], tool->second.max[k] + 1.0f);
+                    }
+                    toolMs += part.nsecsElapsed() / 1e6;
+                    part.restart();
+                    for (const int id : ids) {
+                        if (!fine)
+                            break;
+                        if (!current.count(id)) {
+                            const auto drawn = ask->meshes.find(id);
+                            if (drawn == ask->meshes.end()) {
+                                fine = false;
+                                break;
+                            }
+                            const std::uint64_t key = meshContentKey(drawn->second);
+                            std::lock_guard<std::mutex> hold(g_solidsLock);
+                            SolidKept &kept = g_solids[{this, id}];
+                            if (kept.key != key) {
+                                kept.key = key;
+                                kept.ok = toManifold(drawn->second, 0, kept.solid);
+                            }
+                            if (!kept.ok) {
+                                if (qEnvironmentVariableIsSet("OMAMAKE_TEST_INPUT"))
+                                    qDebug() << "quick cut: the body's mesh is no closed solid, status" << int(kept.solid.Status());
+                                fine = false;
+                                break;
+                            }
+                            current[id] = kept.solid;
+                        }
+                        current[id] = current[id] - toolSolid;
+                        fine = current[id].Status() == manifold::Manifold::Error::NoError;
+                    }
+                    boolMs += part.nsecsElapsed() / 1e6;
+                }
+                fine = fine && !current.empty();
+                if (qEnvironmentVariableIsSet("OMAMAKE_TEST_INPUT"))
+                    qDebug().noquote() << "quick cut:" << (fine ? "made" : "not made") << "tools" << ask->tools.size() << "solids" << current.size()
+                                       << "meshes" << ask->meshes.size();
+                if (fine) {
+                    part.restart();
+                    for (const auto &[id, solid] : current)
+                        appendManifold(out, solid, kToolFaces, lo, hi);
+                    meshMs = part.nsecsElapsed() / 1e6;
+                    part.restart();
+                    for (const auto &[id, m] : ask->meshes)
+                        if (!current.count(id))
+                            appendMesh(out, m);
+                    appendMs = part.nsecsElapsed() / 1e6;
+                    quickDone = true;
+                } else {
+                    out = emptyMesh();
+                    cutting = QVariantList{false, false};
+                    toolMs = boolMs = meshMs = 0;
+                }
+            }
+            if (!quickDone) {
+                std::lock_guard<std::mutex> hold(m_engineLock);
+                waitMs = clock.nsecsElapsed() / 1e6;
+                part.start();
+                ExtrudeJob &job = *ask->job;
+                planExtrude(job);
+                planMs = part.nsecsElapsed() / 1e6;
+                std::set<int> cut;
+                std::map<int, omamake::BodyId> current;
+                for (std::size_t s = 0; s < job.sides.size() && ok && !newer(); ++s) {
+                    const ExtrudeSide &side = job.sides[s];
+                    if (side.resolved != QLatin1String("cut"))
+                        continue;
+                    std::vector<int> ids;
+                    for (const int id : side.hits)
+                        if (!side.skip.count(id) && ask->shown.count(id))
+                            ids.push_back(id);
+                    if (ids.empty())
+                        continue;
+                    if (s < 2)
+                        cutting[int(s)] = true;
+                    part.restart();
+                    const std::vector<omamake::BodyId> tools = extrudeTools(job, int(s));
+                    toolMs += part.nsecsElapsed() / 1e6;
+                    part.restart();
+                    for (const int id : ids) {
+                        if (tools.empty() || newer()) {
+                            ok = false;
+                            break;
+                        }
+                        const omamake::BodyId was = current.count(id) ? current[id] : omamake::BodyId(id);
+                        const omamake::BodyId now = m_engine->combine(was, tools, omamake::Combine::Cut, job.fuzzy ? kFuzzyProfile : 0);
+                        if (!now) {
+                            ok = false;
+                            break;
+                        }
+                        if (current.count(id))
+                            m_engine->release(current[id]);
+                        current[id] = now;
+                        cut.insert(id);
+                    }
+                    for (const omamake::BodyId t : tools)
+                        m_engine->release(t);
+                    boolMs += part.nsecsElapsed() / 1e6;
+                }
+                ok = ok && !cut.empty() && !newer();
+                if (ok) {
+                    part.restart();
+                    std::vector<omamake::Mesh> made;
+                    for (const auto &[id, now] : current)
+                        made.push_back(m_engine->mesh(now));
+                    meshMs = part.nsecsElapsed() / 1e6;
+                    part.restart();
+                    for (const omamake::Mesh &m : made)
+                        appendMesh(out, m);
+                    for (const auto &[id, m] : ask->meshes)
+                        if (!cut.count(id))
+                            appendMesh(out, m);
+                    appendMs = part.nsecsElapsed() / 1e6;
+                }
+                for (const auto &[id, now] : current)
+                    m_engine->release(now);
+            }
+            if (newer() && !quickDone)
+                continue;                         // a newer ask came: this (slow, exact) one is never shown
+            if (!ok)
+                out = emptyMesh();
+            part.restart();
+            finish(out);
+            const double finishMs = part.nsecsElapsed() / 1e6;
+            const double ms = clock.nsecsElapsed() / 1e6;
+            const QVariantMap times{{QStringLiteral("kind"), QStringLiteral("cut")}, {QStringLiteral("copy"), ask->copyMs},
+                                    {QStringLiteral("wait"), waitMs}, {QStringLiteral("plan"), planMs}, {QStringLiteral("tools"), toolMs},
+                                    {QStringLiteral("boolean"), boolMs}, {QStringLiteral("mesh"), meshMs}, {QStringLiteral("append"), appendMs},
+                                    {QStringLiteral("finish"), finishMs}, {QStringLiteral("worker"), ms}, {QStringLiteral("tris"), int(out.indices.size() / 3)},
+                                    {QStringLiteral("quick"), quickDone}};
+            QMetaObject::invokeMethod(this, [this, ask, out = std::move(out), ok, cutting, ms, times, quickDone] {
+                // A quick result is shown though newer asks came (unless a newer one is already shown, or the
+                // preview was cleared since: Done, Cancel, no cut any more); a slow one only if still the newest.
+                if (ask->turn <= m_cutShownTurn || ask->turn <= m_cutClearedTurn || (!quickDone && m_cutTurn != ask->turn))
+                    return;
+                m_cutShownTurn = ask->turn;
+                QElapsedTimer put;
+                put.start();
+                if (ask->faces)
+                    ask->faces->setMesh(out);
+                if (ask->edges)
+                    ask->edges->setMesh(out);
+                if (qEnvironmentVariableIsSet("OMAMAKE_TEST_INPUT")) {
+                    QVariantMap t = times;
+                    t[QStringLiteral("setMesh")] = put.nsecsElapsed() / 1e6;
+                    t[QStringLiteral("latency")] = double(QDateTime::currentMSecsSinceEpoch()) - ask->askedAt;
+                    t[QStringLiteral("at")] = double(QDateTime::currentMSecsSinceEpoch());
+                    t[QStringLiteral("ok")] = ok;
+                    m_testExtrudeLog << t;
+                }
+                emit extrudeCutResultReady(ok, ask->spec, cutting, ms);
+            }, Qt::QueuedConnection);
+        }
+    });
+    connect(worker, &QThread::finished, worker, &QObject::deleteLater);
+    worker->start();
 }
 
 void Document::fillExtrudePreview(MeshGeometry *target, MeshGeometry *wire, const QVariantMap &spec, int side) {
     if (!target)
         return;
-    omamake::Mesh out = emptyMesh();
-    ExtrudeJob job;
+    auto job = std::make_shared<ExtrudeJob>();
     QString why;
-    if (readExtrude(spec, job, why) && side >= 0 && std::size_t(side) < job.sides.size()) {
-        for (const omamake::BodyId t : extrudeTools(job, side)) {
-            const omamake::Mesh m = m_engine->mesh(t);
-            m_engine->release(t);
-            const std::uint32_t base = std::uint32_t(out.positions.size() / 3);
-            out.positions.insert(out.positions.end(), m.positions.begin(), m.positions.end());
-            out.normals.insert(out.normals.end(), m.normals.begin(), m.normals.end());
-            for (const std::uint32_t i : m.indices)
-                out.indices.push_back(base + i);
-            out.edgeLines.insert(out.edgeLines.end(), m.edgeLines.begin(), m.edgeLines.end());
-        }
+    const bool ok = readExtrude(spec, *job, why) && side >= 0 && std::size_t(side) < job->sides.size();
+    // GB-088 (owner: the red took 2-3 s to follow a drag on the speaker mount): a straight prism already built
+    // for this shape is stretched to the new length here, at once, drawn this frame: no worker, no engine, so
+    // never waiting behind the Cut result's boolean for the engine's lock.
+    omamake::Mesh quick;
+    QElapsedTimer clock;
+    clock.start();
+    if (ok && prismFor(*job, side, 0, quick)) {
+        std::shared_ptr<std::atomic<int>> &turns = m_previewTurns[target];
+        if (!turns)
+            turns = std::make_shared<std::atomic<int>>(0);
+        ++*turns;                                  // a slower one still on its way is never shown
+        const double made = clock.nsecsElapsed() / 1e6;
+        target->setMesh(quick);
+        if (wire)
+            wire->setMesh(quick);
+        if (qEnvironmentVariableIsSet("OMAMAKE_TEST_INPUT"))
+            m_testExtrudeLog << QVariantMap{{QStringLiteral("kind"), QStringLiteral("preview")}, {QStringLiteral("quick"), true},
+                                            {QStringLiteral("tools"), made}, {QStringLiteral("setMesh"), clock.nsecsElapsed() / 1e6 - made},
+                                            {QStringLiteral("latency"), clock.nsecsElapsed() / 1e6},
+                                            {QStringLiteral("at"), double(QDateTime::currentMSecsSinceEpoch())},
+                                            {QStringLiteral("tris"), int(quick.indices.size() / 3)}};
+        return;
     }
-    finish(out);
-    target->setMesh(out);
-    if (wire)
-        wire->setMesh(out);
+    previewOffUiThread(target, wire, ok ? job : nullptr, side);
 }
 
 QVariantMap Document::extrudeFrame(const QVariantMap &spec) {
@@ -9662,8 +11745,10 @@ QVariantMap Document::chamferInBackground(const QVariantMap &spec) {
         return {{QStringLiteral("ok"), false}, {QStringLiteral("why"), why}};
     ++m_previewGen;                     // a preview still running is no use now
     m_working = true;
+    m_workingWhat = QStringLiteral("Working");
     emit workingChanged();
     QThread *worker = QThread::create([this, job = std::move(job), spec] {
+        const omamake::HeavyScope heavy;   // GB-089: the memory guard watches while this runs
         QElapsedTimer clock;
         clock.start();
         ChamferResult r = computeChamfer(job);
@@ -9811,6 +11896,7 @@ void Document::chamferPreview(const QVariantMap &spec, MeshGeometry *faces, Mesh
     QPointer<Document> self(this);
     QPointer<MeshGeometry> f(faces), e(edges);
     QThread *worker = QThread::create([self, gen, lite, job = std::move(job), solids = std::move(solids), f, e] {
+        const omamake::HeavyScope heavy;   // GB-089: the memory guard watches while this runs
         auto engine = lite ? omamake::makeLiteEngine() : omamake::makeHeavyEngine();
         std::map<int, ChamferLook> made;
         QStringList notes;
@@ -10013,6 +12099,7 @@ bool Document::rewindFramesBegin(int actions) {
     m_rewindTotal = kRewindFrames;
     QPointer<Document> self(this);
     QThread *worker = QThread::create([=, job = std::move(job), solids = std::move(solids)] {
+        const omamake::HeavyScope heavy;   // GB-089: the memory guard watches while this runs
         auto engine = lite ? omamake::makeLiteEngine() : omamake::makeHeavyEngine();
         std::map<int, omamake::BodyId> here;
         for (const auto &[body, solid] : solids)

@@ -23,6 +23,10 @@ MouseArea {
 
     property real yaw: 0
     property real pitch: 0
+    // A turn about the line of sight, counter-clockwise as seen (degrees). Only Export DXF sets it (rollTo), to
+    // show a sketch turned as it will lie on the page; any other move of the view (lookFrom, restoreView) brings
+    // it back to 0.
+    property real roll: 0
     property real distance: 1000
     property real fov: 40
     property bool gridVisible: true
@@ -199,6 +203,7 @@ MouseArea {
         if (target - yaw < -180) target += 360
         flyYaw.to = target
         flyPitch.to = toPitch
+        flyRoll.to = 0
         if (around)
             fitTo(around.center, around.radius)
         else
@@ -248,6 +253,7 @@ MouseArea {
         if (target - yaw > 180) target -= 360
         if (target - yaw < -180) target += 360
         backYaw.to = target
+        backRoll.to = 0
         backPitch.to = s.pitch
         backDistance.to = s.distance
         backCenter.to = s.center
@@ -258,6 +264,7 @@ MouseArea {
         id: flightBack
         NumberAnimation { id: backYaw; target: nav; property: "yaw"; duration: 380; easing.type: Easing.OutCubic }
         NumberAnimation { id: backPitch; target: nav; property: "pitch"; duration: 380; easing.type: Easing.OutCubic }
+        NumberAnimation { id: backRoll; target: nav; property: "roll"; duration: 380; easing.type: Easing.OutCubic }
         NumberAnimation { id: backDistance; target: nav; property: "distance"; duration: 380; easing.type: Easing.OutCubic }
         Vector3dAnimation { id: backCenter; target: nav.pivot; property: "position"; duration: 380; easing.type: Easing.OutCubic }
     }
@@ -266,7 +273,35 @@ MouseArea {
         id: flight
         NumberAnimation { id: flyYaw; target: nav; property: "yaw"; duration: 380; easing.type: Easing.OutCubic }
         NumberAnimation { id: flyPitch; target: nav; property: "pitch"; duration: 380; easing.type: Easing.OutCubic }
+        NumberAnimation { id: flyRoll; target: nav; property: "roll"; duration: 380; easing.type: Easing.OutCubic }
     }
+    // Turn the view about the line of sight to `degrees` (counter-clockwise as seen), the shortest way round,
+    // keeping `about` (a scene point, optional) still on screen: the picture turns about it.
+    property var rollAbout: null
+    property real rollWas: 0
+    function rollTo(degrees, about) {
+        turnRoll.stop()
+        rollAbout = about || null
+        roll = ((roll % 360) + 540) % 360 - 180
+        let target = ((degrees % 360) + 540) % 360 - 180
+        if (target - roll > 180) target -= 360
+        if (target - roll < -180) target += 360
+        turnRoll.to = target
+        rollWas = roll
+        turnRoll.start()
+    }
+    // While rollTo turns: the centre swings about `rollAbout` as the picture does, so that point stays put.
+    onRollChanged: {
+        const step = roll - rollWas
+        rollWas = roll
+        if (!rollAbout || !turnRoll.running || !step)
+            return
+        const k = camera.forward.normalized(), t = step * Math.PI / 180, c = Math.cos(t), s = Math.sin(t)
+        const r = pivot.position.minus(rollAbout)
+        const turned = r.times(c).plus(k.crossProduct(r).times(s)).plus(k.times(k.dotProduct(r) * (1 - c)))   // Rodrigues
+        pivot.position = rollAbout.plus(turned)
+    }
+    NumberAnimation { id: turnRoll; target: nav; property: "roll"; duration: 380; easing.type: Easing.OutCubic }
 
     // Scene units covered by one screen pixel at the pivot's depth.
     function unitsPerPixel() {

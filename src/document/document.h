@@ -14,8 +14,10 @@
 #include <QVector3D>
 
 #include <climits>
+#include <QPointer>
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <functional>
 #include <map>
 #include <optional>
@@ -24,7 +26,16 @@
 #include <vector>
 
 class MeshGeometry;
+class RegionMask;
 class QTimer;
+
+// An extrude side's solid as last built (GB-088): a straight, untapered prism (every area on one plane, one
+// length), so any other length of it is the same mesh stretched along the plane's normal, no engine needed.
+struct ExtrudePrism {
+    QVector3D o, n;           // the areas' plane: a point on it and its normal (engine mm)
+    double from = 0, to = 0;  // the ends it was built with, along n
+    omamake::Mesh mesh;
+};
 
 class Document : public QObject {
     Q_OBJECT
@@ -49,6 +60,7 @@ class Document : public QObject {
     Q_PROPERTY(QString filePath READ filePath NOTIFY fileChanged)
     Q_PROPERTY(bool importing READ importing NOTIFY importChanged)
     Q_PROPERTY(bool working READ working NOTIFY workingChanged)
+    Q_PROPERTY(QString workingWhat READ workingWhat NOTIFY workingChanged)
     // Chamfer's preview is what's drawn (not the model under Ctrl/Shift): hover and picks go by it (GB-050).
     Q_PROPERTY(bool chamferPreviewShown READ chamferPreviewShown WRITE setChamferPreviewShown NOTIFY chamferPreviewShownChanged)
     Q_PROPERTY(QString importStage READ importStage NOTIFY importChanged)
@@ -165,6 +177,8 @@ public:
     Q_INVOKABLE QVariantMap pick(QVector3D origin, QVector3D direction, float pointReach, float edgeReach, bool through = false) const;
     Q_INVOKABLE int faceTotal() const { return int(m_mesh.faceCount); }
     // A body's exact volume in mm³ (0 when it isn't one), for tests and checks.
+    // The body Fit acts on, named when there are several to choose from (else empty: the question box names it).
+    Q_INVOKABLE QString fitName() const { return m_bodies.size() > 1 && m_bodies.count(int(m_body)) ? m_bodies.at(int(m_body)).name : QString(); }
     Q_INVOKABLE double volumeOf(int body) const { return m_bodies.count(body) ? m_engine->volume(omamake::BodyId(body)) : 0; }
 
     // Shapes that show parts of the model (hover or selection): faces as copies of their
@@ -196,6 +210,15 @@ public:
     Q_INVOKABLE QVariantMap extrudeFrame(const QVariantMap &spec);
     Q_INVOKABLE void fillExtrudePreview(MeshGeometry *target, MeshGeometry *wire, const QVariantMap &spec, int side);
     Q_INVOKABLE void fillExtrudeCutaway(MeshGeometry *target, const QVariantMap &spec, int side);
+    // Extrude's cut region for the body's shader (GB-084 correction): the volume the cutting sides
+    // (`cutting`: [side 0 cuts, side 1 cuts]) take, as the profile's plane (the body's own coordinates, engine mm, Z up), each
+    // side's start, end and taper, and the profile's signed distance over the plane put in `mask`.
+    // {on: false} when nothing cuts or the spec can't be read.
+    Q_INVOKABLE QVariantMap extrudeRegion(const QVariantMap &spec, RegionMask *mask, const QVariantList &cutting);
+    // Extrude's Cut preview as the bodies will be (GB-084 second correction): on a worker, each body the cut
+    // reaches minus the extrude, plus the other shown bodies the extrude's box meets, as they are, into faces /
+    // edges (newest asked only). Then extrudeCutResultReady with the spec it was made for (an empty spec clears).
+    Q_INVOKABLE void fillExtrudeCutResult(MeshGeometry *faces, MeshGeometry *edges, const QVariantMap &spec);
     // Model Chamfer (owner, 2026-11-08: everything Fusion's has, and where Fusion gives up it does its best).
     // spec: {corner: "chamfer" | "miter" | "blend",
     //        sets: [{type: "equal" | "two" | "angle", d1, d2 (mm), angle (degrees, from d1's face), flip, chain,
@@ -339,8 +362,14 @@ public:
     // Sliding a text along its path by the mouse: begin at the grab, slide with the mouse, end (one history step).
     // Test runs only (OMAMAKE_TEST_INPUT set): a real mouse event sent through the window, so a
     // drag can be tried the way the pointer does it. kind: press, move, release.
-    Q_INVOKABLE void testMouse(QObject *window, const QString &kind, double x, double y);
+    Q_INVOKABLE void testMouse(QObject *window, const QString &kind, double x, double y, int modifiers = 0);
     Q_INVOKABLE void testKey(QObject *window, int key, const QString &text = QString(), int modifiers = 0);
+    // Test only (OMAMAKE_TEST_INPUT): a probe's screenshot (an ItemGrabResult's image) saved on a worker, so
+    // the PNG's compression never takes the window thread's time; testSavesPending until they're all written.
+    Q_INVOKABLE void testSaveImage(const QVariant &image, const QString &path) const;
+    Q_INVOKABLE int testSavesPending() const;
+    // Test only (GB-088): the Cut results and red previews put on screen since the last clear, each part's time.
+    Q_INVOKABLE QVariantList testExtrudeLog(bool clear = false);
     Q_INVOKABLE void testHeld(int modifiers);
     Q_INVOKABLE bool beginSketchTextSlide(int sketch, int curve, double u, double v);
     Q_INVOKABLE bool slideSketchText(int sketch, int curve, double u, double v);
@@ -410,6 +439,10 @@ public:
     // Where a dimension's value shows, dragged by hand: (u, v) mm from the middle of what it
     // measures. Kept with the dimension and saved; not a history step (owner, 2026-10-30).
     Q_INVOKABLE void placeDimensionLabel(int sketch, int constraint, double u, double v, bool placed = true);
+    // Pins values where the sketch first shows them, all at once: [{id, u, v}] (owner, 2026-11-13: a value stays
+    // where it first showed at any zoom until dragged, and Export DXF draws it exactly there).
+    Q_INVOKABLE void pinDimensionLabels(int sketch, const QVariantList &pins);
+    void pinUnplacedLabels(int sketch, bool flip);
     // A new value for a dimension already there (constraint id). An action.
     Q_INVOKABLE QString setSketchDimension(int sketch, int constraint, double value,
                                            const QString &unit, const QString &label,
@@ -537,12 +570,43 @@ public:
     // one body for now, so it says no while there is one. The file itself is kept in the design.
     Q_INVOKABLE void importFile(const QString &path);
     // Export (owner, 2026-10-31): the body as a STEP file for now. Returns "" when written, or why not.
-    Q_INVOKABLE QString exportTo(const QString &path);
+    // Export STEP: `bodies` (their numbers) joined into one solid, each where it is now; none given: every
+    // body (the whole design, as before GB-082).
+    Q_INVOKABLE QString exportTo(const QString &path, const QVariantList &bodies = QVariantList());
     Q_INVOKABLE QString exportName() const;
-    // Fit Curved Surfaces (owner, 2026-10-30): asked for, not automatic; background, undoable.
-    Q_INVOKABLE void fitSurfaces();
+    // Export DXF (owner, 2026-11-13): these sketches in one .dxf, each on its own layer, where they sit in the model.
+    // Returns "" when written, or why not.
+    Q_INVOKABLE QString exportSketchesDxf(const QString &path, const QVariantList &sketches) const;
+    // Export DXF, one sketch laid flat (owner, 2026-11-13): 2D in the sketch's own plane. `way`:
+    //   flip      seen from the sketch's back (the side the user picked faces the viewer);
+    //   bottom    [u0, v0, u1, v1], the reference line drawn on the sketch for this export only (optional);
+    //   relation  "parallel", "perpendicular" or "angle" (`angle` degrees, counter-clockwise as seen) to
+    //   ref       {kind: "line", id} (any sketch line: drawn, construction or projected) or {kind: "axis", axis: "X"|"Y"|"Z"}
+    //             (the origin's; only one lying in the sketch's plane counts);
+    //             the line's direction then follows that line, so exporting again later gives the same sheet;
+    //   dims      every dimension (driving and driven, angles too) as lines, arcs and text on layer DIMENSIONS;
+    //   row       the Browser's export row it was reopened from (-1: a new export).
+    // The sheet is turned so the reference line runs level along the bottom, the sketch above it. The file's
+    // extents and starting view are the drawing's, so it opens showing all of it; sizes are never scaled.
+    // Exact lines, arcs and circles in mm. Written, the export is listed under its sketch in the Browser
+    // (kept in the design file; a double-click there exports it again). Returns "" when written, or why not.
+    Q_INVOKABLE QString exportSketchDxf(const QString &path, int sketch, const QVariantMap &way);
+    // The reference line as `way` makes it now ([u0, v0, u1, v1] on the sketch, or [] without one).
+    Q_INVOKABLE QVariantList dxfBottomLine(int sketch, const QVariantMap &way) const;
+    // The export rows that are out of date: their sketch changed after they were exported (both times are kept
+    // in the design file, so moving or deleting the .dxf changes nothing).
+    Q_INVOKABLE QVariantList dxfOutdated() const;
+    // The DXF text for `way` (see exportSketchDxf), or "" without that sketch.
+    QString sketchDxf(int sketch, const QVariantMap &way) const;
+    // An export row's record: {sketch, name (the sketch's), path, way}, or {} when there's none.
+    Q_INVOKABLE QVariantMap dxfExport(int row) const;
+    // Fit Curved Surfaces (owner, 2026-10-30): asked for, not automatic; background, undoable. `style` is
+    // the answer to the two questions Fit asks (owner, 2026-11-12; they were asked on Import Mesh):
+    // "low_poly", "low_res", or "" / "detailed". It goes in the fit's step.
+    Q_INVOKABLE void fitSurfaces(const QString &style = QString());
     bool importing() const { return m_importing; }
     bool working() const { return m_working; }
+    QString workingWhat() const { return m_workingWhat; }
     bool chamferPreviewShown() const { return m_chamferPreviewShown; }
     void setChamferPreviewShown(bool on) {
         if (on != m_chamferPreviewShown) {
@@ -560,6 +624,15 @@ public:
     Q_INVOKABLE QString openFrom(const QString &path);
     // Nothing done in this window yet and never saved: Load can use it instead of a new window.
     Q_INVOKABLE bool untouched() const;
+    // GB-089 recovery (src/document/recovery.cpp). recoveryState: the design as it is now, as an .omamake file holds
+    // it (toJson), taken only when that needs no waiting: empty while an import or an extrude runs, or another worker
+    // has the engine (the caller tries again shortly). recoveryRewindTo: the history length 2 Timeline items back
+    // (items as the design's row shows them: a sketch is one), never before the first item; what a memory stop's
+    // recovery shows. openRecovered: a recovery file opened as openFrom does, then its own file ("" when it was
+    // never saved) and name put back, so Save goes where it went before (or asks, never saved).
+    int recoveryRewindTo() const;
+    int recoveryRows(int steps) const;   // the design row's items in the first `steps` history steps
+    Q_INVOKABLE QString openRecovered(const QString &path, const QString &filePath, const QString &name);
     // Opens `path` in a new OmaMake window (Load while this one holds work).
     Q_INVOKABLE void openInNewWindow(const QString &path) const;
 
@@ -578,12 +651,15 @@ signals:
     void importChanged();
     void workingChanged();
     void extrudeFinished(const QVariantMap &result);
+    // fillExtrudeCutResult's drawing is in: ok false when there was nothing to cut or a cut couldn't be built
+    // (the bodies are then shown as they are); cutting = [side 0 cuts, side 1 cuts]; ms the worker's time.
+    void extrudeCutResultReady(bool ok, const QVariantMap &spec, const QVariantList &cutting, double ms);
     void chamferFinished(const QVariantMap &result);
     void chamferPreviewReady(bool ok, const QString &note);
     void rewindFrameReady(int frame);
     void chamferPreviewShownChanged();
     void importFinished(const QString &why, double seconds, int faces, int triangles);
-    void fitFinished(const QString &why, double seconds, int cylinders, int cones, int spheres, int trianglesLeft, double worstMm);
+    void fitFinished(const QString &why, double seconds, int cylinders, int cones, int spheres, int bowls, int trianglesLeft, double worstMm);
 
 private:
     // Add an action to the history; summary is the one line a person reads.
@@ -598,6 +674,13 @@ private:
     std::unique_ptr<omamake::GeometryEngine> m_engine;
     bool m_importing = false;
     bool m_working = false;           // an extrude's solid work is running off the main thread
+    QString m_workingWhat;            // what the busy card says it is doing ("Extruding", "Projecting")
+    // Heavy work never runs on the window's thread (owner, 2026-11-13: "not responding" is a bug): it runs on a
+    // worker while the window keeps drawing and answering, the busy card showing. Workers take turns on the engine.
+    mutable std::mutex m_engineLock;
+    void offUiThread(const QString &what, const std::function<void()> &work);
+    std::map<MeshGeometry *, std::shared_ptr<std::atomic<int>>> m_previewTurns;
+  // the newest preview asked for, per drawing
     QString m_importStage, m_importName;
     QByteArray m_stepFile;     // a design saved before body_file: the imported file, packed
     QByteArray m_bodyFile;     // the imported body's exact solid, packed, saved with the design
@@ -636,9 +719,49 @@ private:
         std::vector<ExtrudeSide> sides;
         bool fuzzy = false;   // Fuzzy profile: set only for the automatic second try (computeExtrudeTrying); see kFuzzyProfile
     };
+    // Extrude's Cut result (fillExtrudeCutResult): the newest ask, waiting for the one worker.
+    struct CutAsk {
+        int turn = 0;
+        QPointer<MeshGeometry> faces, edges;
+        QVariantMap spec;
+        std::shared_ptr<ExtrudeJob> job;
+        std::set<int> shown;
+        std::map<int, omamake::Mesh> meshes;   // the shown bodies the extrude's box meets, as drawn now
+        double askedAt = 0, copyMs = 0;        // when asked (ms since the epoch) and the window thread's part (probes)
+        // GB-088: per side, its solid from the kept prism (start moved back a hair, so it never lies in the face
+        // it starts on); when every side that has a length has one, the result is a quick mesh boolean.
+        std::map<int, omamake::Mesh> tools;
+        bool quick = false;
+    };
+    // Test only (OMAMAKE_TEST_INPUT, GB-088): one map per Cut result / red preview put on screen, with the time of
+    // each part (testExtrudeLog).
+    QVariantList m_testExtrudeLog;
+    // GB-088: the red (or blue) preview's prism per side's shape, kept across lengths (prismKey); the bodies as
+    // Manifold solids for the quick Cut result (key: their mesh's content), each worker's own.
+    mutable std::mutex m_prismLock;
+    std::map<std::uint64_t, std::shared_ptr<const ExtrudePrism>> m_prisms;
+    static std::uint64_t prismKey(const ExtrudeJob &job, int side, QVector3D &o, QVector3D &n, double &from, double &to);
+    // The side's solid from a kept prism at this job's length (its start moved back by `startBack` mm), or false.
+    bool prismFor(const ExtrudeJob &job, int side, double startBack, omamake::Mesh &out);
+    std::mutex m_cutAskLock;
+    std::shared_ptr<CutAsk> m_cutAsk;
+    bool m_cutWorking = false;
+    std::atomic<int> m_cutTurn{0};
+    int m_cutShownTurn = 0, m_cutClearedTurn = 0;   // the window thread's: the newest result shown, the last clear
     bool readExtrude(const QVariantMap &spec, ExtrudeJob &job, QString &why) const;
+    void previewOffUiThread(MeshGeometry *target, MeshGeometry *wire, std::shared_ptr<const ExtrudeJob> job, int side);
     void arcCentres(const SketchGeometry &g, omamake::Profile &profile) const;
-    void exactCurves(const SketchGeometry &g, omamake::Profile &profile) const;
+    void exactCurves(int sketch, const SketchGeometry &g, omamake::Profile &profile) const;
+    // A sketch's curves and their drawn samples, looked up by spot (exactCurves): built once per change of
+    // the sketch and kept, not once per area and per preview (a projected face can be 1300 curves).
+    struct CurveIndex;
+    mutable std::map<int, std::shared_ptr<const CurveIndex>> m_curveIndex;
+    struct AreaCache {   // each sketch area as an extrude reads it (readExtrude), while the sketch is unchanged
+        std::size_t stamp = 0;
+        std::map<int, omamake::Profile> made;
+    };
+    mutable std::map<int, AreaCache> m_areaCache;
+    std::shared_ptr<const CurveIndex> curveIndexOf(const SketchGeometry &g, std::size_t stamp) const;
     // How far along `normal` from `start` (the areas' middle, on their plane) a picked part lies, for
     // To Object. False and why if it can't be reached that way.
     bool extrudeReach(const QVariantMap &part, const double start[3], const double normal[3], double &mm, QString &why) const;
@@ -660,6 +783,8 @@ private:
         bool booleanFailed = false;   // a cut, join or intersect couldn't be built (the only kind Fuzzy profile can help)
         bool fuzzyTried = false;      // made on the automatic second try, with Fuzzy profile
         double modelLoose = 0;        // with Fuzzy profile: the loosest edge (mm) of the bodies it worked on
+        QString stopped;              // GB-089: "time" (the Fuzzy retry's limit) or "memory" (the memory guard); "" if not
+        double stoppedAfter = 0;      // the Fuzzy retry's seconds when it was stopped
     };
     ExtrudeResult computeExtrude(const ExtrudeJob &job) const;
     // An extrude worked out exactly; if a cut, join or intersect couldn't be built that way, the whole of it
@@ -749,8 +874,18 @@ private:
     bool lineHidden(const SketchGeometry &g, int a, int b) const;
     bool pointHidden(const SketchGeometry &g, int id) const;
     bool m_showPoints = true, m_showProjected = true;
-    void addProfile(omamake::Mesh &out, const Named &sketch, const profiles::Profile &p) const;
-    mutable std::map<int, std::vector<profiles::Profile>> m_profiles;
+    void addProfile(omamake::Mesh &out, const Named &sketch, const profiles::Profile &p, const std::vector<int> *kept = nullptr) const;
+    // Kept with what the sketch was (sketchStamp), so a change of something else (a body added) keeps them,
+    // and their shading's triangles once worked out.
+    struct KeptProfiles {
+        std::size_t stamp = 0;
+        std::vector<profiles::Profile> profiles;
+        std::vector<std::vector<int>> triangles;   // each profile's, empty until drawn
+    };
+    mutable std::map<int, KeptProfiles> m_profiles;
+    // A sketch's areas, shading and curve index worked out (on a worker) and kept, for a geometry just made.
+    void keepWorkedOut(int sketch, const SketchGeometry &g, KeptProfiles &&areas, std::shared_ptr<const CurveIndex> curves);
+    KeptProfiles workOutAreas(const SketchGeometry &g) const;
     // "Point3", "Line2", or the origin's own: "the Origin", "the X axis" (named after the model's
     // axis it lies along). kind: 'P' a point, 'L' a line.
     QString sketchPartName(const Named &sketch, QChar kind, int id) const;
@@ -795,6 +930,12 @@ private:
         QString name, unit = QStringLiteral("in"), expr, comment;
     };
     std::vector<Parameter> m_params;
+    // When each sketch last changed, with what it held then ({drawing's fingerprint, UTC time}); see stampSketches.
+    mutable std::map<int, std::pair<QByteArray, QDateTime>> m_sketchChanged;
+    QHash<int, QDateTime> m_savedChanged;          // as the opened file had them
+    mutable bool m_stampsFromFile = false;
+    void stampSketches() const;
+    QJsonArray m_dxfExports;      // Export DXF's records, [{sketch, path, way}]: the Browser's rows under each sketch
     int m_nextParameter = 1;
     bool m_paramSession = false;     // the Parameters window is open
     int m_paramItem = -1;            // its history item (index in m_actions), once it made one
@@ -919,6 +1060,29 @@ private:
     int m_runSketch = 0;
     QString m_filePath;     // where it was last saved ("" until then)
     QJsonObject toJson() const;
+    // toJson's text of each body's solid and each imported mesh, made once (GB-089: the recovery file after every step).
+    struct SolidText { QString file, source; };
+    mutable std::map<int, SolidText> m_solidText;
+    mutable std::map<std::string, QString> m_sourceText;
+    // A packed file's base64 and the mesh it came from, made once while the bytes stay the same (shared, same data).
+    struct PackedText { QByteArray of; QString text, source; };
+    mutable PackedText m_bodyFileText, m_stepFileText;
+    mutable std::map<QString, PackedText> m_importText;
+    const PackedText &packedText(PackedText &kept, const QByteArray &bytes, bool withSource) const;
+    // Set by recoveryState: solids not made into text yet are left out of toJson and put here, for the writer.
+    mutable std::vector<std::pair<int, std::function<std::string()>>> *m_laterSolids = nullptr;
+public:
+    // GB-089: the writer's text of a solid, kept (on the window's thread).
+    void keepSolidText(int body, const QString &file, const QString &source) {
+        if (m_bodies.count(body))
+            m_solidText[body] = {file, source};
+    }
+    // The recovery's solids still to write: the work for each (run on any thread), and the mesh source's name lookup.
+    struct LaterSolid { int body; std::function<std::string()> write; };
+    QJsonObject recoveryState(std::vector<LaterSolid> &later);
+    std::string engineSourceOf(const std::string &bytes) const { return m_engine->sourceOf(bytes); }
+    std::string engineSourceBytes(const std::string &name) const { return m_engine->sourceBytes(name); }
+private:
     struct BvhNode { float lo[3]; float hi[3]; int left; int right; int first; int count; };
     mutable std::vector<BvhNode> m_bvh;      // the model's triangles in a tree, built when first needed
     mutable std::vector<int> m_bvhTriangles;

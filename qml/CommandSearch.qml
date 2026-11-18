@@ -1,6 +1,6 @@
 import QtQuick
 
-// The Alt+Space command search: slides down from the window's top edge.
+// The command search (S, or Ctrl+Space even in a text box; Alt+Space until GB-087): slides down from the window's top edge.
 // Type to filter, ↑ ↓ to choose, Enter to run, Esc to close.
 // Shows nothing until something is typed, and ranks what fits the mode first (owner,
 // 2026-10-30: "L" then Enter must draw a Line in a sketch, "R" a rectangle; the look, file and

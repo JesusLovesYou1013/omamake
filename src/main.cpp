@@ -1,10 +1,13 @@
 #include "document/document.h"
+#include "document/recovery.h"
 #include "engine/engine.h"
 #include "theme/dialoglook.h"
 #include "theme/omarchytheme.h"
 #include "theme/transparency.h"
 #include "view/meshgeometry.h"
 #include "view/modifierkeys.h"
+#include "view/esckeys.h"
+#include "view/regionmask.h"
 
 #include <QDir>
 #include <QGuiApplication>
@@ -45,11 +48,13 @@ int main(int argc, char *argv[]) {
     QGuiApplication::setWindowIcon(QIcon(QStringLiteral(":/icons/omamake.png")));
 
     qmlRegisterType<MeshGeometry>("OmaMake", 1, 0, "MeshGeometry");
+    qmlRegisterType<RegionMask>("OmaMake", 1, 0, "RegionMask");     // Extrude's cut region (GB-084)
 
     Transparency transparency;
     ModifierKeys modifierKeys;
     OmarchyTheme omarchyTheme;
     DialogLook dialogLook;
+    EscKeys escKeys;                     // Esc once / twice (GB-081)
     // The engine (owner, 2026-10-30): Heavy (OpenCascade, exact surfaces) unless OMAMAKE_ENGINE=lite.
     Document document(qEnvironmentVariable("OMAMAKE_ENGINE") == QLatin1String("lite")
                           ? omamake::makeLiteEngine() : omamake::makeHeavyEngine());
@@ -57,6 +62,8 @@ int main(int argc, char *argv[]) {
     // OMAMAKE_TEST_CUBE=1 places the old 12 in cube, for testing faces until bodies can be made.
     if (qEnvironmentVariableIntValue("OMAMAKE_TEST_CUBE"))
         document.addCube(12 * kInch);
+    // The memory guard and the recovery file (GB-089): a design left by a memory stop is offered at start.
+    Recovery recovery(&document);
 
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("doc"), &document);
@@ -64,6 +71,8 @@ int main(int argc, char *argv[]) {
     engine.rootContext()->setContextProperty(QStringLiteral("modifierKeys"), &modifierKeys);
     engine.rootContext()->setContextProperty(QStringLiteral("omarchyTheme"), &omarchyTheme);
     engine.rootContext()->setContextProperty(QStringLiteral("dialogLook"), &dialogLook);
+    engine.rootContext()->setContextProperty(QStringLiteral("escKeys"), &escKeys);
+    engine.rootContext()->setContextProperty(QStringLiteral("recovery"), &recovery);
     // Where Save As starts: Documents/OmaMake, or OMAMAKE_SAVE_DIR (test windows run with a
     // made-up home, and their saves should still land in the real one).
     QString saveDir = qEnvironmentVariable("OMAMAKE_SAVE_DIR");

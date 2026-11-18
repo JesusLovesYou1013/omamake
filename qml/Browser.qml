@@ -52,6 +52,30 @@ Item {
     // branches holding those bodies open, each with a checkbox. Cleared, the tree is as the owner had it.
     property var cutChoices: null
     signal cutToggled(int body, bool on)
+    // Export DXF: while it's open a click on a sketch row picks it (or takes it away) instead; picked rows are outlined.
+    property var sketchPick: null
+    property var pickedSketches: ({})
+    // Export STEP (GB-082): while set, a click on a body or component row (the design's too) picks it,
+    // (key, name); a click on its arrow still opens or closes it. pickedKeys: the rows shown picked.
+    property var bodyPick: null
+    property var pickedKeys: ({})
+    // An Export DXF row (under its sketch) double-clicked: export it again, its saved settings in the panel.
+    signal dxfReopenRequested(int row)
+    // Export rows whose sketch changed since: {row: true}; each gets a red triangle (owner, 2026-11-13).
+    // Checked a moment after the sketches stop changing, not on every step of a drag.
+    property var dxfOutdated: ({})
+    Timer {
+        id: outdatedCheck
+        interval: 300
+        onTriggered: { const m = {}; for (const r of doc.dxfOutdated()) m[r] = true; browser.dxfOutdated = m }
+    }
+    Connections {
+        target: doc
+        function onSketchesChanged() { outdatedCheck.restart() }
+        function onStructureChanged() { outdatedCheck.restart() }
+        function onHistoryChanged() { outdatedCheck.restart() }
+    }
+    Component.onCompleted: outdatedCheck.restart()
     function holdsCut(node) {
         if (!cutChoices)
             return false
@@ -63,7 +87,7 @@ Item {
     function isOpen(node) {
         if (holdsCut(node))
             return true
-        return node.key in expanded ? expanded[node.key] : (node.kind === "component" || node.kind === "folder")
+        return node.key in expanded ? expanded[node.key] : (node.kind === "component" || node.kind === "folder" || node.kind === "sketch")
     }
 
     function toggle(node) {
@@ -150,6 +174,9 @@ Item {
                     readonly property bool sketchPlane: node.kind === "plane" && !!browser.sketch && browser.sketch.active
                     readonly property bool shown: sketchPlane ? !!browser.sketch.shownPlanes[node.key] : node.shown
                     readonly property bool seen: sketchPlane ? shown : node.visible
+                    readonly property bool picked: node.kind === "sketch" ? !!browser.pickedSketches[parseInt(node.key.slice(1))]
+                                                                          : !!browser.pickedKeys[node.key]
+                    readonly property bool bodyPickable: !!browser.bodyPick && (node.kind === "body" || node.kind === "component")
 
                     x: modelData.depth * browser.indent
                     width: browser.treeWidth - x
@@ -157,7 +184,8 @@ Item {
                     radius: 7
                     color: rowArea.containsMouse ? browser.theme.controlHover
                          : Qt.rgba(browser.theme.panelRaised.r, browser.theme.panelRaised.g, browser.theme.panelRaised.b, 0.88)
-                    border.color: active ? browser.theme.accent
+                    border.width: picked ? 2 : 1
+                    border.color: active || picked ? browser.theme.accent
                                 : Qt.rgba(browser.theme.border.r, browser.theme.border.g, browser.theme.border.b, 0.8)
 
                     MouseArea {
@@ -165,9 +193,13 @@ Item {
                         anchors.fill: parent
                         hoverEnabled: true
                         acceptedButtons: Qt.LeftButton | Qt.RightButton
-                        cursorShape: row.parentNode || row.node.kind === "sketch" ? Qt.PointingHandCursor : Qt.ArrowCursor
+                        cursorShape: row.parentNode || row.bodyPickable || row.node.kind === "sketch" || row.node.kind === "dxf" ? Qt.PointingHandCursor : Qt.ArrowCursor
                         onDoubleClicked: mouse => {
                             if (mouse.button !== Qt.LeftButton)
+                                return
+                            if (row.node.kind === "dxf")
+                                return browser.dxfReopenRequested(row.node.row)
+                            if (row.node.kind === "sketch" && browser.sketchPick)
                                 return
                             if (row.node.kind === "sketch")
                                 browser.sketchEditRequested(parseInt(row.node.key.slice(1)))
@@ -182,6 +214,10 @@ Item {
                                     const at = mapToItem(browser, mouse.x, mouse.y)
                                     browser.planeMenuRequested(at.x, at.y)
                                 }
+                            } else if (row.node.kind === "sketch" && browser.sketchPick) {
+                                browser.sketchPick(parseInt(row.node.key.slice(1)), row.node.name)
+                            } else if (row.bodyPickable && !(row.parentNode && mouse.x < arrow.x + arrow.width + 2)) {
+                                browser.bodyPick(row.node.key, row.node.name)
                             } else if (row.parentNode) {
                                 browser.toggle(row.node)
                             }
@@ -290,7 +326,31 @@ Item {
                         anchors.rightMargin: 4
                         anchors.verticalCenter: parent.verticalCenter
                         theme: browser.theme
+                        visible: row.node.kind !== "dxf"            // a file, not in the model: nothing to find
                         onClicked: browser.findRequested(row.node.key, row.node.name)
+                    }
+
+                    // An export whose sketch changed since: its file is out of date (export it again to clear it).
+                    Canvas {
+                        id: outdatedMark
+                        objectName: "outdated " + row.node.key
+                        readonly property bool on: row.node.kind === "dxf" && !!browser.dxfOutdated[row.node.row]
+                        visible: on
+                        anchors.right: parent.right
+                        anchors.rightMargin: 32
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: 16; height: 14
+                        onVisibleChanged: requestPaint()
+                        onPaint: {
+                            const ctx = getContext("2d")
+                            ctx.reset()
+                            ctx.fillStyle = browser.theme.danger
+                            ctx.beginPath(); ctx.moveTo(8, 0); ctx.lineTo(16, 14); ctx.lineTo(0, 14); ctx.closePath(); ctx.fill()
+                            ctx.fillStyle = "#ffffff"
+                            ctx.fillRect(7.2, 4, 1.6, 5.5); ctx.fillRect(7.2, 10.8, 1.6, 1.6)
+                        }
+                        HoverTip { theme: browser.theme; area: outdatedTip; text: "DXF export is likely out of date since last changes made to sketch." }
+                        MouseArea { id: outdatedTip; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
                     }
 
                     // Same column on every row, whether or not it has the activate button.
@@ -300,7 +360,7 @@ Item {
                         anchors.rightMargin: 30
                         anchors.verticalCenter: parent.verticalCenter
                         theme: browser.theme
-                        visible: !row.isDesign
+                        visible: !row.isDesign && row.node.kind !== "dxf"     // nothing of it shows in the model
                         enabled: !row.node.future          // made after the sketch being edited: out of reach
                         open: row.shown
                         onClicked: browser.crossfade(() => row.sketchPlane ? browser.sketch.showPlane(row.node.key, !row.shown)

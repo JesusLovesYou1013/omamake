@@ -53,6 +53,8 @@ Second form: a cut whose sides lie right on the body's own walls (an extrude of 
 
 Third form: a join whose tool stood on the body's face (the face itself pushed back down) came back the right volume, but OpenCascade's check called it broken: 7 new edges at the seam lay up to 0.0101 mm off their faces against 0.0091 allowed, and neither input had a loose edge. Such a result is now repaired with OpenCascade's own `BOPTools_AlgoTools::CorrectCurveOnSurface` (tolerance widened to fit, never past the loosest tolerance of the inputs) and used. The outline is never moved as a whole any more, since that changes the size; if nothing works, the extrude fails and says so. Still failing: a cut from a converted body's own face straight through the body, where the walls flare by less than the body's tolerance.
 
+Since 0.53: before any straight cut is built, each edge of its outline that lies on a wall of a body the cut reaches moves 0.01 mm into empty space, edge by edge (outer edges out, hole edges in), and only where that space is empty. Joins, new bodies, intersects and tapered cuts stay exact. When a cut still leaves a few faces of almost no area (under 0.000001 mm²) and would be refused only for them, they are folded into their neighbours and the result checked again. On the speaker mount every cut from its projected outline and holes now comes out as one valid solid.
+
 Still open: a narrowing taper (−10°) cut through the speaker mount's thread is broken in all three ways, and is refused. A widening taper through it works.
 
 
@@ -67,6 +69,8 @@ Cause: after the STEP round trip one spline wall's boundary curves run past the 
 Not the inch change, the merge change or the touching tolerance: the cut fails with all three turned off, and the current build makes the same cut (whole model projected onto the base, up to the top face at −0.1 in and −1 mm) on the mesh-converted body in 0.8–1.0 s, 23,593 and 22,395 mm³ left. OpenCascade's own repairs (`ShapeFix_Shape`, `ShapeFix_Face`, rebuilding the boundary curves, every `read.surfacecurve.mode`) leave the wall as it is.
 
 Resolution: none yet. Options: repair such walls on import, write STEP that reads back cleanly, or check a cut against an exact overlap when the body's mesh and exact volume disagree.
+
+Since 0.53: a mesh conversion now carries a thread's surface 0.2 mm past its outline, so the converted thread face no longer reads back inside out from STEP. Whether that also clears this case hasn't been checked.
 
 ## OpenCascade's own chamfer and fillet hand back shapes that pass its check but are wrong
 
@@ -85,6 +89,38 @@ Status: fixed in OmaMake, first seen 2026-11-09.
 Problem: after a chamfer cut through the fillets round a row of holes, the fillets showed inside out and the chamfer seemed to pass through them, while OpenCascade's check still called the body valid. OmaMake's own clean-up, which joins faces lying on one surface, rebuilt a cut torus face from its outline, and on a torus that outline encloses the rest of the ring.
 
 Resolution: that clean-up now joins faces only on planes, cylinders and cones, and a joined face must have the same area as its pieces. Spheres, tori and free-form faces are left to OpenCascade's `ShapeUpgrade_UnifySameDomain`. Files saved before the fix keep their saved body until that step is done again.
+
+## OmaMake was killed when the system ran out of memory
+
+Status: guarded in OmaMake since 0.53, first seen 2026-11-16.
+
+Problem: a cut on the speaker mount failed exactly, and the automatic second try ran about 5 minutes and took about 6.2 GB. The system's out-of-memory killer ended OmaMake, and the design was lost.
+
+Resolution (OmaMake side): while heavy work runs, OmaMake watches the memory left. Under 15 % available it stops the work, says "System memory running low, closing to protect system", saves the design as it was two steps before, and closes. At the next start it offers that design back, even if it was never saved to a file.
+
+## Fusion 360's own cut from a projected outline removed most of the base
+
+Status: Fusion 360's, not OmaMake's; recorded 2026-11-17 for comparison.
+
+Problem: OmaMake's converted speaker mount, saved as STEP and opened in Fusion 360, projected whole onto its base, then cut up from that outline, lost 36 % of its volume: nearly the whole grooved base went, leaving 24 thin slivers in its notches. The most likely cause is that Fusion's outline ran straight across each notch's mouth instead of down into it.
+
+OmaMake on the same model and the same steps gives one clean solid.
+
+## Fit Curved Surfaces after projecting leaves a thin skin
+
+Status: expected, first seen 2026-11-17.
+
+Problem: an outline projected from a faceted mesh, then Fit Curved Surfaces run, then a cut from that older outline leaves thin slivers up to 0.026 mm thick on the rounds. The fitted round bulges past each flat facet it replaced, and the old outline still follows the facets.
+
+Resolution: run Fit Curved Surfaces before projecting, so the outline follows the true surface.
+
+## Not done yet, or not tested much (0.53)
+
+- A cut that will be refused still tries several times first (up to about 30 s on the speaker mount); Extrude has no Cancel yet.
+- Export STEP pauses the window for about 3 seconds, and an import's last step for about 1 second.
+- Find Profile Gaps reports the speaker mount's notch mouths (0.66 mm) as gaps, though the outline is closed.
+- Faces with no display mesh stop the 0.01 mm wall move near them, so such a cut stays exact.
+- Export DXF writes the sketch in world coordinates; Fusion 360 writes a sketch on a downward face in the sketch's own axes (y mirrored).
 
 ## Not done yet, or not tested much (0.52)
 

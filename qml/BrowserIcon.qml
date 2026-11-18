@@ -59,6 +59,16 @@ Item {
         x: 4; y: 4; width: 6; height: 6; radius: 3
         color: icon.theme.success
     }
+    // An Export DXF row: a sheet with two lines drawn on it.
+    Rectangle {
+        visible: icon.kind === "dxf"
+        x: 2; y: 1; width: 10; height: 12; radius: 1.5
+        color: "transparent"
+        border.color: icon.theme.textSecondary
+        border.width: 1.5
+        Rectangle { x: 2.5; y: 4; width: 5; height: 1.5; color: icon.theme.textSecondary }
+        Rectangle { x: 2.5; y: 7; width: 5; height: 1.5; color: icon.theme.textSecondary }
+    }
     // Origin and its centre point: a ring, filled for the point.
     Rectangle {
         visible: icon.kind === "origin" || icon.kind === "point"

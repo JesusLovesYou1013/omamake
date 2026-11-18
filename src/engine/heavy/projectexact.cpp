@@ -168,10 +168,12 @@ Laid lay(const TopoDS_Edge &edge) {
     if (a.GetType() == GeomAbs_Line) {
         out.p = down(a.Value(f));
         out.q = down(a.Value(l));
-        out.kind = out.p.Distance(out.q) < kSame ? Laid::Point : Laid::Segment;
+        out.kind = out.p.Distance(out.q) < omamake::kProjectFit ? Laid::Point : Laid::Segment;
         return out;
     }
-    if (a.GetType() == GeomAbs_Circle && std::abs(a.Circle().Axis().Direction().Z()) > 1 - 1e-12) {
+    // A circle facing the sheet is drawn as its circle when its tilt shows less than the accuracy
+    // every projected curve is drawn to: r (1 - |cos tilt|) is how far its true shadow is off round.
+    if (a.GetType() == GeomAbs_Circle && a.Circle().Radius() * (1 - std::abs(a.Circle().Axis().Direction().Z())) <= omamake::kProjectFit) {
         const gp_Circ k = a.Circle();
         gp_Ax2 axes(down(k.Location()), gp_Dir(0, 0, k.Axis().Direction().Z() > 0 ? 1 : -1), gp_Dir(k.XAxis().Direction().X(), k.XAxis().Direction().Y(), 0));
         out.curve = new Geom_Circle(axes, k.Radius());
@@ -183,7 +185,10 @@ Laid lay(const TopoDS_Edge &edge) {
         flat = GeomProjLib::ProjectOnPlane(new Geom_TrimmedCurve(c3, f, l), new Geom_Plane(gp::XOY()), gp::DZ(), true);
     } catch (const Standard_Failure &) {
     }
-    // Seen edge on, or end on: no flat curve, or one with no width. Its farthest points then.
+    // Seen edge on, or end on: no flat curve, or one with no width. Its farthest points then. End on and edge
+    // on are judged to the accuracy every projected curve is drawn to (kProjectFit), not exactly: an edge a
+    // hair off square to the sketch (a circle's axis 1e-6 mm off, laid flat 0.000003 mm wide) is that point
+    // or line, not a stub or a spline it can't be drawn as.
     gp_Pnt lo = down(c3->Value(f)), hi = lo;
     for (int i = 1; i <= 64; ++i) {
         const gp_Pnt p = down(c3->Value(f + (l - f) * i / 64));
@@ -194,7 +199,7 @@ Laid lay(const TopoDS_Edge &edge) {
         const gp_Pnt p = down(c3->Value(f + (l - f) * i / 64));
         if (p.Distance(hi) > far.Distance(hi)) far = p;
     }
-    if (far.Distance(hi) < kSame) {
+    if (far.Distance(hi) < omamake::kProjectFit) {
         out.p = hi;
         out.kind = Laid::Point;
         return out;
@@ -202,7 +207,7 @@ Laid lay(const TopoDS_Edge &edge) {
     const gp_Lin across(far, gp_Dir(gp_Vec(far, hi)));
     bool straight = true;
     for (int i = 0; i <= 256 && straight; ++i)
-        straight = across.Distance(down(c3->Value(f + (l - f) * i / 256))) < kSame;
+        straight = across.Distance(down(c3->Value(f + (l - f) * i / 256))) < omamake::kProjectFit;
     if (straight || flat.IsNull()) {
         if (!straight)
             return out;     // can't be laid flat: left out
@@ -260,7 +265,8 @@ bool fit(const Handle(Geom_Curve) &c, double t0, double t1, const Point2 &startA
         }
         roughAll += rough[k];
     }
-    const int kTable = std::clamp(int(std::ceil(roughAll / 0.01)), 4096, 1 << 20);
+    // At least 256 entries: a short piece needs no more to keep each step within 0.01 mm.
+    const int kTable = std::clamp(int(std::ceil(roughAll / 0.01)), 256, 1 << 20);
     std::vector<double> ts{t0};
     for (std::size_t k = 0; k + 1 < breaks.size(); ++k) {
         const int steps = std::max(16, int(std::ceil(kTable * (roughAll > 0 ? rough[k] / roughAll : 1.0))));
@@ -269,8 +275,12 @@ bool fit(const Handle(Geom_Curve) &c, double t0, double t1, const Point2 &startA
     }
     const std::size_t kLast = ts.size() - 1;
     std::vector<double> len(ts.size(), 0);
-    for (std::size_t i = 1; i <= kLast; ++i)
-        len[i] = len[i - 1] + c->Value(ts[i - 1]).Distance(c->Value(ts[i]));
+    gp_Pnt was = c->Value(ts[0]);           // each point worked out once, not twice
+    for (std::size_t i = 1; i <= kLast; ++i) {
+        const gp_Pnt p = c->Value(ts[i]);
+        len[i] = len[i - 1] + was.Distance(p);
+        was = p;
+    }
     if (len.back() < kSame) {
         missed = -1;            // no curve left at all: the caller draws a straight line between the ends
         return false;
@@ -418,6 +428,7 @@ struct Run {
     gp_Elips ellipse;               // a whole ellipse
     Handle(Geom_Curve) curve;       // anything else: the flat curve, travelled from t0 to t1
     double t0 = 0, t1 = 0;
+    double fromRoom = 0, toRoom = 0;    // how loose the model's corner at each end is (its tolerance)
 };
 
 Run runOf(const TopoDS_Edge &e) {
@@ -426,6 +437,8 @@ Run runOf(const TopoDS_Edge &e) {
     const bool forward = e.Orientation() != TopAbs_REVERSED;
     r.from = two(BRep_Tool::Pnt(TopExp::FirstVertex(e, true)));
     r.to = two(BRep_Tool::Pnt(TopExp::LastVertex(e, true)));
+    r.fromRoom = BRep_Tool::Tolerance(TopExp::FirstVertex(e, true));
+    r.toRoom = BRep_Tool::Tolerance(TopExp::LastVertex(e, true));
     const bool closed = TopExp::FirstVertex(e, true).IsSame(TopExp::LastVertex(e, true));
     if (a.GetType() == GeomAbs_Line) {
         r.kind = FlatPiece::Line;
@@ -503,6 +516,7 @@ double sweep(const Run &r) {
 Run reversed(Run r) {
     std::swap(r.from, r.to);
     std::swap(r.t0, r.t1);
+    std::swap(r.fromRoom, r.toRoom);
     r.ccw = !r.ccw;
     if (r.kind == FlatPiece::Ellipse)
         r.ellipse.SetPosition(gp_Ax2(r.ellipse.Location(), r.ellipse.Axis().Direction().Reversed(), r.ellipse.XAxis().Direction()));
@@ -528,6 +542,7 @@ bool finish(std::vector<Run> runs, std::vector<FlatPiece> &out, std::string &why
                 if (!joined.empty() && (sameLine(joined.back(), r) || sameCircle(joined.back(), r) || sameCurve(joined.back(), r))) {
                     joined.back().to = r.to;
                     joined.back().t1 = r.t1;
+                    joined.back().toRoom = r.toRoom;
                     continue;
                 }
                 joined.push_back(r);
@@ -569,6 +584,7 @@ bool finish(std::vector<Run> runs, std::vector<FlatPiece> &out, std::string &why
         return t;
     };
     std::vector<double> turnBefore(n, 0);
+    std::vector<bool> bridge(n, false);     // a line from run i's end to run i+1's start
     for (std::size_t i = 0; i < n; ++i)
         if (runs[i].kind == FlatPiece::Arc)
             turnBefore[i] = turn(runs[i]);
@@ -581,13 +597,29 @@ bool finish(std::vector<Run> runs, std::vector<FlatPiece> &out, std::string &why
                 // Where the two circles cross, nearest the corner; else on the first.
                 const double dx = b.centre.x - a.centre.x, dy = b.centre.y - a.centre.y, d = std::hypot(dx, dy);
                 const double s = (a.radius * a.radius - b.radius * b.radius + d * d) / (2 * d), h2 = a.radius * a.radius - s * s;
+                // Where the model's corner is loose (a valid solid allows it within the corner's
+                // tolerance), the crossing may be that far off it. Past that, both circles keep their
+                // own ends and a line bridges them, so the outline is closed as the face is.
+                const Point2 corner = p;
                 p = ontoCircle(a, p);
+                bool crossed = false;
                 if (h2 >= 0) {
                     const double h = std::sqrt(h2), mx = a.centre.x + dx * s / d, my = a.centre.y + dy * s / d;
                     const Point2 one{mx - dy * h / d, my + dx * h / d}, other{mx + dy * h / d, my - dx * h / d};
-                    const Point2 &best = apart(one, a.to) < apart(other, a.to) ? one : other;
-                    if (apart(best, a.to) < 1e-6)
+                    const Point2 &best = apart(one, corner) < apart(other, corner) ? one : other;
+                    if (apart(best, corner) < std::max(1e-6, std::max(a.toRoom, b.fromRoom))) {
                         p = best;
+                        crossed = true;
+                    }
+                }
+                if (!crossed) {
+                    const Point2 q = ontoCircle(b, corner);
+                    if (apart(p, q) > kSame) {
+                        bridge[i] = true;
+                        a.to = p;
+                        b.from = q;
+                        continue;
+                    }
                 }
             } else if (ra) {
                 p = ontoCircle(a, p);
@@ -621,7 +653,16 @@ bool finish(std::vector<Run> runs, std::vector<FlatPiece> &out, std::string &why
     for (std::size_t i = 0; i < n; ++i)
         if (n > 1 && runs[i].kind == FlatPiece::Arc && std::abs(turn(runs[i]) - turnBefore[i]) > M_PI)
             gone[i] = true;
+    const auto bridgeAfter = [&](std::size_t i) {
+        FlatPiece line;
+        line.kind = FlatPiece::Line;
+        line.a = runs[i].to;
+        line.b = runs[(i + 1) % n].from;
+        out.push_back(line);
+    };
     for (std::size_t i = 0; i < n; ++i) {
+        if (i > 0 && bridge[i - 1])
+            bridgeAfter(i - 1);
         if (gone[i])
             continue;
         const Run &r = runs[i];
@@ -708,6 +749,8 @@ bool finish(std::vector<Run> runs, std::vector<FlatPiece> &out, std::string &why
         }
         out.push_back(f);
     }
+    if (n > 1 && bridge[n - 1])
+        bridgeAfter(n - 1);
     return true;
 }
 
@@ -954,8 +997,78 @@ bool edge(const TopoDS_Edge &edge, const omamake::Placement &plane, std::vector<
     }
 }
 
+static bool outline(const std::vector<TopoDS_Shape> &shapes, const omamake::Placement &plane,
+                    std::vector<std::vector<FlatPiece>> &loops, std::string &why);
+
+// A loop laid out as a closed polygon (GB-095): its pieces' ends, arcs and circles every 1/32 turn, a
+// whole ellipse in 64 points, a spline by its poles. Empty when the loop doesn't close (within 0.001 mm).
+static std::vector<projection::Flat> polygonOf(const std::vector<FlatPiece> &loop) {
+    std::vector<projection::Flat> p;
+    for (const FlatPiece &q : loop) {
+        switch (q.kind) {
+        case FlatPiece::Point:
+        case FlatPiece::Line:
+            p.push_back({q.a.x, q.a.y});
+            break;
+        case FlatPiece::Spline:
+            for (std::size_t i = 0; i + 1 < q.poles.size(); ++i)
+                p.push_back({q.poles[i].x, q.poles[i].y});
+            break;
+        case FlatPiece::Ellipse:
+            for (int i = 0; i < 64; ++i) {
+                const double t = 2 * M_PI * i / 64, c = std::cos(t), s = std::sin(t);
+                p.push_back({q.c.x + c * (q.major.x - q.c.x) + s * (q.minor.x - q.c.x), q.c.y + c * (q.major.y - q.c.y) + s * (q.minor.y - q.c.y)});
+            }
+            break;
+        case FlatPiece::Arc:
+        case FlatPiece::Circle: {
+            const double r = std::hypot(q.a.x - q.c.x, q.a.y - q.c.y), t0 = std::atan2(q.a.y - q.c.y, q.a.x - q.c.x);
+            double turn = 2 * M_PI;
+            if (q.kind == FlatPiece::Arc) {
+                turn = std::fmod(std::atan2(q.b.y - q.c.y, q.b.x - q.c.x) - t0 + 4 * M_PI, 2 * M_PI);
+                if (turn < 1e-12)
+                    turn = 2 * M_PI;
+            }
+            for (int i = 0; i < 32; ++i)
+                p.push_back({q.c.x + r * std::cos(t0 + turn * i / 32), q.c.y + r * std::sin(t0 + turn * i / 32)});
+            break;
+        }
+        }
+    }
+    const FlatPiece &first = loop.front(), &last = loop.back();
+    const bool closedAlone = loop.size() == 1 && (first.kind == FlatPiece::Circle || first.kind == FlatPiece::Ellipse);
+    if (!closedAlone && std::hypot(last.b.x - first.a.x, last.b.y - first.a.y) > 1e-3)
+        p.clear();
+    return p;
+}
+
+// The whole model (GB-095, owner 2026-11-17: "projecting the whole body has no interior lines at all,
+// only the exterior"): the outside of its shadow only, one loop for each separate region of it. The
+// shadow's holes (a bore straight through), any island inside a hole, and the stray pieces the side
+// test keeps inside the shadow (a line there and back, of no area) all go. One face asked for on its own
+// is its outline, holes included, as before. Until GB-095 the whole model also gave its holes, and the
+// loops of its own flat faces lying in the sketch's plane (GB-072 round 7 turn 34, the blind bore's
+// rim); those were interior lines by definition and are no longer added.
 bool shadow(const std::vector<TopoDS_Shape> &shapes, const omamake::Placement &plane,
             std::vector<std::vector<FlatPiece>> &loops, std::string &why) {
+    if (!outline(shapes, plane, loops, why))
+        return false;
+    const bool oneFace = std::any_of(shapes.begin(), shapes.end(), [](const TopoDS_Shape &s) { return s.ShapeType() == TopAbs_FACE; });
+    if (oneFace)
+        return true;
+    std::vector<std::vector<projection::Flat>> polygons;
+    for (const auto &l : loops)
+        polygons.push_back(l.empty() ? std::vector<projection::Flat>{} : polygonOf(l));
+    std::vector<std::vector<FlatPiece>> outside;
+    // A region under 0.000001 mm2, or on average under 0.001 mm wide, is no region: a piece there and back.
+    for (const std::size_t i : projection::outermost(polygons, 1e-6, 1e-3))
+        outside.push_back(std::move(loops[i]));
+    loops = std::move(outside);
+    return !loops.empty() || (why = "that throws no outline on this sketch", false);
+}
+
+static bool outline(const std::vector<TopoDS_Shape> &shapes, const omamake::Placement &plane,
+                    std::vector<std::vector<FlatPiece>> &loops, std::string &why) {
     try {
         stage("start");
         const gp_Trsf t = toPlane(plane);
@@ -1051,7 +1164,10 @@ bool shadow(const std::vector<TopoDS_Shape> &shapes, const omamake::Placement &p
                 flatOf[std::size_t(i - 1)] = make.Edge();
             } else {
                 const TopoDS_Vertex a = mine(v0, l.curve->Value(l.first));
-                const TopoDS_Vertex b = v0.IsSame(v1) ? a : mine(v1, l.curve->Value(l.last));
+                // Ends that land on one spot (a half round seen from the side goes out and back) are one corner:
+                // OpenCascade takes ends that close as one point and won't give them two.
+                const bool home = v0.IsSame(v1) || l.curve->Value(l.first).Distance(l.curve->Value(l.last)) <= Precision::Confusion();
+                const TopoDS_Vertex b = home ? a : mine(v1, l.curve->Value(l.last));
                 BRepBuilderAPI_MakeEdge make(l.curve, a, b, l.first, l.last);
                 if (!make.IsDone()) { ++left; continue; }
                 add(make.Edge());
@@ -1275,6 +1391,7 @@ bool shadow(const std::vector<TopoDS_Shape> &shapes, const omamake::Placement &p
         // turns all on one circle). What is kept is still each exact edge, whole.
         std::vector<std::vector<projection::Flat>> rough;
         double reachOut = 0;
+        double stray = 0;   // how far the drawn triangles stray from the true surfaces (mm)
         std::map<std::pair<long long, long long>, std::vector<std::pair<projection::Flat, projection::Flat>>> grid;
         const auto key = [&](double x, double y) { return std::pair{(long long)std::floor(x / reachOut), (long long)std::floor(y / reachOut)}; };
         const auto near = [&](const gp_Pnt &p) {
@@ -1305,7 +1422,7 @@ bool shadow(const std::vector<TopoDS_Shape> &shapes, const omamake::Placement &p
         };
         {
             std::vector<std::array<projection::Flat, 3>> drawn;
-            double stray = std::clamp(std::hypot(std::hypot(x1 - x0, y1 - y0), z1 - z0) / 50000, 0.01, 0.5);
+            stray = std::clamp(std::hypot(std::hypot(x1 - x0, y1 - y0), z1 - z0) / 50000, 0.01, 0.5);
             bool meshed = false;
             for (TopExp_Explorer f(all, TopAbs_FACE); f.More(); f.Next()) {
                 TopLoc_Location loc;
@@ -1326,7 +1443,9 @@ bool shadow(const std::vector<TopoDS_Shape> &shapes, const omamake::Placement &p
                     drawn.push_back({projection::Flat{pa.X(), pa.Y()}, projection::Flat{pb.X(), pb.Y()}, projection::Flat{pc.X(), pc.Y()}});
                 }
             }
+            stage("  triangles");
             rough = projection::covering(drawn, 1e-6);
+            stage("  drawn shadow");
             reachOut = 3 * stray + 1e-4;
             if (!rough.empty()) {
                 for (const auto &loop : rough)
@@ -1565,6 +1684,12 @@ bool shadow(const std::vector<TopoDS_Shape> &shapes, const omamake::Placement &p
             bool upright = false;           // stands straight up: seen edge on, covers nothing
             gp_Pln pln;
             std::shared_ptr<FaceInside> inside;   // made when first asked
+            // A free-form face's drawn triangles, flat, each with its corners' (u, v), by grid cell: where a
+            // line straight down can meet the surface (a true point is within `stray` of a triangle).
+            struct Tri { gp_Pnt2d p[3]; gp_Pnt2d uv[3]; };
+            std::vector<Tri> tris;
+            std::map<std::pair<long long, long long>, std::vector<int>> cells;
+            double cell = 0;
         };
         std::vector<FaceTest> faceTests;
         for (TopExp_Explorer f(all, TopAbs_FACE); f.More(); f.Next()) {
@@ -1592,8 +1717,113 @@ bool shadow(const std::vector<TopoDS_Shape> &shapes, const omamake::Placement &p
                 else if (kind.GetType() == GeomAbs_SurfaceOfExtrusion)
                     t.upright = up(kind.Direction());
             }
+            {
+                TopLoc_Location at;
+                const Handle(Poly_Triangulation) tri = BRep_Tool::Triangulation(t.face, at);
+                if (!t.plane && !t.upright && !tri.IsNull() && tri->HasUVNodes() && tri->NbTriangles() > 0) {
+                    const gp_Trsf place = at.Transformation();
+                    const double w = std::sqrt(t.box.SquareExtent());
+                    t.cell = std::max(4 * stray, w / std::sqrt(double(tri->NbTriangles())));
+                    for (int k = 1; k <= tri->NbTriangles(); ++k) {
+                        int n[3];
+                        tri->Triangle(k).Get(n[0], n[1], n[2]);
+                        FaceTest::Tri one;
+                        double lo[2] = {1e300, 1e300}, hi[2] = {-1e300, -1e300};
+                        for (int c = 0; c < 3; ++c) {
+                            const gp_Pnt q = tri->Node(n[c]).Transformed(place);
+                            one.p[c] = gp_Pnt2d(q.X(), q.Y());
+                            one.uv[c] = tri->UVNode(n[c]);
+                            lo[0] = std::min(lo[0], q.X()), lo[1] = std::min(lo[1], q.Y());
+                            hi[0] = std::max(hi[0], q.X()), hi[1] = std::max(hi[1], q.Y());
+                        }
+                        t.tris.push_back(one);
+                        const double r = 2 * stray;
+                        for (long long gx = (long long)std::floor((lo[0] - r) / t.cell); gx <= (long long)std::floor((hi[0] + r) / t.cell); ++gx)
+                            for (long long gy = (long long)std::floor((lo[1] - r) / t.cell); gy <= (long long)std::floor((hi[1] + r) / t.cell); ++gy)
+                                t.cells[{gx, gy}].push_back(int(t.tris.size()) - 1);
+                    }
+                }
+            }
             faceTests.push_back(std::move(t));
         }
+        // Where a line straight down through m meets a free-form face, from its drawn triangles: each
+        // triangle within reach gives a start, and Newton's method on the surface's own (x, y) finds the
+        // exact point from it. False when a start doesn't settle (then the general intersection answers).
+        const auto quickHits = [&](const FaceTest &t, const gp_Pnt &m, std::vector<std::pair<double, double>> &hits) {
+            hits.clear();
+            const auto it = t.cells.find({(long long)std::floor(m.X() / t.cell), (long long)std::floor(m.Y() / t.cell)});
+            if (it == t.cells.end())
+                return true;   // no triangle within reach: the line misses the face
+            const gp_Pnt2d at(m.X(), m.Y());
+            const double reach = 2 * stray;
+            double u0, u1, v0, v1;
+            t.surface->Bounds(u0, u1, v0, v1);
+            for (const int k : it->second) {
+                const FaceTest::Tri &tr = t.tris[std::size_t(k)];
+                // The triangle's nearest point to m, as weights of its corners (inside it, or on its nearest side).
+                const gp_XY a = tr.p[0].XY(), e1 = tr.p[1].XY() - a, e2 = tr.p[2].XY() - a, d = at.XY() - a;
+                const double det = e1.X() * e2.Y() - e1.Y() * e2.X();
+                double b1 = (d.X() * e2.Y() - d.Y() * e2.X()) / det, b2 = (e1.X() * d.Y() - e1.Y() * d.X()) / det;
+                if (!(std::abs(det) > 1e-300 && b1 >= 0 && b2 >= 0 && b1 + b2 <= 1)) {
+                    double best = 1e300;
+                    const gp_XY c[3] = {a, tr.p[1].XY(), tr.p[2].XY()};
+                    const double w[3][2] = {{0, 0}, {1, 0}, {0, 1}};
+                    for (int s0 = 0; s0 < 3; ++s0) {
+                        const int s1 = (s0 + 1) % 3;
+                        const gp_XY side = c[s1] - c[s0];
+                        const double l2 = side.SquareModulus();
+                        const double f = l2 > 0 ? std::clamp((at.XY() - c[s0]).Dot(side) / l2, 0.0, 1.0) : 0;
+                        const double gap = (c[s0] + side * f - at.XY()).Modulus();
+                        if (gap < best) {
+                            best = gap;
+                            b1 = w[s0][0] + (w[s1][0] - w[s0][0]) * f;
+                            b2 = w[s0][1] + (w[s1][1] - w[s0][1]) * f;
+                        }
+                    }
+                    if (best > reach)
+                        continue;
+                }
+                double u = tr.uv[0].X() + (tr.uv[1].X() - tr.uv[0].X()) * b1 + (tr.uv[2].X() - tr.uv[0].X()) * b2;
+                double v = tr.uv[0].Y() + (tr.uv[1].Y() - tr.uv[0].Y()) * b1 + (tr.uv[2].Y() - tr.uv[0].Y()) * b2;
+                // Newton's step, halved until it brings the point closer: where it can't (beyond a fold, or
+                // past the surface's own edge) the line passes the surface by the distance left.
+                const auto off = [&](double uu, double vv) {
+                    const gp_Pnt p = t.surface->Value(uu, vv);
+                    return std::hypot(p.X() - m.X(), p.Y() - m.Y());
+                };
+                bool settled = false, stuck = false;
+                double gap = off(u, v);
+                for (int step = 0; step < 40 && !settled && !stuck; ++step) {
+                    gp_Pnt p;
+                    gp_Vec du, dv;
+                    t.surface->D1(u, v, p, du, dv);
+                    const double fx = p.X() - m.X(), fy = p.Y() - m.Y();
+                    const double j = du.X() * dv.Y() - du.Y() * dv.X();
+                    if (std::abs(j) < 1e-300) {
+                        stuck = true;
+                        break;
+                    }
+                    const double su = -(fx * dv.Y() - fy * dv.X()) / j, sv = -(du.X() * fy - du.Y() * fx) / j;
+                    stuck = true;
+                    for (double k = 1; k > 1e-6; k /= 2) {
+                        const double nu = t.surface->IsUPeriodic() ? u + k * su : std::clamp(u + k * su, u0, u1);
+                        const double nv = t.surface->IsVPeriodic() ? v + k * sv : std::clamp(v + k * sv, v0, v1);
+                        const double g = off(nu, nv);
+                        if (g < gap) {
+                            u = nu, v = nv, gap = g, stuck = false;
+                            break;
+                        }
+                    }
+                    settled = gap < 1e-9;
+                }
+                if (!settled && stuck && gap > 1e-6)
+                    continue;   // the line misses the surface near this start
+                if (!settled)
+                    return false;   // no clean answer here: the exact intersection decides
+                hits.push_back({u, v});
+            }
+            return true;
+        };
         // Any face the line is inside answers, so the quick ones are asked first: flat faces, then the
         // simple round ones, the free-form ones (a thread's flanks) last.
         {
@@ -1633,6 +1863,17 @@ bool shadow(const std::vector<TopoDS_Shape> &shapes, const omamake::Placement &p
                         on = -1;
                     continue;
                 }
+                std::vector<std::pair<double, double>> quick;
+                if (!t.tris.empty() && quickHits(t, m, quick)) {
+                    for (const auto &[u, v] : quick) {
+                        const TopAbs_State st = judge(u, v);
+                        if (st == TopAbs_IN)
+                            return 1;
+                        if (st == TopAbs_ON)
+                            on = -1;
+                    }
+                    continue;
+                }
                 GeomAPI_IntCS hits(new Geom_Line(line), t.surface);
                 if (!hits.IsDone())
                     continue;
@@ -1660,6 +1901,14 @@ bool shadow(const std::vector<TopoDS_Shape> &shapes, const omamake::Placement &p
         };
         std::vector<Bit> bits;
         int pieceCount = 0;
+        // Each piece's two sides are looked at all at once, over every core (each look only reads the
+        // model and its tables; the faces' inside tests are made first): the side test was most of
+        // Project's time (owner, 2026-11-13: every step under 5 s). The pieces keep their order.
+        for (FaceTest &t : faceTests)
+            if (!t.upright && !t.inside)
+                t.inside = std::make_shared<FaceInside>(t.face);
+        struct Job { const Flat *x; double ta, tb, tm, side; bool whole; int way = 0; };   // way: 1 forward, 2 back, 0 none
+        std::vector<Job> jobs;
         for (Flat &x : flats) {
             std::sort(x.cuts.begin(), x.cuts.end());
             std::vector<double> at;
@@ -1704,13 +1953,21 @@ bool shadow(const std::vector<TopoDS_Shape> &shapes, const omamake::Placement &p
                             break;
                         }
                 }
-                ++pieceCount;
+                jobs.push_back({&x, ta, tb, tm, side, whole});
+            }
+        }
+        pieceCount = int(jobs.size());
+        OSD_Parallel::For(0, int(jobs.size()), [&](int jk) {
+            Job &job = jobs[std::size_t(jk)];
+            const Flat &x = *job.x;
+            const double ta = job.ta, tb = job.tb, tm = job.tm, side = job.side;
+            job.way = [&]() -> int {
                 gp_Pnt m;
                 gp_Vec d;
                 x.curve->D1(tm, m, d);
                 const gp_Vec2d along(d.X(), d.Y());
                 if (along.Magnitude() < 1e-15)
-                    continue;
+                    return 0;
                 // Looked at from 10 times the model's looseness there in to kSideStep (kSideStep to 10 times
                 // it on an exact model), but no farther out than half the piece is long, or twice the
                 // looseness if that is more: the piece is cut where anything meets it, so the nearest corner
@@ -1752,13 +2009,13 @@ bool shadow(const std::vector<TopoDS_Shape> &shapes, const omamake::Placement &p
                     const int sl = sideAt(step, 1);
                     const int sr = sideAt(step, -1);
                     if (sl < 0 || sr < 0)
-                        continue;
+                        return 0;
                     if (sl == 1 && sr == 1) {
                         if (step >= x.loose) {
                             inside = true;
                             break;
                         }
-                        continue;
+                        return 0;
                     }
                     if (sl != sr && !decided) {
                         decided = true;
@@ -1770,9 +2027,21 @@ bool shadow(const std::vector<TopoDS_Shape> &shapes, const omamake::Placement &p
                     l = rr = 0;
                 const bool onLeft = l == 1, onRight = rr == 1;
                 if (onLeft == onRight)
-                    continue;
+                    return 0;
+                return onLeft ? 1 : 2;
+            }();
+        });
+        for (const Job &job : jobs) {
+            if (!job.way)
+                continue;
+            {
+                const Flat &x = *job.x;
+                const double ta = job.ta, tb = job.tb, tm = job.tm;
+                const bool whole = job.whole;
+                const GeomAdaptor_Curve kind(x.curve);
+                const gp_Pnt m = x.curve->Value(tm);
                 // Travelled with the shadow on its left.
-                const bool forward = onLeft;
+                const bool forward = job.way == 1;
                 Bit bit;
                 bit.loose = x.loose;
                 bit.curve = x.curve;
@@ -1823,7 +2092,15 @@ bool shadow(const std::vector<TopoDS_Shape> &shapes, const omamake::Placement &p
             }
             std::vector<bool> copy(bits.size(), false);
             std::vector<std::size_t> copyOf(bits.size(), bits.size());
-            for (std::size_t i = 0; i < bits.size(); ++i) {
+            // The loosest pieces are tried as copies first, so where two lie along each other the one kept
+            // is the model's more exact curve: a fitted body's 0.027 mm loose straight edge laid over its
+            // exact outer circle (sag 0.026 mm) was kept instead of the circle, and the cut from that
+            // outline left a sliver of wall behind (owner, 2026-11-13: Project must match the real geometry).
+            std::vector<std::size_t> order(bits.size());
+            for (std::size_t k = 0; k < order.size(); ++k)
+                order[k] = k;
+            std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) { return bits[a].loose > bits[b].loose; });
+            for (const std::size_t i : order) {
                 const gp_Pnt m(bits[i].middle.X(), bits[i].middle.Y(), 0);
                 for (std::size_t j = 0; j < bits.size() && !copy[i]; ++j) {
                     if (j == i || copy[j])
@@ -1904,6 +2181,8 @@ bool shadow(const std::vector<TopoDS_Shape> &shapes, const omamake::Placement &p
         // The same piece twice (two edges lying on each other): once.
         {
             std::vector<Bit> once;
+            // (the most exact of twins first, so it is the one kept)
+            std::stable_sort(bits.begin(), bits.end(), [](const Bit &a, const Bit &b) { return a.loose < b.loose; });
             for (Bit &b : bits) {
                 const double tol = std::max(b.loose, Precision::Confusion());
                 // The one kept stands for both, so it is as loose as the looser: they agree only that
@@ -1943,7 +2222,7 @@ bool shadow(const std::vector<TopoDS_Shape> &shapes, const omamake::Placement &p
         //    loose model's curves stop short of each other, the nearest start within its looseness.
         std::vector<bool> used(bits.size(), false), taken(bits.size(), false);   // taken: by an earlier chain
         std::vector<bool> inLoop(bits.size(), false);
-        std::vector<std::pair<std::vector<std::size_t>, gp_Pnt2d>> leftover;     // chains that didn't close, and where
+        std::vector<std::pair<std::vector<std::size_t>, std::vector<Run>>> leftover;   // chains that didn't close: their pieces, in order
         std::vector<std::vector<FlatPiece>> outside, holes;
         for (std::size_t s = 0; s < bits.size(); ++s) {
             if (used[s])
@@ -2003,7 +2282,7 @@ bool shadow(const std::vector<TopoDS_Shape> &shapes, const omamake::Placement &p
                         mine.push_back(k);
                         taken[k] = true;
                     }
-                leftover.push_back({std::move(mine), bits[at].to});
+                leftover.push_back({std::move(mine), runs});
                 continue;
             }
             for (std::size_t k = 0; k < bits.size(); ++k)
@@ -2017,10 +2296,16 @@ bool shadow(const std::vector<TopoDS_Shape> &shapes, const omamake::Placement &p
         }
         // What didn't close. On a loose model the shadow's edge is only known to within its looseness:
         // a stub where faces overlap a hair past the outline, or a copy the copy check couldn't see (past
-        // the end of the curve it copies). It is no shape if all of it lies within the looseness of an
-        // outline found; anything farther is a real gap, and fails.
-        for (const auto &[chain, where] : leftover) {
-            for (const std::size_t k : chain)
+        // the end of the curve it copies), is no shape if all of it lies within the looseness of an
+        // outline found. Anything else is outline whose ends the tracing above couldn't match (the edges
+        // of a loose model, or a curved face's outline and its edges, can stop that far apart). A shadow
+        // is always closed, so each such chain goes on to the nearest start left (its own or another
+        // chain's), a straight line across any gap, until every one is round: never a refusal.
+        std::vector<std::vector<Run>> open;
+        for (const auto &[chain, chainRuns] : leftover) {
+            bool stub = true;
+            for (std::size_t c = 0; c < chain.size() && stub; ++c) {
+                const std::size_t k = chain[c];
                 for (const gp_Pnt2d &q : {bits[k].from, bits[k].middle, bits[k].to}) {
                     bool near = false;
                     for (std::size_t j = 0; j < bits.size() && !near; ++j) {
@@ -2035,12 +2320,54 @@ bool shadow(const std::vector<TopoDS_Shape> &shapes, const omamake::Placement &p
                         near = on.NbPoints() > 0 && on.LowerDistance() <= reach;
                     }
                     if (!near) {
-                        char text[160];
-                        snprintf(text, sizeof text, "the outline doesn't close near (%.4f, %.4f)", where.X(), where.Y());
-                        why = text;
-                        return false;
+                        stub = false;
+                        break;
                     }
                 }
+            }
+            if (!stub)
+                open.push_back(chainRuns);
+        }
+        while (!open.empty()) {
+            std::vector<Run> runs = std::move(open.back());
+            open.pop_back();
+            for (;;) {
+                const Point2 end = runs.back().to;
+                std::size_t next = open.size();
+                bool back = false;   // the nearest is that chain's end: it was read the wrong way round
+                double best = apart(end, runs.front().from);
+                for (std::size_t k = 0; k < open.size(); ++k)
+                    for (const bool b : {false, true})
+                        if (apart(end, b ? open[k].back().to : open[k].front().from) < best) {
+                            best = apart(end, b ? open[k].back().to : open[k].front().from);
+                            next = k;
+                            back = b;
+                        }
+                if (back) {
+                    std::reverse(open[next].begin(), open[next].end());
+                    for (Run &r : open[next])
+                        r = reversed(r);
+                }
+                const Point2 to = next < open.size() ? open[next].front().from : runs.front().from;
+                if (best > kExactJoin) {
+                    Run line;
+                    line.from = end;
+                    line.to = to;
+                    runs.push_back(line);
+                }
+                if (next == open.size())
+                    break;
+                runs.insert(runs.end(), open[next].begin(), open[next].end());
+                open.erase(open.begin() + std::ptrdiff_t(next));
+            }
+            double area = 0;
+            for (const Run &r : runs)
+                area += sweep(r);
+            std::vector<FlatPiece> pieces;
+            if (!finish(runs, pieces, why))
+                return false;
+            if (!pieces.empty())
+                (area >= 0 ? outside : holes).push_back(std::move(pieces));
         }
         loops = std::move(outside);
         loops.insert(loops.end(), holes.begin(), holes.end());

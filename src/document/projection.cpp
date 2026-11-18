@@ -245,11 +245,70 @@ std::vector<std::vector<Flat>> covering(const std::vector<std::array<Flat, 3>> &
     return out;
 }
 
-std::vector<std::vector<Piece>> outline(const std::vector<std::array<Flat, 3>> &triangles, double tol) {
+std::vector<std::vector<Piece>> outline(const std::vector<std::array<Flat, 3>> &triangles, double tol, bool outsideOnly) {
+    std::vector<std::vector<Flat>> loops = covering(triangles, tol);
+    if (outsideOnly) {   // GB-095: the whole body's outside only
+        std::vector<std::vector<Flat>> kept;
+        for (const std::size_t i : outermost(loops, tol * tol * 4))
+            kept.push_back(std::move(loops[i]));
+        loops = std::move(kept);
+    }
     std::vector<std::vector<Piece>> out;
-    for (std::vector<Flat> &p : covering(triangles, tol))
+    for (std::vector<Flat> &p : loops)
         out.push_back(pieces(std::move(p), tol));
     return out;
+}
+
+std::vector<std::size_t> outermost(const std::vector<std::vector<Flat>> &loops, double minArea, double minWidth) {
+    struct Box { double u0 = 1e300, v0 = 1e300, u1 = -1e300, v1 = -1e300; };
+    std::vector<double> area(loops.size(), 0);
+    std::vector<Box> box(loops.size());
+    std::vector<std::size_t> big;
+    for (std::size_t i = 0; i < loops.size(); ++i) {
+        const std::vector<Flat> &p = loops[i];
+        double length = 0;
+        for (std::size_t k = 0; k < p.size(); ++k) {
+            const Flat &a = p[k], &b = p[(k + 1) % p.size()];
+            area[i] += a.u * b.v - b.u * a.v;
+            length += std::hypot(b.u - a.u, b.v - a.v);
+            box[i] = {std::min(box[i].u0, a.u), std::min(box[i].v0, a.v), std::max(box[i].u1, a.u), std::max(box[i].v1, a.v)};
+        }
+        area[i] = std::abs(area[i]) / 2;
+        if (p.size() >= 3 && area[i] > minArea && 2 * area[i] > minWidth * length)
+            big.push_back(i);
+    }
+    if (big.empty()) {   // nothing covers any area: leave them all
+        std::vector<std::size_t> all(loops.size());
+        for (std::size_t i = 0; i < all.size(); ++i)
+            all[i] = i;
+        return all;
+    }
+    std::stable_sort(big.begin(), big.end(), [&](std::size_t a, std::size_t b) { return area[a] > area[b]; });
+    // Inside a larger loop: most of up to 64 of its points, spread round it, are inside that loop (even-odd
+    // rule). Loops of one outline never cross, so where they touch at a point the others decide.
+    const auto inside = [&](std::size_t in, std::size_t of) {
+        const Box &a = box[in], &b = box[of];
+        if (a.u0 < b.u0 || a.v0 < b.v0 || a.u1 > b.u1 || a.v1 > b.v1)
+            return false;
+        const std::vector<Flat> &p = loops[in], &q = loops[of];
+        const std::size_t step = std::max<std::size_t>(1, p.size() / 64);
+        int yes = 0, all = 0;
+        for (std::size_t k = 0; k < p.size(); k += step, ++all) {
+            bool odd = false;
+            for (std::size_t m = 0, n = q.size() - 1; m < q.size(); n = m++)
+                if ((q[m].v > p[k].v) != (q[n].v > p[k].v)
+                    && p[k].u < (q[n].u - q[m].u) * (p[k].v - q[m].v) / (q[n].v - q[m].v) + q[m].u)
+                    odd = !odd;
+            yes += odd;
+        }
+        return 2 * yes > all;
+    };
+    std::vector<std::size_t> kept;
+    for (const std::size_t i : big)
+        if (std::none_of(kept.begin(), kept.end(), [&](std::size_t k) { return inside(i, k); }))
+            kept.push_back(i);
+    std::sort(kept.begin(), kept.end());
+    return kept;
 }
 
 } // namespace projection
